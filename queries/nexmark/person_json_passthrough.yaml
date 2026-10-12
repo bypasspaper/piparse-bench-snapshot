@@ -1,0 +1,29 @@
+query:
+  name: nexmark_person_json_passthrough
+  description: "person passthrough (drop timestamp; 6 VARSIZED fields) over NDJSON input. JSON->{JSON,CSV}."
+  sql: |
+    SELECT id, name, email_address, credit_card, city, state, extra FROM person
+  sources:
+    - name: person
+      schema:
+        - { name: id, type: INT32, not_null: true }
+        - { name: name, type: VARSIZED, not_null: true }
+        - { name: email_address, type: VARSIZED, not_null: true }
+        - { name: credit_card, type: VARSIZED, not_null: true }
+        - { name: city, type: VARSIZED, not_null: true }
+        - { name: state, type: VARSIZED, not_null: true }
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: extra, type: VARSIZED, not_null: true }
+      data:
+        large:
+          file: large/nexmark/person_840MB.json
+          size_bytes: 1240941057
+          rows: 4000000
+  sink_schema:
+    - { name: person.id, type: INT32, not_null: true }
+    - { name: person.name, type: VARSIZED, not_null: true }
+    - { name: person.email_address, type: VARSIZED, not_null: true }
+    - { name: person.credit_card, type: VARSIZED, not_null: true }
+    - { name: person.city, type: VARSIZED, not_null: true }
+    - { name: person.state, type: VARSIZED, not_null: true }
+    - { name: person.extra, type: VARSIZED, not_null: true }

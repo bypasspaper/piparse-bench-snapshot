@@ -1,0 +1,58 @@
+query:
+  name: cm_q2_original
+  description: "Cluster Monitoring Q2: sliding window SUM(cpu) grouped by jobId, original data"
+
+  sql: |
+    SELECT start, end, SUM(cpu) AS totalCpu, jobId
+    FROM monitoringClusterData
+    WHERE eventType == INT16(3)
+    GROUP BY jobId
+    WINDOW SLIDING(creationTS, SIZE 60 SEC, ADVANCE BY 1 SEC)
+
+  flink_sql: |
+    SELECT CAST(TIMESTAMPDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', CAST(window_start AS TIMESTAMP(3))) AS BIGINT) * 1000 AS `start`, CAST(TIMESTAMPDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', CAST(window_end AS TIMESTAMP(3))) AS BIGINT) * 1000 AS `end`, SUM(cpu) AS totalCpu, jobId
+    FROM TABLE(HOP(TABLE monitoringClusterData, DESCRIPTOR(`__rt`), INTERVAL '1' SECOND, INTERVAL '60' SECOND))
+    WHERE eventType = 3
+    GROUP BY window_start, window_end, jobId
+
+  spark_sql: |
+    SELECT unix_millis(window.start) AS `start`, unix_millis(window.end) AS `end`, SUM(cpu) AS totalCpu, jobId FROM monitoringClusterData WHERE eventType = 3 GROUP BY window(__rt, '60 seconds', '1 second'), jobId
+  sources:
+    - name: monitoringClusterData
+      flink_rowtime: { column: creationTS, delay: "0.001 SECOND" }
+      spark_rowtime: { column: creationTS, delay: "1 millisecond" }
+      schema:
+        - { name: creationTS, type: UINT64, not_null: true }
+        - { name: jobId, type: UINT64, not_null: true }
+        - { name: taskId, type: UINT64, not_null: true }
+        - { name: machineId, type: INT64, not_null: true }
+        - { name: eventType, type: INT16, not_null: true }
+        - { name: userId, type: INT16, not_null: true }
+        - { name: category, type: INT16, not_null: true }
+        - { name: priority, type: INT16, not_null: true }
+        - { name: cpu, type: FLOAT64, not_null: true }
+        - { name: ram, type: FLOAT64, not_null: true }
+        - { name: disk, type: FLOAT64, not_null: true }
+        - { name: constraints, type: BOOLEAN, not_null: true }
+      data:
+        large:
+          # actual on-disk size (the old 1073741824 was the name's "1G", not the file: 1.53 GB)
+          file: large/cluster_monitoring/google-cluster-data-original_1G.csv
+          size_bytes: 1527761977
+          rows: 18649057
+        native:
+          # 18,649,057 rows x 65 B (u64 x3, i64, i16 x4, f64 x3, bool-as-1-byte packed LE);
+          # generated via csv_to_binary.py from a False/True -> 0/1 sed copy (uint8 fast path,
+          # byte-identical to the row-wise bool encoder)
+          file: large/cluster_monitoring/google-cluster-data-original_1G.nes
+          size_bytes: 1212188705
+          rows: 18649057
+
+  sink_schema:
+    - { name: monitoringClusterData.start, type: UINT64, not_null: true }
+    - { name: monitoringClusterData.end, type: UINT64, not_null: true }
+    - { name: monitoringClusterData.totalCpu, type: FLOAT64, not_null: true }
+    - { name: monitoringClusterData.jobId, type: UINT64, not_null: true }
+
+  validation:
+    large: { tuples: 3094778, checksum: 7192484640 }

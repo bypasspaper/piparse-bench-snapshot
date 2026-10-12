@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+# Stateless passthrough over the 4-int bid stream, CSV + SystemNative binary twin.
+# Used by the e2e shredder-scaling experiment: bypass (SIMDCSV, LOCK_FREE/LOCKING) vs
+# no-serde (SystemNative). Output NATIVE for all arms -> isolates the INPUT formatter.
+query:
+  name: nexmark_bid_pass_scaling
+  description: >
+    SELECT timestamp, auctionId, bidder, price FROM bid (full-projection passthrough,
+    4 integer fields). Cheap per-tuple -> the SequenceShredder is a visible share, so the
+    LOCK_FREE-vs-LOCKING difference and the parallel-serde-vs-no-serde comparison both show.
+  sql: "SELECT timestamp, auctionId, bidder, price FROM bid"
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder,    type: INT32, not_null: true }
+        - { name: price,     type: INT64, not_null: true }
+      data:
+        csv:
+          file: large/nexmark/bid_1GB.csv
+          size_bytes: 1089194961
+          rows: 31300000
+        native:
+          file: large/nexmark/bid_1GB.nes
+          size_bytes: 751200000
+          rows: 31300000
+  sink_schema:
+    - { name: bid.timestamp, type: UINT64, not_null: true }
+    - { name: bid.auctionId, type: INT32,  not_null: true }
+    - { name: bid.bidder,    type: INT32,  not_null: true }
+    - { name: bid.price,     type: INT64,  not_null: true }

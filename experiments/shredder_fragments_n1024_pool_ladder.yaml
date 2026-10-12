@@ -1,0 +1,92 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: shredder_fragments_n1024_pool_ladder
+  description: >
+    N=1024 POOL LADDER at 128 KiB with the TIMER-WAIT runner (2026-07-12, user question: why
+    384 buffers at all?). With fragments the liveness floor is GONE -- buf/src no longer needs
+    >= 1.5; the pool is a shared fleet and N=512 drove the SAME 768-buffer fleet (192/cell) at
+    46.7 GB/s active. The prior N=1024 @ 192 number (14.2 active) is STALE: it used the
+    blocking-slice runner whose 5 ms waits hogged io threads exactly in this many-waiters
+    regime; with the 1 ms suspending timer wait, pickup latency with ~256 staggered waiters
+    per cell is ~interval/waiters = microseconds, so 192 may carry N=1024 far higher.
+    ARMS (both x 128 KiB, N=1024): pool 192 (24 MB/cell, comfortably in the 32 MB per-CCX L3
+    given bands/queues need the rest) and pool 256 (32 MB/cell = exactly L3 -> expect partial
+    spill; classic-shredder law had 256 at -33%, and FIFO recycling rotates the WHOLE pool
+    through cache regardless of the shredder). Thread sampler runs alongside (io vs worker
+    CPU): worker ~99% = plateau-style joint saturation; io pegged + workers starved = spill.
+    EXPECT: 192 >> 14.2 (timer effect), possibly approaching the high-30s/low-40s; 256 at or
+    below 192 (spill tax). If 192 wins, the 384-buffer choice was unnecessary and the config
+    guidance becomes "same 192 x 128K pool from N=1 to N=1024".
+    RESULTS (2026-07-12, CERTIFIED - full uninterrupted run, both arms 1024/1024, zero
+    DIAG_SRCLIFE deaths):
+      n1024_192x128k_timer: wall 38956 MB/s, active-median 45.1 GB/s, peak 53.7, span 172 s;
+        workers 15.6/16 (98%), io 7.8/8 -> the WORKER-BOUND PLATEAU at N=1024. vs N=512@same
+        pool: 46.7 active = 97% PARITY. vs the same config on the old blocking-slice wait:
+        14.2 active (the timer wait alone recovers ~3x in the many-waiter regime).
+      n1024_256x128k_timer: wall 31436, active 36.4, workers 14.0/16, io 7.94/8 PEGGED ->
+        the 32 MB/cell = full-CCX-L3 spill tax measured: -19% wall, io-bound-leaning.
+    VERDICT: 384 buffers were never needed and the 64K detour is obsolete. ONE CONFIG -
+    192 x 128 KiB per cell + fragment shredder + timer-wait runner - serves N=1..1024 at the
+    worker-bound plateau (~45 GB/s active). Pool sizing is now L3-governed only (keep <= ~24
+    MB/cell); fan-in is decoupled from both liveness AND throughput.
+    LATENCY (medians across queries; vs N=512@192x128K ref 2.01/3.71/5.15 ms p50/p99/p999):
+    192x128k: 2.38/4.09/5.62 ms (+10-18%; Little's law: 768x128K fleet / 45 GB/s ~ 2.2 ms);
+    256x128k: 3.58/5.83/7.48 ms (bigger fleet + lower rate, again Little-consistent).
+    FAIRNESS across 1024 queries: per-query p50 spread 2376-2486 us (~5% band) -- the
+    timer-wait sharing rotates the fleet evenly, no starving query. Worst single-query p999
+    17.8 ms (1 of 1024, deployment-window straddler); p90-of-p999 = 6.7 ms ~= N=512.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 8
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+    ccx_shared_source_pools: true
+    ccx_source_pool_buffers: 192
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, sequence_shredder_mode: LOCK_FREE_FRAGMENTS }
+    input_parser: { uint64: TracedUINT64, int32: TracedINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  worker_env:
+    NES_TASKQUEUE_STATS: 1
+    NES_CELLPOOL_STATS: 1
+  generator:
+    repeat: 6
+
+variants:
+  - name: n1024_192x128k_timer
+    query: nexmark/bid_passthrough
+    axes:
+      x: { label: "Concurrent Queries", parameter: num_queries, values: [1024] }
+    y: { metric: throughput_mbps, label: "Aggregate System Throughput (MB/s)" }
+
+  - name: n1024_256x128k_timer
+    query: nexmark/bid_passthrough
+    overrides:
+      worker.ccx_source_pool_buffers: 256
+    axes:
+      x: { label: "Concurrent Queries", parameter: num_queries, values: [1024] }
+    y: { metric: throughput_mbps, label: "Aggregate System Throughput (MB/s)" }

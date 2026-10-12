@@ -1,0 +1,100 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: w1_column_replication
+  description: >
+    FULL-COLUMN replication of the user's paper W1 table at the CURRENT TIP (b5d757c9f6+knobs):
+    10 bidstr matrix queries x 3 arms x W1, MmapFile zero-copy + populate + warm, repeat 8,
+    128 KiB, fnattr. Arms: simd (SIMDCSV lazy csv->JSON, 5-arm parsers) vs paper simd_med;
+    native_json (SystemNative "13,73" -> JSON) vs paper native_med; csv_native_out (SIMDCSV
+    csv -> NATIVE output) = the user's "csv in, native out" hypothesis for the native column.
+    Known anchors: q2mod simd 41.0 (paper 40.70 = 0.8% match), q2mod native_json 127.2 (paper
+    92.59 = the anomaly). Read: per-query match/mismatch pattern, which arm's SHAPE tracks the
+    paper native column. ⚠️ metric = throughput_mrows_s only (bytes/row differs across arms).
+    ⚠️ q0/q10/q22 W1 windows up to ~25 s (slow arms) — repeat 8 fine, do not lower.
+    RUN: cd ~/work/piparse-bench && pkill -x main; PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/w1_column_replication.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mrows_s
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: MmapFile
+    sink_type: Monitoring
+    input_formatter:
+      type: SIMDCSV
+      allow_commas_in_strings: false
+    input_parser:
+      uint64: TracedUINT64
+      int64: TracedINT64
+      int32: FastINT32
+      int16: TracedINT16
+      uint32: TracedUINT32
+      uint16: TracedUINT16
+      f64: EiselFloatF64
+      f32: EiselFloatF32
+      bool: TracedBOOL
+    output_formatter:
+      type: JSON
+    output_parser:
+      f64: ZMIJF64
+      f32: ZMIJF32
+  generator:
+    repeat: 8
+  worker_env:
+    NES_MMAP_POPULATE: '1'
+_wk_x: &wk_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [1]
+_arms: &arms
+  label: "arm"
+  explicit:
+    - name: simd
+      baseline: true
+      overrides: {}
+    - name: native_json
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "13,73" }
+        query_config.input_parser: {}
+    - name: csv_native_out
+      overrides:
+        query_config.output_formatter: { type: NATIVE }
+        query_config.output_parser: {}
+_y: &y
+  metric: throughput_mrows_s
+  label: "Throughput (M records/s)"
+variants:
+  - { name: q0,       query: nexmark/matrix/bidstr_q0,       axes: { x: *wk_x, series: *arms }, y: *y, visualization: { type: grouped_bar } }
+  - { name: qproject, query: nexmark/matrix/bidstr_qproject, axes: { x: *wk_x, series: *arms }, y: *y, visualization: { type: grouped_bar } }
+  - { name: qroute,   query: nexmark/matrix/bidstr_qroute,   axes: { x: *wk_x, series: *arms }, y: *y, visualization: { type: grouped_bar } }
+  - { name: q1,       query: nexmark/matrix/bidstr_q1,       axes: { x: *wk_x, series: *arms }, y: *y, visualization: { type: grouped_bar } }
+  - { name: q2og,     query: nexmark/matrix/bidstr_q2og,     axes: { x: *wk_x, series: *arms }, y: *y, visualization: { type: grouped_bar } }
+  - { name: q2mod,    query: nexmark/matrix/bidstr_q2mod,    axes: { x: *wk_x, series: *arms }, y: *y, visualization: { type: grouped_bar } }
+  - { name: q10,      query: nexmark/matrix/bidstr_q10,      axes: { x: *wk_x, series: *arms }, y: *y, visualization: { type: grouped_bar } }
+  - { name: q14,      query: nexmark/matrix/bidstr_q14,      axes: { x: *wk_x, series: *arms }, y: *y, visualization: { type: grouped_bar } }
+  - { name: q22,      query: nexmark/matrix/bidstr_q22,      axes: { x: *wk_x, series: *arms }, y: *y, visualization: { type: grouped_bar } }
+  - { name: qex,      query: nexmark/matrix/bidstr_qex,      axes: { x: *wk_x, series: *arms }, y: *y, visualization: { type: grouped_bar } }

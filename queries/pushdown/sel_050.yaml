@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: Apache-2.0
+query:
+  name: pushdown_sel_050
+  description: >
+    Predicate-pushdown sweep point. Dataset large/multicol/mixed_n16.csv (16 fields: f0 UINT64
+    predicate + f1..f15 FLOAT64 payload). Predicate f0 < 50000000 => ~49.941% selectivity. The projection
+    sums all 15 payload floats (forces their parse for SURVIVORS only; one cheap scalar out per row, so
+    the sink adds no per-field output cost). Compiled+lazy parses f1..f15 only for survivors (pushdown);
+    SequentialUncompiled materialises all 16 every row. InMemory prefill, single thread, Monitoring sink.
+  sql: "SELECT (f1 + f2 + f3 + f4 + f5 + f6 + f7 + f8 + f9 + f10 + f11 + f12 + f13 + f14 + f15) AS s FROM t WHERE f0 < UINT64(50000000)"
+  sources:
+    - name: t
+      schema:
+        - { name: f0, type: UINT64, not_null: true }
+        - { name: f1, type: FLOAT64, not_null: true }
+        - { name: f2, type: FLOAT64, not_null: true }
+        - { name: f3, type: FLOAT64, not_null: true }
+        - { name: f4, type: FLOAT64, not_null: true }
+        - { name: f5, type: FLOAT64, not_null: true }
+        - { name: f6, type: FLOAT64, not_null: true }
+        - { name: f7, type: FLOAT64, not_null: true }
+        - { name: f8, type: FLOAT64, not_null: true }
+        - { name: f9, type: FLOAT64, not_null: true }
+        - { name: f10, type: FLOAT64, not_null: true }
+        - { name: f11, type: FLOAT64, not_null: true }
+        - { name: f12, type: FLOAT64, not_null: true }
+        - { name: f13, type: FLOAT64, not_null: true }
+        - { name: f14, type: FLOAT64, not_null: true }
+        - { name: f15, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/multicol/mixed_n16.csv
+          size_bytes: 250000054
+  sink_schema:
+    - { name: s, type: FLOAT64, not_null: true }

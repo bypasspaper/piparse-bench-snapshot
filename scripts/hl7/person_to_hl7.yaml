@@ -1,0 +1,47 @@
+# csv -> hl7 conversion: nexmark person (4M rows, 840MB CSV) -> MLLP-framed HL7.
+# Run via convert_csv_to_hl7.sh. Varsized-heavy (name/email/credit_card/city/state/extra);
+# values verified free of | ^ & CR, so default HL7 delimiters apply on re-parse -> leaf
+# arity 25 (15 header leaves + seg + 8 data + pad). PID is the natural segment here.
+# One record = one message: <VT> MSH-header <CR> PID|f1|..|f8 <CR> <FS><CR>.
+query: SELECT * FROM person INTO personHl7Sink
+logical:
+  - name: person
+    schema:
+      - { name: id, type: INT32 }
+      - { name: name, type: VARSIZED }
+      - { name: email_address, type: VARSIZED }
+      - { name: credit_card, type: VARSIZED }
+      - { name: city, type: VARSIZED }
+      - { name: state, type: VARSIZED }
+      - { name: timestamp, type: UINT64 }
+      - { name: extra, type: VARSIZED }
+physical:
+  - logical: person
+    type: File
+    host: "localhost:8080"
+    parser_config:
+      type: SIMDCSV
+      allow_commas_in_strings: "false"
+    source_config:
+      file_path: __TESTDATA__/large/nexmark/person_840MB.csv
+sinks:
+  - name: personHl7Sink
+    type: File
+    host: "localhost:8080"
+    schema:
+      - { name: person$id, type: INT32 }
+      - { name: person$name, type: VARSIZED }
+      - { name: person$email_address, type: VARSIZED }
+      - { name: person$credit_card, type: VARSIZED }
+      - { name: person$city, type: VARSIZED }
+      - { name: person$state, type: VARSIZED }
+      - { name: person$timestamp, type: UINT64 }
+      - { name: person$extra, type: VARSIZED }
+    config:
+      output_format: HL7
+      file_path: __OUTPUT__
+    parser_config:
+      segment_name: PID
+workers:
+  - host: "localhost:8080"
+    max_operators: 10000

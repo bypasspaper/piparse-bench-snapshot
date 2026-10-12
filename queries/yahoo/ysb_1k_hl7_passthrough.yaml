@@ -1,0 +1,52 @@
+query:
+  name: ysb_1k_hl7_passthrough
+  description: >
+    YSB ad-event passthrough over MLLP-framed HL7 input (one message per event; generated 1:1
+    from ysb_1k_data_474M.csv via the engine's HL7 output formatter -- scripts/hl7/). Same 5M
+    logical rows as the csv variant; HL7 footprint 832MB = uniform +68 B/message glue.
+    SCHEMA = ALL 28 leaves: 15 MSH-header leaves (default delimiters incl. '&': the ^~\&
+    encoding chars split into 3 junk leaves), segment name (YSB), 11 numeric data fields, pad.
+    All-numeric data -> default HL7 delimiter config applies (no subcomponent override needed).
+  sql: |
+    SELECT user_id, campaign_id, event_type, current_ms FROM ysb
+  sources:
+    - name: ysb
+      schema:
+        - { name: h01, type: VARSIZED }
+        - { name: h02, type: VARSIZED }
+        - { name: h03, type: VARSIZED }
+        - { name: h04, type: VARSIZED }
+        - { name: h05, type: VARSIZED }
+        - { name: h06, type: VARSIZED }
+        - { name: h07, type: VARSIZED }
+        - { name: h08, type: VARSIZED }
+        - { name: h09, type: VARSIZED }
+        - { name: h10, type: VARSIZED }
+        - { name: h11, type: VARSIZED }
+        - { name: h12, type: VARSIZED }
+        - { name: h13, type: VARSIZED }
+        - { name: h14, type: VARSIZED }
+        - { name: h15, type: VARSIZED }
+        - { name: seg, type: VARSIZED }
+        - { name: user_id, type: UINT64, not_null: true }
+        - { name: page_id, type: UINT64, not_null: true }
+        - { name: campaign_id, type: UINT64, not_null: true }
+        - { name: ad_type, type: UINT64, not_null: true }
+        - { name: event_type, type: UINT64, not_null: true }
+        - { name: current_ms, type: UINT64, not_null: true }
+        - { name: ip, type: UINT64, not_null: true }
+        - { name: d1, type: UINT64, not_null: true }
+        - { name: d2, type: UINT64, not_null: true }
+        - { name: d3, type: UINT32, not_null: true }
+        - { name: d4, type: UINT16, not_null: true }
+        - { name: pad, type: VARSIZED }
+      data:
+        hl7:
+          file: large/ysb/ysb_1k_data_474M.hl7
+          size_bytes: 832214231
+          rows: 5000000
+  sink_schema:
+    - { name: ysb.user_id, type: UINT64, not_null: true }
+    - { name: ysb.campaign_id, type: UINT64, not_null: true }
+    - { name: ysb.event_type, type: UINT64, not_null: true }
+    - { name: ysb.current_ms, type: UINT64, not_null: true }

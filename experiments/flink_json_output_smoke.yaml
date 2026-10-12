@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: flink_json_output_smoke
+  description: >
+    SMOKE (2026-07-13): csv->json in Flink with discarded output - validates the
+    flink_output_format knob end-to-end (renderer + driver + runner). Three arms on q1
+    medium (bid_1GB.csv): none (blackhole, parse-only - the pre-existing behavior),
+    json_object (JSON_OBJECT() in the SELECT -> STRING -> blackhole; true void sink but
+    Calcite's per-row JSON-node builder, alphabetical keys), json_file (Flink's real
+    JsonRowDataSerializationSchema -> tmpfs dir, deleted after timing; schema-ordered keys,
+    JSON_OUT_BYTES printed by the driver for volume accounting), json_blackhole (2026-07-14,
+    THE fair arm: custom `blackhole-format` connector from flink-ext/pbench-flink-ext.jar -
+    Flink's real json serializer, bytes discarded in the sink writer; per-subtask
+    PBENCH_VOIDSINK bytes=/rows= lines in the driver log; serialization verified
+    BYTE-IDENTICAL to json_file minus the per-row newline on a 3-row probe).
+    CONTEXT: Flink is single-thread parse-bound at ~110 MB/s on a single csv stream
+    (flink_vs_nes_q1 law) - the json arms measure the SERIALIZATION ADD-ON on top of that
+    bound, so expect all arms slow in absolute terms; the none-vs-json delta is the signal.
+    GOTCHA: blackhole+'format'='json' is REJECTED by Flink (ValidationException) - that's
+    why the workaround arms exist at all. Rebuild the jar (flink-ext/build.sh) after any
+    pyflink version bump.
+    EXPECTED (2026-07-14, bid_1GB medium, parallelism 8, single rep): none 105.2 MB/s
+    (the single-thread parse bound), json_blackhole 56.9, json_object 33.0, json_file 12.8.
+    json_blackhole is the fastest JSON void-sink route by 1.7x/4.4x - it IS the native
+    encoder, so this is Flink's honest csv->json number (~1.85x parse-only slowdown).
+  primary_metric: processing_time_s
+  higher_is_better: false
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: flink
+  mode: flink
+  build: native
+  data_size: medium
+  topology: single-node
+  completion_timeout_s: 900
+  flink_execution_mode: streaming
+  worker:
+    query_engine:
+      number_of_worker_threads: 8
+
+_x: &q_x
+  label: "query"
+  explicit:
+    - { name: q1_price, overrides: {} }
+
+_y: &time_y { metric: processing_time_s, label: "Processing time (s)" }
+
+variants:
+  - name: flink_q1_json_arms
+    description: "q1 medium: blackhole vs JSON_OBJECT->blackhole vs json->tmpfs"
+    query: nexmark/q1_price
+    axes:
+      x: *q_x
+      series:
+        label: "output format"
+        explicit:
+          - { name: none_blackhole, baseline: true, overrides: {} }
+          - { name: json_object, overrides: { flink_output_format: json_object } }
+          - { name: json_file, overrides: { flink_output_format: json_file } }
+          - { name: json_blackhole, overrides: { flink_output_format: json_blackhole } }
+    y: *time_y
+    visualization: { type: grouped_bar }

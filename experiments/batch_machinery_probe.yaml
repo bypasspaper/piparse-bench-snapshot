@@ -1,0 +1,84 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: batch_machinery_probe
+  description: >
+    #2: the e2e->isolated shredder gap (1.34x vs 2.34x) is per-task engine machinery HALVING LF (isolated LF
+    9 GB/s vs e2e 4.6; LK identical ~3.44 both). Probe which machinery: NES_DISABLE_EMIT stops the pipeline
+    handing buffers to the sink -> removes the SINK tasks + downstream emitWork + serialize, leaving the
+    pipeline task alone (index+shredder+extract id) ~ the isolated stage-only drain. Deep-queue config
+    (inflight 8192, no starvation), single-src bigstr_id_pass, 4K, K32, W24. Arms {LF,LK}x{emit,no-emit}.
+    READ: if LF_noemit jumps 4.6 -> toward 9, the sink/emit machinery is the cost; LF/LK toward isolated 2.3x.
+    RUN: cd ~/work/piparse-bench && pkill -x main; PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/batch_machinery_probe.yaml --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  worker:
+    query_engine:
+      number_of_worker_threads: 24
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      pin_threads: false
+      ccx_aware_task_queues: false
+      admission_queue_size: 32768
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 8192
+    dump_compilation_result: NONE
+    default_max_inflight_buffers: 8192
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false }
+    output_formatter: { type: CSV }
+    input_parser: {}
+    output_parser: {}
+  generator:
+    repeat: 8
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 8
+    NES_INMEM_BUFSIZE: 4096
+    NES_LOG_LEVEL: WARNING
+    NES_SOURCE_EMIT_BATCH: 32
+    NES_TASKQUEUE_STATS: 1
+variants:
+  - name: probe
+    query: formatter/bigstr_id_pass
+    axes:
+      x:
+        label: "worker threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [24]
+      series:
+        label: "shredder x emit"
+        explicit:
+          - name: lf_emit
+            baseline: true
+            overrides:
+              query_config.input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false, sequence_shredder_mode: LOCK_FREE }
+          - name: lk_emit
+            overrides:
+              query_config.input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false, sequence_shredder_mode: LOCKING }
+          - name: lf_noemit
+            overrides:
+              query_config.input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false, sequence_shredder_mode: LOCK_FREE }
+              worker_env.NES_DISABLE_EMIT: "1"
+          - name: lk_noemit
+            overrides:
+              query_config.input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false, sequence_shredder_mode: LOCKING }
+              worker_env.NES_DISABLE_EMIT: "1"
+    y: { metric: throughput_mbps, label: "MB/s" }
+    visualization: { type: line_chart }

@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: Apache-2.0
+query:
+  name: nexmark_bidstr_iso_q2
+  description: >
+    Nexmark Q2 (filter+projection) over the 6-field bid_strings dataset, for the JSON-input
+    isolation study. SELECT auctionId, price WHERE auctionId % 123 = 0 -> ~0.8% survivors.
+    auctionId (INT32) is parsed on EVERY row (the filter); price (FLOAT64) only for survivors
+    (lazy elision), so this query is INT-parse + field-locate bound, tiny output. channel/url
+    are present in every input representation but NOT projected: JSON forward-skips them
+    (near-free in ondemand), CSV still SIMD-indexes their delimiters, native stride-reads their
+    fixed slots -> the cross-arm delta isolates the NUMERIC field-extract cost of each parser.
+    Three input representations of the IDENTICAL 31.3M logical rows:
+      json   -> bid_strings_3GB.json  (JSON formatter, simdjson on-demand)
+      csv    -> bid_strings_3GB.csv   (SIMDCSV formatter)
+      native -> bid_strings_3GB.nes   (SystemNative, string_length "13,73"; NO parse = floor)
+    Run at OUTPUT_FORMAT=NATIVE (no compiled serializer) + Monitoring sink -> "parse to native,
+    discard": output serialization removed so the INPUT parser dominates. rows are identical
+    across arms (31.3M) so compare on processing_time_s / Mrows/s (NOT MB/s -- byte denominators
+    differ: json 5.57GB, csv 3.60GB, native 3.44GB).
+
+  sql: "SELECT auctionId, price FROM bid WHERE auctionId % INT32(123) = INT32(0)"
+
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+        - { name: channel, type: VARSIZED, not_null: true }
+        - { name: url, type: VARSIZED, not_null: true }
+      data:
+        json:
+          file: large/nexmark/bid_strings_3GB.json
+          size_bytes: 5567181395
+          rows: 31300000
+        csv:
+          file: large/nexmark/bid_strings_3GB.csv
+          size_bytes: 3595281395
+          rows: 31300000
+        native:
+          file: large/nexmark/bid_strings_3GB.nes
+          size_bytes: 3443000000
+          rows: 31300000
+
+  sink_schema:
+    - { name: bid.auctionId, type: INT32, not_null: true }
+    - { name: bid.price, type: FLOAT64, not_null: true }

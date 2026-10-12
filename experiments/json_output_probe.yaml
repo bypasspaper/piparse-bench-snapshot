@@ -1,0 +1,108 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: json_output_probe
+  description: >
+    CSV->JSON output probe (2026-07-13) on the OPTIMIZED JSONOutputFormatter (constant
+    per-field key prefixes precomputed at construction + writeBytesToBuffer constant-length
+    writes, raw lazy passthrough for numerics, escape-scan fast path for strings instead of
+    nlohmann per value, host-side last-field check). Companion to json_output_smoke (q1,
+    bid_star, person_star); this one covers the remaining stateless output shapes of the
+    all_queries_benchmark: computed-string output (q10 CASTFROMUNIXTS), computed-float
+    (q14), string concat (q22), filter+projection (q2 repo shape).
+    EXPECTED SHAPE: JSON embeds key names per row, so output volume is ~2-3x CSV's - on
+    numeric/lazy shapes the optimized formatter sits near the byte-volume-explained bound
+    (bid_star json ~=3.9 GB/s vs volume model ~3.5); string shapes retain real headroom
+    (escape scan + per-field calls).
+    GOTCHAS: q2_filter_proj has ONLY large (6GB) csv - fine at repeat 1; bid_653M small is
+    the 5-field trap (do not use small for any bid-schema parse query); q22 large =
+    bid_strings_3GB (13,73 slots), strings go through writeJsonStringValue.
+  primary_metric: processing_time_s
+  higher_is_better: false
+  repetitions: 2
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser:
+      uint64: TracedUINT64
+      int64: TracedINT64
+      int32: FastINT32
+      int16: TracedINT16
+      uint32: TracedUINT32
+      uint16: TracedUINT16
+      f64: EiselFloatF64
+      f32: EiselFloatF32
+      bool: TracedBOOL
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+
+_series_outfmt: &outfmt_series
+  label: "output format"
+  explicit:
+    - name: csv_out
+      baseline: true
+      overrides: {}
+    - name: json_out
+      overrides:
+        query_config.output_formatter: { type: JSON }
+
+_x: &w16_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [16]
+
+_y: &time_y { metric: processing_time_s, label: "Processing time (s)" }
+
+variants:
+  - name: q10_datetime_json
+    description: "q10: CASTFROMUNIXTS ISO-8601 reformat - computed string output (medium 1GB)"
+    query: nexmark/q10_datetime
+    axes: { x: *w16_x, series: *outfmt_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: q14_calc_json
+    description: "q14: computed-float range filter - float codec output (medium 1GB)"
+    query: nexmark/q14_calc
+    axes: { x: *w16_x, series: *outfmt_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: q22_concat_json
+    description: "q22: string concat output - JSON string escaping path (large 3GB, only size)"
+    query: nexmark/q22_concat
+    overrides: { data_size: large }
+    axes: { x: *w16_x, series: *outfmt_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: q2_filter_proj_json
+    description: "q2 repo shape: %123 filter + 2-col projection (large 6GB, only csv size)"
+    query: nexmark/q2_filter_proj
+    overrides: { data_size: large }
+    axes: { x: *w16_x, series: *outfmt_series }
+    y: *time_y
+    visualization: { type: grouped_bar }

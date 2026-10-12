@@ -1,0 +1,53 @@
+# csv -> hl7 conversion: nexmark bid_strings (31.3M rows, 3.6GB CSV) -> MLLP-framed HL7.
+# Run via convert_csv_to_hl7.sh (starts worker, submits with nes-cli, strips the FileSink
+# schema-header line, validates the FS-CR message count == row count).
+#
+# GOTCHAS / decisions baked into this file:
+# - One record = one message: <VT> MSH-header <CR> BID|f1|..|f6 <CR> <FS><CR>.
+# - The bid URLs contain '&' (query=1&channel_id=0). '&' is HL7's default SUBCOMPONENT
+#   delimiter, so the HL7 *input* arm for this dataset MUST disable subcomponent splitting
+#   (subcomponent_delimiter: '') or every message fails arity validation (ERROR 4000).
+#   With '&' out of the structural class the leaf arity is 22 (14 header + seg + 6 data + pad),
+#   not the default-header 23. The values contain no '|', '^' or CR (verified).
+# - The output formatter does NOT escape values (conscious simplification); correctness of the
+#   generated data is guaranteed by the input-side arity validation on re-parse.
+# - FileSink prepends one 'name:TYPE:NULLABLE,...' header line; the converter script strips it
+#   (tail -n +2 is exact: the HL7 payload itself contains no \n bytes).
+query: SELECT * FROM bid INTO bidHl7Sink
+logical:
+  - name: bid
+    schema:
+      - { name: timestamp, type: UINT64 }
+      - { name: auctionId, type: INT32 }
+      - { name: bidder, type: INT32 }
+      - { name: price, type: FLOAT64 }
+      - { name: channel, type: VARSIZED }
+      - { name: url, type: VARSIZED }
+physical:
+  - logical: bid
+    type: File
+    host: "localhost:8080"
+    parser_config:
+      type: SIMDCSV
+      allow_commas_in_strings: "false"
+    source_config:
+      file_path: __TESTDATA__/large/nexmark/bid_strings_3GB.csv
+sinks:
+  - name: bidHl7Sink
+    type: File
+    host: "localhost:8080"
+    schema:
+      - { name: bid$timestamp, type: UINT64 }
+      - { name: bid$auctionId, type: INT32 }
+      - { name: bid$bidder, type: INT32 }
+      - { name: bid$price, type: FLOAT64 }
+      - { name: bid$channel, type: VARSIZED }
+      - { name: bid$url, type: VARSIZED }
+    config:
+      output_format: HL7
+      file_path: __OUTPUT__
+    parser_config:
+      segment_name: BID
+workers:
+  - host: "localhost:8080"
+    max_operators: 10000

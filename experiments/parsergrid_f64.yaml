@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: parsergrid_f64
+  description: >
+    PARSER FUNCTION MATTERS (f64). csv->json over mixed_n16 materialising all 15 F64 payload fields
+    (codec-dominated). Grid: input float parser (x) x output float serializer (series). ostream (both dirs)
+    is the naive slow anchor; xjb is the new serializer. InMemory prefill, W1, Monitoring/JSON.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: false
+  completion_timeout_s: 300
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: {type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false}
+    input_parser: {f64: FastFloatF64}
+    output_parser: {f64: ZMIJF64}
+    output_formatter: {type: JSON}
+  generator:
+    repeat: 4
+    mode: burst
+    rate: 1000000
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 4
+    NES_INMEM_BUFSIZE: 131072
+
+variants:
+  - name: grid
+    description: "input parser (x) x output parser (series), csv->json f64"
+    queries:
+      - parsergrid/mixed_float_f64
+    axes:
+      x:
+        label: "input float parser"
+        explicit:
+          - {name: fast_float, baseline: true, overrides: {query_config.input_parser: {f64: FastFloatF64}}}
+          - {name: eisel, overrides: {query_config.input_parser: {f64: EiselFloatF64}}}
+          - {name: from_chars, overrides: {query_config.input_parser: {f64: DefaultF64}}}
+          - {name: ostream, overrides: {query_config.input_parser: {f64: OstreamF64}}}
+      series:
+        label: "output float parser"
+        explicit:
+          - {name: zmij, baseline: true, overrides: {query_config.output_parser: {f64: ZMIJF64}}}
+          - {name: to_chars, overrides: {query_config.output_parser: {f64: DefaultF64}}}
+          - {name: xjb, overrides: {query_config.output_parser: {f64: XJBF64}}}
+          - {name: ostream, overrides: {query_config.output_parser: {f64: OstreamF64}}}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: grouped_bar}

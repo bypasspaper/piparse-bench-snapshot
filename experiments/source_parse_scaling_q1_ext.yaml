@@ -1,0 +1,111 @@
+experiment:
+  name: source_parse_scaling_q1_ext
+  description: >
+    EXTENSION of source_parse_scaling_q1 (READ ITS HEADER + RESULTS FIRST) to N = 150/200/
+    250/500 concurrent queries -- pushing the blocking/interpreted arm deep past the HW
+    budget (500 source threads + 24 workers = 524 threads on 48 HT = ~11x oversubscription)
+    and the async arm's fixed 4-io-thread pool to 500 multiplexed sources. Separate
+    experiment file ONLY because pbench has no per-point filtering (re-running the base
+    experiment would redo N=1..100); config is IDENTICAL except:
+      - completion_timeout_s 1800 (N=500 blocking rep moves ~3 TB (500 x 6 x 1GB) at a
+        declining rate -> ~700+ s of data time + 500-pipeline JIT compile + stagger).
+      - admission_queue_size 1024 (500 concurrent submissions; N<=100 ran on the default).
+        Should not affect steady-state throughput, only admission.
+    Join with source_parse_scaling_q1 on (series, N) for the full 1..500 curve.
+
+    BASELINE (source_parse_scaling_q1, N=1/10/50/100):
+      async_compiled      5031 / 11822 / 12331 / 12601 MB/s; p99 0.3 / 2.2 / 5.5 / 12.3 ms
+      blocking_uncompiled  423 /  4713 /  7814 /  6876 MB/s; p50 0.6 / 0.4 / 16.6 / 20.9 ms
+
+    PREDICTIONS (write before running):
+      - async: throughput stays FLAT ~12.3-12.7 GB/s through N=500 (io pool + 24 workers
+        unchanged; per-query rate just divides). p50 grows with queueing (~1.5-3 ms at 500),
+        p99 keeps degrading past 12 ms (output-volume tail, HOL on 4 io threads).
+      - blocking: CONTINUES THE DECLINE, roughly monotone: ~6.3-6.6 @150, ~5.7-6.2 @200,
+        ~5.2-5.8 @250, ~4-5 @500. Mechanism = nonvoluntary-preemption thrash (file sources
+        burn their timeslice parsing, unlike TCP's voluntary wake/park storm) -> GRADUAL
+        decay, no TCP-style cliff. p50 climbs with run-queue depth (~25-35 ms @250, 40-60+
+        @500); p99 40+ ms @500.
+      - Gap widens monotonically: ~2x @150-250, ~2.5-3x @500.
+      - RISK N=500: buffer pressure -- 500 private source pools (64 x 128 KiB = 8 MB each)
+        = 4 GB + 4 GB global pool. If "buffer allocation failure" appears, raise
+        number_of_buffers_in_global_buffer_manager. JIT-compiling 500 pipelines at submit
+        makes wall time long before the window even starts (expected, not a hang).
+
+    GOTCHAS: all of source_parse_scaling_q1's apply (timestamp-propagation fix required,
+    parser overrides only on the async series, `pkill -x main` pre-flight, warm 1GB +
+    repeat 6, rebuild nes-single-node-worker after code changes).
+
+    RESULTS (2026-07-06, reps=3, 0 failures, no buffer pressure at N=500):
+      async_compiled:      N=150/200/250/500 = 12285 / 12367 / 12382 / 12006 MB/s -- FLAT as
+        predicted (N=500 dips only 3%). Latency: p50 1.7 -> 5.4 ms, p99 13.5 -> 16.7 ms,
+        p999 <= 18.5 ms. 500 sources on 4 io threads + 24 workers just divides the rate.
+      blocking_uncompiled: N=150/200/250/500 = 6094 / 5536 / 5102 / 3545 MB/s -- GRADUAL
+        monotone decline (no TCP-style cliff, confirming nonvoluntary-preemption thrash),
+        but STEEPER than predicted at 500 (3545 vs the 4000-5000 band; per-src 7 MB/s).
+        Latency: p50 25 -> 52 ms, p99 36 -> 124 ms, p999 166 ms at N=500.
+      GAP: 2.0x / 2.2x / 2.4x / 3.4x at 150/200/250/500 -- widens monotonically; at N=500
+        the naive setup delivers 30% of the optimized throughput at ~10x the p50 and ~7x
+        the p99 latency. Combined curve (join with source_parse_scaling_q1): blocking peaks
+        at N=50 (7.8 GB/s) and loses ~55% of that peak by N=500.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  worker:
+    query_engine:
+      number_of_worker_threads: 24
+      number_of_io_threads: 4
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+  query_config:
+    sink_type: Monitoring
+  generator:
+    repeat: 6
+
+variants:
+  - name: parse_thread_model_q1
+    description: "Nexmark Q1 high-N extension: async compiled+lazy vs blocking uncompiled sequential, N=150..500"
+    query: nexmark/q1_price
+    axes:
+      x:
+        label: "Concurrent Queries (= Concurrent Sources)"
+        parameter: num_queries
+        values: [150, 200, 250, 500]
+      series:
+        label: "Ingestion + parse model"
+        explicit:
+          - name: async_compiled
+            baseline: true
+            overrides:
+              query_config.source_type: File
+              query_config.input_formatter: { type: SIMDCSV }
+              query_config.input_parser: { uint64: TracedUINT64, int32: TracedINT32, f64: EiselFloatF64 }
+              query_config.output_formatter: { type: CSV }
+              query_config.output_parser: { f64: ZMIJF64 }
+          - name: blocking_uncompiled
+            overrides:
+              query_config.source_type: BlockingFile
+              query_config.input_formatter: { type: SequentialUncompiledCSV, threading_mode: sequential }
+              query_config.output_formatter: { type: CSVUncompiled }
+    y:
+      metric: throughput_mbps
+      label: "Aggregate System Throughput (MB/s)"
+    visualization:
+      type: line_chart
+      x_scale: log

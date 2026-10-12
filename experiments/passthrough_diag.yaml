@@ -1,0 +1,89 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: passthrough_diag
+  description: >
+    BLAST-RADIUS probe for the q1_price fast-path crash. bid_star = SELECT * FROM bid = pure
+    passthrough (all 4 fields lazy, NO filter -> ALL 31M rows emitted) -> maximum stress on piece #1
+    (the all-passthrough bounded-store fast path, commit 343d3d6377). q2_filter_proj = 2-field
+    passthrough projection WITH a filter. If bid_star CRASHES with the same buffer-refcount error ->
+    piece #1 is broken at scale (broad: hits bid_star/q0/person/bid_ts). If bid_star is CLEAN -> the
+    bug is confined to the computed/mixed extension (b807710975), i.e. q1_price/pricecalc only.
+    r3 all-off + r5 inline. W1, bid_1GB, Monitoring (void) sink, CSV->JSON, fast parser. 2 reps.
+    RUN: cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/passthrough_diag.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099 --detach
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 2
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 600
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: default
+      inline_invoke_calls: false
+      trace_constant_bytes: false
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: BlockingFile
+    sink_type: Monitoring
+    input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+    output_formatter: { type: JSON }
+    input_parser: { uint64: TracedUINT64, int64: TracedINT64, int32: FastINT32, int16: TracedINT16, uint32: TracedUINT32, uint16: TracedUINT16, bool: TracedBOOL, f64: EiselFloatF64, f32: EiselFloatF32 }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s)" }
+
+_diag: &diag
+  label: "knobs"
+  explicit:
+    - name: r3_alloff
+      baseline: true
+      overrides:
+        worker.query_engine.invoke_mode_configuration: default
+        worker.query_engine.inline_invoke_calls: false
+        worker.query_engine.trace_constant_bytes: false
+    - name: r5_inline
+      overrides:
+        worker.query_engine.invoke_mode_configuration: fnattr
+        worker.query_engine.inline_invoke_calls: true
+        worker.query_engine.trace_constant_bytes: false
+
+variants:
+  - name: bid_star
+    description: "SELECT * FROM bid - pure passthrough, all rows (piece #1 stress)"
+    query: nexmark/bid_star
+    axes: { x: *noop_x, series: *diag }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: q2_filter_proj
+    description: "SELECT auctionId,price WHERE %123 - passthrough projection, filtered"
+    query: nexmark/q2_filter_proj
+    axes: { x: *noop_x, series: *diag }
+    y: *tput_y
+    visualization: { type: grouped_bar }

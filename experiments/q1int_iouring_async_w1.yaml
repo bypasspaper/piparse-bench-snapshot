@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: q1int_iouring_async_w1
+  description: >
+    Same as q1_iouring_async_w1 but price is INT64 parsed by the NON-TRACED FAST int parser (FastINT64,
+    input_parse-tagged fast_float-for-ints) + integer arithmetic + integer output (DefaultOutputParser,
+    output_parse-tagged). A/B inlining (input_parse+output_parse enabled vs disabled, a BUILD-time config in
+    testing/configurations/InlineTagConfig.yaml -- compare the two run_groups). Question: does inlining the
+    INT parser help like it did for the float codec (+16% on q1)? Hypothesis (user's recollection): int-parse
+    inlining did NOT help historically -- the fast int parse is thin, so the wrapper boundary is a smaller
+    fraction than the float's parseWithEiselFloat/parseF64ZMIJ wrappers.
+
+    IoUringFileAsync O_DIRECT QD16, 1 io + 1 worker, cold single bid_6GB pass, n=3 median. Only PRICE uses
+    FastINT64 (input_parse); the other int fields stay Traced (not input_parse-tagged) so the A/B isolates
+    the price int parser -- mirrors the float q1 where only price used Eisel.
+    GOTCHAS: NES_IOURING_DIRECT needs 512-aligned; don't force QD==pool; pkill -x main; :8080 free; no gen.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: true
+  completion_timeout_s: 120
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 4096
+  query_config:
+    source_type: IoUringFileAsync
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: FastINT64}
+    output_formatter: {type: CSV}
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+  worker_env:
+    NES_IOURING_DIRECT: 1
+    NES_IOURING_QD: 16
+
+variants:
+  - name: q1int_async_w1
+    description: "Q1-int (price INT64 via FastINT64), IoUringFileAsync O_DIRECT QD16, 1io+1worker, cold bid_6GB"
+    query: nexmark/q1_price_int
+    axes:
+      x:
+        label: "config"
+        explicit:
+          - name: "iouring_async_1io_1w"
+            baseline: true
+            overrides: {}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

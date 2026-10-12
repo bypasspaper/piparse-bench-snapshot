@@ -1,0 +1,53 @@
+query:
+  name: nexmark_q1_price
+  description: "Nexmark Q1: price * 908 / 1000 (arithmetic on FLOAT64)"
+
+  sql: "SELECT timestamp, auctionId, bidder, price * FLOAT64(908) / FLOAT64(1000) as price FROM bid"
+
+  # Flink-dialect equivalent for `mode: flink`. Differences from NES SQL above: `timestamp` is a
+  # reserved word in Flink SQL (backtick it); NES typed literals FLOAT64(x) become CAST(x AS DOUBLE)
+  # — same IEEE-754 double arithmetic. Source/sink DDL is auto-derived by render_flink.
+  flink_sql: "SELECT `timestamp`, auctionId, bidder, price * CAST(908 AS DOUBLE) / CAST(1000 AS DOUBLE) AS price FROM bid"
+
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/nexmark/bid_6GB.csv
+          size_bytes: 6442450944
+          rows: 183991721
+        medium:
+          file: large/nexmark/bid_1GB.csv
+          size_bytes: 1089194961
+          rows: 31300000
+        small:
+          file: large/nexmark/bid_653M.csv
+          size_bytes: 666738765
+          rows: 18106394
+        native:
+          # 183,991,721 rows x 24 B (uint64,int32,int32,float64 packed LE); generated from
+          # bid_6GB.csv via nes-systests/testdata/small/csv_to_binary.py
+          file: large/nexmark/bid_6GB.nes
+          size_bytes: 4415801304
+          rows: 183991721
+
+  sink_schema:
+    - { name: bid.timestamp, type: UINT64, not_null: true }
+    - { name: bid.auctionId, type: INT32, not_null: true }
+    - { name: bid.bidder, type: INT32, not_null: true }
+    - { name: price, type: FLOAT64, not_null: true }
+
+  validation:
+    large: { tuples: 183991721, checksum: 370730288260 }
+    # small: 5-FIELD file (see bid_star.yaml). Since the 2026-07-14 LF conversion q1 RUNS on
+    # the fast stack again (only the float field parses; the 2026-07-13 "eisel malformed" was
+    # the CRLF, not the field count) - but full-parse paths still throw, and this checksum
+    # (systest, CRLF era) is STALE for passthrough-bearing outputs.
+    small: { tuples: 18106394, checksum: 30057693220 }
+    # native == large: same doubles in -> same arithmetic -> same ZMIJ CSV output
+    native: { tuples: 183991721, checksum: 370730288260 }

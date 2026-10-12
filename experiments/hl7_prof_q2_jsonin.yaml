@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: hl7_prof_q2_jsonin
+  description: >
+    PROFILING harness (session 2026-07-31): SchemaJSON q2 filter REFERENCE arm -- the comparison
+    window for hl7_prof_q2_hl7in (SIMDHL7 10.7 vs SchemaJSON 15.2 Mrows/s on the same 31.3M
+    logical rows). Same warm x40 repeat, W1 fnattr fullopt, 128KiB, Monitoring sink, n=1.
+    Purpose: per-thread split + hot-symbol diff against the SIMDHL7 profile (band-in-place read
+    vs per-leaf emplace, stage1 kernel cost vs 6-compare HL7 kernel).
+    RUN: cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+      experiments/hl7_prof_q2_jsonin.yaml --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+    then attach: NES_PROFILE_OUTDIR=<scratch> .claude/skills/nes-profile/nes-profile.sh --port 9099 --secs 12 --stat
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: json
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: true
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: BlockingFile
+    sink_type: Monitoring
+    input_formatter: { type: SchemaJSON }
+    output_formatter: { type: CSV }
+    input_parser: { uint64: TracedUINT64, int64: TracedINT64, int32: FastINT32, int16: TracedINT16, uint32: TracedUINT32, uint16: TracedUINT16, bool: TracedBOOL, f64: EiselFloatF64, f32: EiselFloatF32 }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 40
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: prof_q2_jsonin
+    description: "WARM bid json 5.57GB x40, W1 SchemaJSON q2 filter -> CSV out -- reference"
+    query: nexmark/bidstr_iso_q2
+    axes:
+      x:
+        label: "config"
+        explicit:
+          - name: "prof_q2_jsonin"
+            baseline: true
+            overrides: {}
+    y: { metric: throughput_mbps, label: "Throughput (MB/s, input bytes)" }
+    visualization: { type: bar_chart }

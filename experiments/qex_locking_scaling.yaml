@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: qex_locking_scaling
+  description: >
+    LOCKING-SHREDDER companion to qex_serde_matrix_scaling: bypass (SIMDCSV csv->JSON)
+    with sequence_shredder_mode LOCKING, same worker sweep. EXPECT ~= the lock-free bypass
+    curve at 128 KiB (low shredder call-rate; LF/LK was 1.00-1.07 on q2mod ideal sweep).
+    Original description: figure on bidstr q-ex (the query where simd/bypass comes closest
+    to the no-serde bound: 0.90 @W23). x = worker threads {1..23}, y = M records/s. 4 arms = the
+    full 2x2 serde matrix: simd (SIMDCSV lazy csv->JSON, 5-arm parsers = full serde), csv_native
+    (csv->NATIVE, deserialize-only), native_json (SystemNative->JSON, serialize-only), native_native
+    (true no-serde). EXPECT on q-ex (~220 survivors -> output ~free): the matrix collapses into two
+    pairs (natnat 644 ~= natjson 630; simd 580 ~= csvnat 576 @W23 tip probes) -> the figure shows the
+    residual gap = INPUT deserialization only, closing with threads. Tip code state (b5d757c9f6 +
+    knobs + eqImpl early-return fix — REQUIRED: without it simd qex is -29%). reps 6 (q-ex W23 spread
+    is wider than the int filters), repeat 8, MmapFile zero-copy + populate + warm, 128 KiB, fnattr.
+    ⚠️ W1 csv arms ~10-25 s windows (slow end), W23 ~0.4-0.7 s (5-arm footing, median of 6).
+    ⚠️ launch DETACHED (setsid nohup) — harness background tasks were externally killed twice today.
+    RUN: cd ~/work/piparse-bench && pkill -x main; setsid nohup env PBENCH_KEEP_LOGS=1 uv run python \
+           bench.py run experiments/qex_serde_matrix_scaling.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099 \
+           > qex_serde_matrix_scaling.log 2>&1 &
+  primary_metric: throughput_mrows_s
+  higher_is_better: true
+  repetitions: 6
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  worker:
+    query_engine:
+      number_of_worker_threads: 23
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: MmapFile
+    sink_type: Monitoring
+    input_formatter:
+      type: SIMDCSV
+      allow_commas_in_strings: false
+    input_parser:
+      uint64: TracedUINT64
+      int64: TracedINT64
+      int32: FastINT32
+      int16: TracedINT16
+      uint32: TracedUINT32
+      uint16: TracedUINT16
+      f64: EiselFloatF64
+      f32: EiselFloatF32
+      bool: TracedBOOL
+    output_formatter:
+      type: JSON
+    output_parser:
+      f64: ZMIJF64
+      f32: ZMIJF32
+  generator:
+    repeat: 8
+  worker_env:
+    NES_MMAP_POPULATE: '1'
+variants:
+  - name: qex_matrix
+    description: "q-ex 2x2 serde matrix, worker sweep, 128KiB"
+    query: nexmark/matrix/bidstr_qex
+    axes:
+      x:
+        label: "worker threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [1, 2, 4, 8, 12, 16, 20, 23]
+      series:
+        label: "arm"
+        explicit:
+          - name: bypass_locking
+            baseline: true
+            overrides:
+              query_config.input_formatter: { type: SIMDCSV, allow_commas_in_strings: false, sequence_shredder_mode: LOCKING }
+    y:
+      metric: throughput_mrows_s
+      label: "Throughput (M records/s)"
+    visualization:
+      type: line_chart

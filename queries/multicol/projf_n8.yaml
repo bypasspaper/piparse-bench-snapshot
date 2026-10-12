@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+query:
+  name: multicol_projf_n8
+  description: >
+    Field-count sweep point: 8-FLOAT64-column row (.6f floats), project+parse ONLY c0
+    (c0*FLOAT64(1) forces parse+serialize of c0). All 8 delimiters are INDEXED; the COMPILED
+    formatter parses only c0 (projection pushdown) while the UNCOMPILED formatter parses all 8
+    (no pushdown). csv->json. Data large/multicol/nf8.csv (200000079 B, 2295704 rows).
+  sql: "SELECT c0 * FLOAT64(1) AS c0 FROM t"
+  sources:
+    - name: t
+      schema:
+        - { name: c0, type: FLOAT64, not_null: true }
+        - { name: c1, type: FLOAT64, not_null: true }
+        - { name: c2, type: FLOAT64, not_null: true }
+        - { name: c3, type: FLOAT64, not_null: true }
+        - { name: c4, type: FLOAT64, not_null: true }
+        - { name: c5, type: FLOAT64, not_null: true }
+        - { name: c6, type: FLOAT64, not_null: true }
+        - { name: c7, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/multicol/nf8.csv
+          size_bytes: 200000079
+          rows: 2295704
+  sink_schema:
+    - { name: c0, type: FLOAT64, not_null: true }

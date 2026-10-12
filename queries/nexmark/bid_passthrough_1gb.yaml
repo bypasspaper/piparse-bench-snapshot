@@ -1,0 +1,35 @@
+query:
+  name: nexmark_bid_passthrough_1gb
+  description: >
+    Same as bid_passthrough (4-int-field passthrough, lazy CSV fast-path) but on a
+    ~1 GB cut of bid_6GB (head -n 31.3M). Purpose: high source-count sweeps with
+    INDEPENDENT generators, where each generator loads the whole file into RAM — a
+    1 GB file keeps N x file within RAM (N=24 -> ~26 GB) so we can push N far past
+    the bid_6GB RAM limit (N=8 -> 48 GB). Steady-state throughput is data-size
+    independent, so use a higher generator.repeat for a comparable window.
+
+    REGENERATE the data file (not in git) - it's a head-cut of bid_6GB.csv:
+      head -n 31300000 <build>/nes-systests/testdata/large/nexmark/bid_6GB.csv \
+        > <build>/nes-systests/testdata/large/nexmark/bid_1GB.csv
+    (31.3M lines x ~32 B = 1089194961 bytes = the size_bytes below.)
+
+  sql: "SELECT timestamp, auctionId, bidder, price FROM bid"
+
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: INT64, not_null: true }
+      data:
+        large:
+          file: large/nexmark/bid_1GB.csv
+          size_bytes: 1089194961
+          rows: 31300000
+
+  sink_schema:
+    - { name: bid.timestamp, type: UINT64, not_null: true }
+    - { name: bid.auctionId, type: INT32, not_null: true }
+    - { name: bid.bidder, type: INT32, not_null: true }
+    - { name: bid.price, type: INT64, not_null: true }

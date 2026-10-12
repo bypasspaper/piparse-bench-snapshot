@@ -1,0 +1,48 @@
+query:
+  name: nexmark_q22_concat
+  description: "Nexmark q22 (interim CONCAT form): string manipulation over the string-bearing bid - the engine has no SPLIT_INDEX/regex yet"
+
+  # Faithful flink q22 = SPLIT_INDEX(url,'/',3..5) x3. The engine's only string function
+  # today is CONCAT (plus casts), so the interim shape reads both VARSIZED columns,
+  # produces a NEW varsized value per row (CONCAT defeats lazy passthrough elision), and
+  # re-serializes it - the string-manipulation input+output path the user asked for.
+  # Upgrade to real SPLIT_INDEX when the engine grows it (same data works; also unlocks
+  # a simplified q21 - user deferred that one explicitly).
+  sql: |
+    SELECT auctionId, bidder, price, channel, CONCAT(channel, url) AS churl FROM bid
+
+  flink_sql: |
+    SELECT auctionId, bidder, price, channel, CONCAT(channel, url) AS churl FROM bid
+
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+        - { name: channel, type: VARSIZED, not_null: true }
+        - { name: url, type: VARSIZED, not_null: true }
+      data:
+        large:
+          # bid_1GB rows + flink-style channel (80% hot-4 / 20% channel-N tail, max 12) and
+          # url (fixed host + 3 pseudo-random dirs + channel_id param, max 72); deterministic
+          # Knuth-hash per row index - regenerate with the script in pbench commit history
+          # (session 2026-07-13). LF, no commas in strings.
+          file: large/nexmark/bid_strings_3GB.csv
+          size_bytes: 3595281395
+          rows: 31300000
+        native:
+          # 31.3M rows x 110 B (u64,i32,i32,f64 + string[13] + string[73] fixed slots);
+          # footprint csv/nes only 1.044 - string bytes dominate both formats (the
+          # varsized-YSB regime). SystemNative arm needs string_length "13,73".
+          file: large/nexmark/bid_strings_3GB.nes
+          size_bytes: 3443000000
+          rows: 31300000
+
+  sink_schema:
+    - { name: bid.auctionId, type: INT32, not_null: true }
+    - { name: bid.bidder, type: INT32, not_null: true }
+    - { name: bid.price, type: FLOAT64, not_null: true }
+    - { name: bid.channel, type: VARSIZED, not_null: true }
+    - { name: churl, type: VARSIZED, not_null: true }

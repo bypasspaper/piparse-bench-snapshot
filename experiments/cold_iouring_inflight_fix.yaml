@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: cold_iouring_inflight_fix
+  description: >
+    ROOT-CAUSE VALIDATION (session 2026-07-03). The blocking + async io_uring file sources deadlock
+    on the ~6.8 GB/s recipe because forcing NES_IOURING_QD=64 makes the ring queue depth EQUAL the
+    source's private buffer pool, leaving zero refill headroom -> open() primes QD reads, drains the
+    pool, never emits (DIAG parse calls=0, 120s timeout).
+
+    THE CHAIN (all verified in code):
+    - default_max_inflight_buffers defaults to 64 (WorkerConfiguration.hpp).
+    - SourceProvider.cpp:65-77 gives each source its OWN pool sized to that inflight limit (64), a
+      change that POSTDATES the HANDOVER §36-40 runs that measured 6.84 (comment cites §41/§43).
+      Before it, sources drew from the shared 2048-buffer global pool, so QD64 was trivially satisfied.
+    - IoUring{,Async}FileSource auto-size QD = clamp(pool/2, 1, 64) = 32 for a 64-buffer pool,
+      deliberately reserving half the pool as refill headroom. Forcing NES_IOURING_QD=64 bypasses this
+      -> QD == pool == 64 -> deadlock. (File source is immune: QD1.) Ablation proof
+      (cold_iouring_ablation): plain File works ~1.9 GB/s, IoUringAsync buffered hangs -- independent
+      of O_DIRECT/regbuf.
+
+    THE FIX (this experiment): raise default_max_inflight_buffers to 128 so the forced QD64 regains its
+    pool/2 headroom (128/2 = 64). This reproduces the ORIGINAL §36 config (QD64 with 2x headroom).
+    Single arm, blocking IoUringFile, full recipe: O_DIRECT + REGBUF + align512 + QD64, W4/IO1, cold
+    bid_6GB passthrough, SIMDCSV. (number_of_buffers_in_global_buffer_manager=2048 stays for pipeline
+    OUTPUT buffers; the SOURCE pool is default_max_inflight_buffers=128.)
+
+    PREDICTION: WORKS at ~6.7-6.8 GB/s (= §36 blocking IoUringFile regbuf 6.84 = 96% of the 7.03 NVMe
+    cap). If it STILL hangs, the QD-vs-pool story is incomplete -- fall back to DROPPING NES_IOURING_QD
+    (auto QD = pool/2 = 64 with pool 128, or 32 with the default 64 pool; §2: QD>=32 already saturates
+    the device). If it works, the alternative production-clean fixes are: (a) don't force QD (let auto
+    pick pool/2), or (b) clamp forced QD to pool/2 in resolveQueueDepth so a mis-set env can't deadlock.
+
+    GOTCHAS:
+    - worker.default_max_inflight_buffers flattens to --worker.default_max_inflight_buffers (same path
+      as global_buffer_alignment). The SOURCE pool is sized to THIS, not number_of_buffers_in_global.
+    - The source pool inherits the global pool's alignment (SourceProvider.cpp:77 max(align,64)), so
+      global_buffer_alignment:512 -> regbuf engages on the source pool.
+    - cold_read evicts bid_6GB before each rep; generator.repeat=1, single 6.44 GB pass; NO generator.
+    - Sandbox OFF (binds :8080); verify :8080 free + no stray worker/main first.
+    - WATCH rep 1: if it hangs (120s), kill and switch to the drop-QD fallback rather than burn n reps.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: true
+  completion_timeout_s: 120
+  worker:
+    query_engine:
+      number_of_worker_threads: 4
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    global_buffer_alignment: 512
+    number_of_buffers_in_global_buffer_manager: 2048
+    default_max_inflight_buffers: 128
+  query_config:
+    source_type: IoUringFile
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64}
+    output_formatter: {type: CSV}
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+  worker_env:
+    NES_IOURING_DIRECT: 1
+    NES_IOURING_QD: 64
+    NES_IOURING_REGBUF: 1
+
+variants:
+  - name: cold_iouring_inflight_fix
+    description: "COLD bid_6GB passthrough, W4/IO1, IoUringFile O_DIRECT+REGBUF QD64, inflight=128 (QD64 headroom)"
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "config"
+        explicit:
+          - name: "inflight128 QD64"
+            baseline: true
+            overrides: {}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

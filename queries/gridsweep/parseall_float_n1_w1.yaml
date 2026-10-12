@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+query:
+  name: gridsweep_parseall_float_n1_w1
+  description: >
+    2-D grid point (PARSE-ALL companion of the projection grid): 1-field schema, 1-digit values; parse+
+    serialize ALL 1 columns as FLOAT64 (cI*FLOAT64(1)). Index scales with N AND codec scales with N. Subtract the
+    projection grid (parse 1) to isolate the pure per-field parse+serialize cost. Data n1_w1.csv (209715304 B).
+  sql: "SELECT c0 * FLOAT64(1) AS c0 FROM t"
+  sources:
+    - name: t
+      schema:
+        - { name: c0, type: FLOAT64, not_null: true }
+      data:
+        large: { file: large/multicol/n1_w1.csv, size_bytes: 209715304 }
+  sink_schema:
+    - { name: c0, type: FLOAT64, not_null: true }

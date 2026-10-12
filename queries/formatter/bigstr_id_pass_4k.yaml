@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# (id UINT64, s VARSIZED ~4KB) rows. SELECT id: the string makes each row span ~1 buffers @4KiB
+# (forcing the SequenceShredder to reassemble the span), but output is only the 8-byte id -> NO string
+# output copy. Span-sweep sibling of bigstr_id_pass; one point on the spanning-tuple-size x-axis.
+query:
+  name: bigstr_id_pass_4k
+  description: "SELECT id FROM (id, 4KB string): span ~1 buffers @4KiB, tiny id output (no varsized copy)."
+  sql: "SELECT id FROM src"
+  sources:
+    - name: src
+      schema:
+        - { name: id, type: UINT64, not_null: true }
+        - { name: s, type: VARSIZED, not_null: true }
+      data:
+        csv:
+          file: large/formatter/bigstr_id_4k_500m.csv
+          size_bytes: 524291602
+          rows: 130839
+  sink_schema:
+    - { name: src.id, type: UINT64, not_null: true }

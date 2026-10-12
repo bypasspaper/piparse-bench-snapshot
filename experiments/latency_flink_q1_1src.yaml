@@ -1,0 +1,99 @@
+experiment:
+  name: latency_flink_q1_1src
+  # ============================================================================================
+  # LATENCY, 1 SOURCE — the fair Flink analog of NES's MonitoringSink e2e latency, first cut.
+  #
+  # NES measures per-TupleBuffer latency: sourceCreationTimestamp is stamped (us) at READ-START
+  # when the source begins filling a buffer, and MonitoringSink records `arrival - creation` per
+  # buffer, then p50/p99/p999 over all retained per-buffer samples. Under bulk saturation this is
+  # dominated by QUEUE-RESIDENCE time (a buffer waiting in the shared task queue for a worker) —
+  # the decoupling that lets NES parse one stream in parallel.
+  #
+  # Flink (flink_output_format: latency): now_ns() (flink-ext NowNanos, non-deterministic → per
+  # row) stamps an ingestion timestamp as the row is projected off the source; the custom
+  # `latency-blackhole` sink reads it as the last column and records `System.nanoTime() - ingest`.
+  # sample-every is set to operator_buffer_size / avg_row_bytes so one sample ≈ one NES buffer's
+  # worth of input (per-buffer-equivalent granularity). Latencies reported in us (ns/1000) to
+  # match NES.
+  #
+  # FAIRNESS / ARCHITECTURE: with operator chaining on (Flink's default max-efficiency mode)
+  # source+project+sink run in ONE thread with no decoupling queue, so this is Flink's TRUE
+  # per-row processing latency — expected to be small and load-insensitive, because Flink does not
+  # buffer between read and process the way NES does. That difference (NES trades latency for
+  # parse-parallelism via its queue; Flink keeps low latency but parses single-threaded) IS the
+  # finding, not a measurement bug.
+  #
+  # Single source, parallelism 1 (a single non-splittable CSV = one reader thread anyway). Get
+  # this right before scaling to 1..1024 concurrent sources.
+  #
+  # RUN: pbench run experiments/latency_flink_q1_1src.yaml \
+  #        --build-dir <repo>/cmake-build-release --worker-port 8085
+  #   --worker-port is REQUIRED here only because another session's worker was squatting the
+  #   default 8080 (Address already in use); 8085 sidesteps it. Drop it if 8080 is free.
+  #
+  # RESULT (2026-07-15, 3-rep, medium bid_1GB, 1 thread each; latencies ms):
+  #   engine       p50    p99    p999   throughput
+  #   NES(1 wkr)   10.12  11.49  12.05  786 MB/s
+  #   Flink(p=1)    1.54   3.16   11.97   96 MB/s
+  #   At 1 thread Flink has LOWER latency but 8x lower throughput: NES's deep buffer pool trades
+  #   latency for parallel-parse throughput; Flink's shallow bounded source queue caps latency via
+  #   backpressure. Both measure the identical ingest->sink path (read + queue + native parse +
+  #   projection + sink); Flink's per-fetch batch is aligned to NES's operator_buffer_size so the
+  #   per-batch vs per-buffer stamp granularity matches. Instrumentation overhead ~1.4% (noise).
+  # ============================================================================================
+  description: "Flink Q1 e2e per-row latency (1 source, chained) — fair analog of NES MonitoringSink"
+  primary_metric: p50_latency_us
+  higher_is_better: false
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      pin_threads: false
+      invoke_mode_configuration: fnattr
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, f64: EiselFloatF64}
+    output_formatter: {type: CSV}
+    output_parser: {f64: ZMIJF64}
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: q1_latency_1src
+    description: "q1 price projection latency: NebulaStream (Monitoring) vs Flink (latency-blackhole)"
+    query: nexmark/q1_price
+    axes:
+      x:
+        label: "query"
+        explicit:
+          - {name: q1_price, overrides: {}}
+      series:
+        label: "engine"
+        explicit:
+          - {name: NebulaStream, baseline: true, overrides: {}}
+          - name: Flink
+            system: flink
+            overrides:
+              mode: flink
+              flink_execution_mode: streaming
+              flink_output_format: latency
+    y: {metric: p50_latency_us, label: "p50 latency (us)"}
+    visualization: {type: grouped_bar, y_label: "p50 latency (us)"}

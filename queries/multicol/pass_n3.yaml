@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+# Fig2 v2 (2026-09-25): PLAIN projection over N=3 equi-width FLOAT64 (.6f) columns -- the elision-friendly
+# twin of allf_nN. No computed field, so on the compiled LAZY path every output field is a raw-span
+# passthrough (index + copy + JSON key; no float parse, no float format). With INPUT_FORMATTER.eager_parse=true
+# the same query materialises + re-serialises every field (== allf_nN's cost, the anchor check).
+# The naive (uncompiled) arm parses+formats everything regardless. csv->json. Same nf{N}.csv as allf_nN.
+query:
+  name: multicol_pass_n3
+  description: "Fig2 v2 field-count point: plain SELECT of all 3 FLOAT64 columns (csv->json, passthrough-eligible)."
+  sql: "SELECT c0, c1, c2 FROM t"
+  # Flink dialect: identical (plain projection).
+  flink_sql: "SELECT c0, c1, c2 FROM t"
+  sources:
+    - name: t
+      schema:
+        - { name: c0, type: FLOAT64, not_null: true }
+        - { name: c1, type: FLOAT64, not_null: true }
+        - { name: c2, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/multicol/nf3.csv
+          size_bytes: 200000031
+          rows: 6121831
+        xlarge:
+          # nf3.csv concatenated 10x (2026-09-03, Fig2-on-Flink: JVM-length run; same bytes/row)
+          file: large/multicol/nf3_x10.csv
+          size_bytes: 2000000310
+          rows: 61218310
+  sink_schema:
+    - { name: t.c0, type: FLOAT64, not_null: true }
+    - { name: t.c1, type: FLOAT64, not_null: true }
+    - { name: t.c2, type: FLOAT64, not_null: true }

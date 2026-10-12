@@ -1,0 +1,78 @@
+experiment:
+  name: source_parse_scaling_q1_ctrl_io_lift
+  description: >
+    Third control in the thread-budget series (async q1, N=100, one rep per point). The
+    wio_split control showed the 24w/4io plateau was partly INGESTION-bound (18w/6io =
+    13349 MB/s, +6% over baseline) and that there is a queueing knee below ~20 workers
+    (p50 1.2 ms at >=20w vs ~11-13 ms at <=18w). This probe keeps workers AT the knee-safe
+    24 and lifts io to 6 and 8 (30/32 threads total, modest SMT sharing -- which 24w/4io
+    vs 20w/4io already showed is free).
+
+    CONTEXT (all async q1 N=100): 24w/4io 12601 p50 1.2 | 20w/4io 12645 p50 1.2 |
+    18w/6io 13349 p50 10.8 | 16w/8io 11530 p50 12.6.
+
+    PREDICTION: if io supply was the binding constraint at 4io, 24w/6io combines the best
+    of both: ~13.3-13.5 GB/s AND p50 ~1.2 ms (workers stay above the queueing knee).
+    24w/8io tests for further io headroom: if 6io saturates ingestion, 8io adds nothing
+    (or slightly hurts via 32-thread SMT pressure). If instead 24w/6io does NOT reach
+    ~13.3, the 18w/6io number was partly a fluke of its slower drain (deeper queues ->
+    bigger wall-span denominators are HONEST though, so more likely it replicates).
+
+    RESULTS (2026-07-06, 1 rep each) -- PREDICTION HIT EXACTLY:
+      24w/6io = 13634 MB/s, p50 1.1 ms, p99 12.2  <- best throughput AND best latency
+      24w/8io = 13562 MB/s, p50 1.5 ms, p99 12.3  <- io saturates at 6; 8 adds nothing
+      VERDICT: 4 io threads left ~8% aggregate on the table at N=100 (io-supply bound);
+      io=6 is the sweet spot; 30-threads-on-24-cores SMT sharing remains free. The async
+      series in source_parse_scaling{,_q1,_q1_ext} (all 4io) is ~8% UNDERSTATED at N>=50;
+      curve SHAPES unaffected (constant config across N). Full N=100 async q1 leaderboard:
+      24w/6io 13634 (p50 1.1) | 24w/8io 13562 (1.5) | 18w/6io 13349 (10.8) | 20w/4io
+      12645 (1.2) | 24w/4io 12601 (1.2) | 16w/8io 11530 (12.6).
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 600
+  worker:
+    query_engine:
+      number_of_worker_threads: 24
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV }
+    input_parser: { uint64: TracedUINT64, int32: TracedINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  generator:
+    repeat: 6
+  num_queries: 100
+
+variants:
+  - name: io_lift
+    description: "q1, async File+SIMDCSV, N=100, 24 workers, io threads 6 vs 8"
+    query: nexmark/q1_price
+    axes:
+      x:
+        label: "io threads (24 workers fixed)"
+        parameter: worker.query_engine.number_of_io_threads
+        values: [6, 8]
+    y:
+      metric: throughput_mbps
+      label: "Aggregate System Throughput (MB/s)"
+    visualization:
+      type: bar_chart

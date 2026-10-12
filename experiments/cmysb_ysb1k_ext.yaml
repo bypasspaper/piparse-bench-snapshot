@@ -1,0 +1,101 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: cmysb_ysb1k_ext
+  description: >
+    STEADY-STATE closure for the one format-sensitive CM/YSB query: ysb_1k on 24x extended
+    data with FORWARD-shifted event time (current_ms += 5,000,000 per copy - real longer
+    stream, NOT replay; the replay probe cmysb_repeat_probe SIGSEGVs the worker, see there).
+    120M rows, ~11.9GB CSV / 9.36GB native -> ~1-2s measurement windows instead of the
+    47-69ms single-pass ones in cmysb_native_vs_csv (which are ramp-inflated).
+
+    EXPECT (predict-first, from the single-pass run): csv ~7.1 GB/s and native ~8.3 GB/s
+    if the short-window numbers were honest; per-byte NAT/CSV ~1.17 and Mr/s ~1.47. If the
+    short windows flattered one arm (JIT ramp, supply burst), the steady ratio moves - the
+    nexmark v2 analogy (parse-forced scans) says toward per-byte ~1.05-1.11. State grows to
+    4008 windows x 1k groups over the run but stays tiny per instant (tumbling: ~1 live
+    window) - should remain input-bound.
+
+    GOTCHAS: all of cmysb_native_vs_csv's (fast stack incl TracedBOOL, string_length on the
+    native arm); files are ~21GB combined - warm_read both, box has 62GB (evicts the CM
+    files, re-dd them before re-running that experiment); generator repeat MUST stay 1
+    (stateful); no validation entries for the ext files (checksums differ from 1x by
+    construction - correctness is inherited from the certified 1x smoke + same query plan).
+
+    RESULTS run 1 (2026-07-13 morning, 6/6 ok, spread <1%/2%): csv 8597 MB/s / 86.2 Mr/s /
+    1.392s; native 8001 / 102.6 / 1.169s -> per-byte 0.93 "csv-favored", Mr/s 1.19 < the
+    1.279 footprint. Cache class NOT measured for this run - superseded by run 2.
+    RESULTS run 2 (same day, CLASS-CONTROLLED after the user's page-cache-class warning:
+    dd ceilings measured immediately pre-run on the resident files - csv 12.8 GB/s
+    fast-class, nes 10.8 slow-class - preserved through the run, all reps WARM): csv 7912
+    MB/s (62% of own ceiling) / 79.3 Mr/s / 1.877s; native 7838 (73%) / 100.5 / 1.858s.
+    Ratios NAT/CSV: per-byte 0.99 (WASH), Mr/s 1.27 = footprint exactly.
+    CORRECTED READING: run 1's "csv more byte-efficient" was within the cache-class/run
+    wobble (per-byte 0.93 -> 0.99 across runs, +-7% run-dependent; csv and nes are
+    DIFFERENT FILES and roll page-cache classes independently - the user's warning
+    materialized). Class-robust law: per-byte ~ 1.0, rows/s ratio ~ byte footprint -
+    native's win is density and ONLY density. Neither arm sits at its dd wall (62-73%),
+    so per-byte parity is an engine-cost statement, not supply compression. The ramp
+    conclusion stands (single-pass 1.47x was short-window flattery; steady 1.19-1.27).
+    RULE going forward: any csv-vs-native per-byte claim finer than ~10% needs
+    same-session dd ceilings on BOTH files (the v2 protocol).
+  primary_metric: processing_time_s
+  higher_is_better: false
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: xlarge
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 600
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser:
+      uint64: TracedUINT64
+      uint32: TracedUINT32
+      uint16: TracedUINT16
+    output_formatter: { type: CSV }
+  generator:
+    repeat: 1
+
+variants:
+  - name: ysb_1k_ext24
+    description: "YSB 1k campaigns, 120M rows / 24x forward-shifted time, csv vs native"
+    query: yahoo/ysb_1k
+    axes:
+      x:
+        label: "worker threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [16]
+      series:
+        label: "input format"
+        explicit:
+          - name: csv_optimized
+            baseline: true
+            overrides: {}
+          - name: native
+            overrides:
+              data_size: xlarge_native
+              query_config.input_formatter: { type: SystemNative, string_length: "16" }
+              query_config.input_parser: {}
+    y: { metric: processing_time_s, label: "Processing time (s)" }
+    visualization: { type: grouped_bar }

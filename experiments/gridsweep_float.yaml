@@ -1,0 +1,98 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: gridsweep_float
+  description: >
+    2-D THROUGHPUT GRID (float): throughput vs (#fields N) x (value byte-size W), both in {1,2,4,8,16}.
+    25 synthetic datasets large/multicol/n{N}_w{W}.csv (N cols of exactly-W-digit varied values, each
+    ~200MB so a fixed NES_INMEM_REPEAT=20 gives equal ~4GB windows). PROJECT+parse ONLY c0 (1 field) on an N-field schema; codec type FLOAT64
+    (cI*{type}(1) defeats lazy elision). InMemory PREFILL seq W1 (zero-copy, zero-I/O window --
+    comparable to the multicol study). QUOTE CHECKING OFF (allow_commas defaults false -> SequentialCSV runs
+    the NO-QUOTE index kernel). input_parse+output_parse INLINED (committed default) so float codecs fuse;
+    TracedUINT64 auto-fuses.
+    PURPOSE: separate the two axes of per-row cost. W drives delimiter density (index degrades below ~8 B/
+    value: W1/W2 dense/slow, W>=8 near the ~8.5 GB/s AVX2 index ceiling) AND parse digit-count. N amortizes
+    the per-row fixed cost (index newline + dispatch + framing) over more fields.
+    EXPECT: throughput RISES with W (index climbs to ceiling, per-byte parse ~flat) and RISES with N (per-row
+    overhead amortizes); peak N16/W16, trough N1/W1 (tiny dense rows). float ~1.9x int (ZMIJ output).
+    CAVEAT: W16 float = 16-digit values > 2^53 -> lossy double + Eisel >15-digit slow path (a real large-value
+    effect, not a bug). Synthetic values won't match any prior checksum (throughput study).
+    GOTCHAS: datasets in cmake-build-release/.../multicol/ built by scratchpad/gen.c (regenerate if wiped);
+    NES_INMEM_PREFILL=1 + NES_INMEM_REPEAT=20 (throughput x20-corrected; MonitoringSink InMemory-timestamp fix
+    committed); pool 16384; pkill -x main pre-flight + :8080 free; NEVER pkill -f self.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: false
+  completion_timeout_s: 180
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: {type: SequentialCSV, threading_mode: sequential}
+    input_parser: {f64: EiselFloatF64}
+    output_formatter: {type: CSV}
+    output_parser: {f64: ZMIJF64}
+  generator:
+    repeat: 20
+    mode: burst
+    rate: 1000000
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 20
+    NES_INMEM_BUFSIZE: 131072
+variants:
+  - name: gridsweep_float
+    description: "2-D grid: project+parse 1 col of an N-field schema x value byte-size W, InMemory prefill seq W1, quote off"
+    queries:
+      - gridsweep/float_n1_w1
+      - gridsweep/float_n1_w2
+      - gridsweep/float_n1_w4
+      - gridsweep/float_n1_w8
+      - gridsweep/float_n1_w16
+      - gridsweep/float_n2_w1
+      - gridsweep/float_n2_w2
+      - gridsweep/float_n2_w4
+      - gridsweep/float_n2_w8
+      - gridsweep/float_n2_w16
+      - gridsweep/float_n4_w1
+      - gridsweep/float_n4_w2
+      - gridsweep/float_n4_w4
+      - gridsweep/float_n4_w8
+      - gridsweep/float_n4_w16
+      - gridsweep/float_n8_w1
+      - gridsweep/float_n8_w2
+      - gridsweep/float_n8_w4
+      - gridsweep/float_n8_w8
+      - gridsweep/float_n8_w16
+      - gridsweep/float_n16_w1
+      - gridsweep/float_n16_w2
+      - gridsweep/float_n16_w4
+      - gridsweep/float_n16_w8
+      - gridsweep/float_n16_w16
+    axes:
+      x:
+        label: "grid point (n{N}_w{W})"
+        explicit:
+          - name: "sweep"
+            baseline: true
+            overrides: {}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

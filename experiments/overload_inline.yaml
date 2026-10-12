@@ -1,0 +1,188 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: overload_inline
+  description: >
+    OVERLOAD x INLINE microbenchmark (compiler-opt parsing family, micro #4, part 2). Same
+    q2_original OR-chain rig as #2/overload_dedup (SELECT auctionId, price FROM bid WHERE auctionId
+    == c1 OR ... OR ck), 0% match => zero output => the entire measured cost is the FILTER compare.
+    x-axis = k (# OR terms, all on auctionId, distinct constants) in {1,2,3,4,5,6,8,10}. CSV->JSON,
+    InMemory prefill, W1. invoke_mode = fnattr held in ALL arms (invoke-mode was proven MOOT for
+    overload in overload_dedup -- the overload arms coincided across default/fnattr). The 2x2 varies
+    EXACTLY {overload off/on} x {inline_invoke_calls off/on}:
+      * parse_noinline  (overload off, inline off): fnattr GVN dedups the k identical auctionId parses
+                        to ~2 + k SIMD int-compares. THE BEST PARSE STRATEGY (inlining the parse breaks
+                        GVN dedup -- the -2.9x result -- so no-inline is parse's optimum).
+      * parse_inline    (overload off, inline on): the parse invoke is spliced/inlined -> GVN can no
+                        longer CSE the k inlined SWAR parse nests -> k un-merged parses. Parse CRIPPLED
+                        by inlining (evidence for "no inline for parse").
+      * overload_noinline (overload on, inline off): each `==` lowers to an OPAQUE constantEq proxy
+                        (ptr,size,const) -> 0 parses but k un-inlined per-term calls. Overload CRIPPLED
+                        by no-inline (IR-verified: k opaque constantEq calls; loses to GVN at high k).
+      * overload_inline (overload on, inline on): constantEq INLINES -- renderConstantDigits folds to
+                        immediate byte stores + the length check folds; the inner 4-byte memcmp stays a
+                        constant-length call (partial fold, IR-verified). THE BEST OVERLOAD STRATEGY.
+    HEADLINE = the DIAGONAL: parse_noinline (best parse) vs overload_inline (best overload) -- each
+    technique at its own optimum. The off-diagonal (parse_inline, overload_noinline) is the EVIDENCE
+    that inlining HELPS overload but HURTS parse (opposite signs = the crossing, the actual finding).
+    inline_invoke_calls is a RUNTIME knob and lazy_overload/output_parse tags are already enabled in
+    the build => NO rebuild. overload:true lives in the ARM override (dodges the stale validation rule).
+    RUN: cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/overload_inline.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 5
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: false
+      trace_constant_bytes: false
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+    output_formatter: { type: JSON }
+    input_parser: { uint64: FastUINT64, int32: FastINT32, f64: EiselFloatF64 }
+    output_parser: { f64: ZMIJF64 }
+  generator:
+    repeat: 5
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 5
+    NES_INMEM_BUFSIZE: 131072
+
+_arms: &arms
+  label: "arm"
+  explicit:
+    - name: parse_noinline
+      baseline: true
+      overrides:
+        query_config.source_type: InMemory
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: { uint64: FastUINT64, int32: FastINT32, f64: EiselFloatF64 }
+        query_config.output_parser: { f64: ZMIJF64 }
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: fnattr
+        worker.query_engine.inline_invoke_calls: false
+        worker.query_engine.trace_constant_bytes: false
+        overload: false
+        generator.repeat: 5
+    - name: parse_inline
+      overrides:
+        query_config.source_type: InMemory
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: { uint64: FastUINT64, int32: FastINT32, f64: EiselFloatF64 }
+        query_config.output_parser: { f64: ZMIJF64 }
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: fnattr
+        worker.query_engine.inline_invoke_calls: true
+        worker.query_engine.trace_constant_bytes: false
+        overload: false
+        generator.repeat: 5
+    - name: overload_noinline
+      overrides:
+        query_config.source_type: InMemory
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: { uint64: FastUINT64, int32: FastINT32, f64: EiselFloatF64 }
+        query_config.output_parser: { f64: ZMIJF64 }
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: fnattr
+        worker.query_engine.inline_invoke_calls: false
+        worker.query_engine.trace_constant_bytes: false
+        overload: true
+        generator.repeat: 5
+    - name: overload_inline
+      overrides:
+        query_config.source_type: InMemory
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: { uint64: FastUINT64, int32: FastINT32, f64: EiselFloatF64 }
+        query_config.output_parser: { f64: ZMIJF64 }
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: fnattr
+        worker.query_engine.inline_invoke_calls: true
+        worker.query_engine.trace_constant_bytes: false
+        overload: true
+        generator.repeat: 5
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s)" }
+
+variants:
+  - name: k01
+    description: "1-way OR"
+    query: overload/k01
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k02
+    description: "2-way OR"
+    query: overload/k02
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k03
+    description: "3-way OR"
+    query: overload/k03
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k04
+    description: "4-way OR"
+    query: overload/k04
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k05
+    description: "5-way OR (classic NEXMark q2_original)"
+    query: overload/k05
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k06
+    description: "6-way OR"
+    query: overload/k06
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k08
+    description: "8-way OR"
+    query: overload/k08
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k10
+    description: "10-way OR"
+    query: overload/k10
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }

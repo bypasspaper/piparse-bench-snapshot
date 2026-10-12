@@ -1,0 +1,65 @@
+query:
+  name: lrb_q1_avg_speed
+  description: "Linear Road Q1: sliding window AVG speed with HAVING filter"
+
+  sql: |
+    SELECT start, end, highway, direction, positionDiv5280, AVG(speed) AS avgSpeed
+    FROM (SELECT creationTS, highway, direction, position / INT32(5280) AS positionDiv5280, speed FROM lrb)
+    GROUP BY (highway, direction, positionDiv5280)
+    WINDOW SLIDING(creationTS, SIZE 5 MINUTES, ADVANCE BY 1 SEC)
+    HAVING avgSpeed < FLOAT32(40)
+
+  flink_sql: |
+    SELECT CAST(TIMESTAMPDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', CAST(window_start AS TIMESTAMP(3))) AS BIGINT) * 1000 AS `start`, CAST(TIMESTAMPDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', CAST(window_end AS TIMESTAMP(3))) AS BIGINT) * 1000 AS `end`, highway, direction,
+    `position` / 5280 AS positionDiv5280, AVG(CAST(speed AS DOUBLE)) AS avgSpeed
+    FROM TABLE(HOP(TABLE lrb, DESCRIPTOR(`__rt`), INTERVAL '1' SECOND, INTERVAL '5' MINUTE))
+    GROUP BY window_start, window_end, highway, direction, `position` / 5280
+    HAVING AVG(CAST(speed AS DOUBLE)) < 40
+
+  sources:
+    - name: lrb
+      flink_rowtime: { column: creationTS, delay: "0.001 SECOND" }
+      schema:
+        - { name: creationTS, type: UINT64, not_null: true }
+        - { name: vehicle, type: INT16, not_null: true }
+        - { name: speed, type: FLOAT32, not_null: true }
+        - { name: highway, type: INT16, not_null: true }
+        - { name: lane, type: INT16, not_null: true }
+        - { name: direction, type: INT16, not_null: true }
+        - { name: position, type: INT32, not_null: true }
+      data:
+        large:
+          # LF in place (2026-07-14): ExternalData ships CRLF (trailing \r on position INT32
+          # breaks fast parsers). Actual size: the old 587202560 was the name's "560K"
+          # read as MB - the file is 560 KILOBYTES: 16384 rows over 519s of event time
+          # (the 5min window barely fills; measured runs use xlarge).
+          file: large/lrb/linear_road_benchmark_560K.csv
+          size_bytes: 557176
+          rows: 16384
+        native:
+          # 16384 rows x 24 B (u64, i16, f32, i16 x3, i32 packed LE)
+          file: large/lrb/linear_road_benchmark_560K.nes
+          size_bytes: 393216
+          rows: 16384
+        xlarge:
+          # 200 copies of large with creationTS += 520000 ms per copy (seed spans 520
+          # whole seconds; forward time - replay corrupts stateful windows, see
+          # cmysb_repeat_probe). 3.28M rows / 28.9h span.
+          file: large/lrb/lrb_ext200_111M.csv
+          size_bytes: 111435200
+          rows: 3276800
+        xlarge_native:
+          file: large/lrb/lrb_ext200_111M.nes
+          size_bytes: 78643200
+          rows: 3276800
+
+  sink_schema:
+    - { name: lrb.start, type: UINT64, not_null: true }
+    - { name: lrb.end, type: UINT64, not_null: true }
+    - { name: lrb.highway, type: INT16, not_null: true }
+    - { name: lrb.direction, type: INT16, not_null: true }
+    - { name: positionDiv5280, type: INT32, not_null: true }
+    - { name: lrb.avgSpeed, type: FLOAT64, not_null: true }
+
+  validation:
+    large: { tuples: 70916, checksum: 151995926 }

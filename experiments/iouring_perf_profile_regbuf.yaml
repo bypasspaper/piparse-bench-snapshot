@@ -1,0 +1,75 @@
+experiment:
+  name: iouring_perf_profile_regbuf
+  description: >
+    DIG-DEEP into the 5.9 GB/s cold-O_DIRECT IoUringFile ceiling (HANDOVER §27-§31). §31 localized it to
+    the SINGLE DataSrc producer thread (82.6% on-CPU + 17.3% io_cqring_wait; device has headroom, fio=7.0)
+    but never got a SYMBOL-level breakdown of that 82%. This run provides a long STEADY COLD window for a
+    flat perf profile of the DataSrc thread, to answer: is the 82% on-CPU kernel time in the O_DIRECT submit
+    path (get_user_pages_fast + iov_iter + blk, which for O_DIRECT runs INLINE in io_uring_enter on this
+    thread because the pool buffers are UNREGISTERED) -- or user-side emit/pool/atomic work?
+
+    HOW: NES_IOURING_PASSES=12 re-reads bid_6GB 12x. O_DIRECT bypasses the page cache so EVERY pass is cold
+    (no warm-up artifact); ~1.1 s/pass => ~13 s window (single cold pass alone is too short for perf, §30).
+    bid_6GB.csv ends on a newline so each pass's short tail buffer carries no partial tuple across the
+    boundary (multi-pass is correctness-safe here; not guaranteed for non-newline-terminated files).
+
+    Throughput here is ALSO the fair STEADY-STATE number io_uring lacked (§32: it was repeat-1 only; the
+    MonitoringSink reports a RATE = bytes/processing_time, so 12 passes amortize ramp/JIT). Expect ~5.9-6.0.
+
+    RUN ALONGSIDE scripts/perf_datasrc.py (flat profile of the DataSrc tid). Expected top symbols if the
+    hypothesis holds: get_user_pages_fast / gup_*, iov_iter_get_pages, blk/bio submit, __io_submit; if the
+    hypothesis is WRONG: folly MPMC queue, BufferControlBlock prepare atomics, emit/task-queue, clock reads.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: true
+  completion_timeout_s: 180
+  worker:
+    query_engine:
+      number_of_worker_threads: 4
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 4096
+  query_config:
+    source_type: IoUringFile
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64}
+    output_formatter: {type: CSV}
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+  worker_env:
+    NES_IOURING_DIRECT: 1
+    NES_IOURING_QD: 64
+    NES_IOURING_PASSES: 12
+    NES_BUFFER_ALIGN: 512
+    NES_IOURING_REGBUF: 1
+
+variants:
+  - name: iouring_perf_profile_regbuf
+    description: "12-pass cold O_DIRECT IoUringFile QD64, W4/IO1 -- steady window for DataSrc perf profiling"
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "run"
+        explicit:
+          - name: "profile"
+            baseline: true
+            overrides: {}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: w23_native_native_regen
+  description: >
+    PAPER NATIVE-COLUMN REGENERATION at current tip (b5d757c9f6 + knobs + eqImpl early-return fix):
+    10 bidstr matrix queries, NATIVE->NATIVE ONLY (SystemNative string_length "13,73" in, NATIVE out
+    = true no-serde arm, per user: replaces the paper's unreproducible native column, which the 5-arm
+    measured with JSON output). W23, MmapFile zero-copy + NES_MMAP_POPULATE + warm, repeat 8, 128 KiB,
+    fnattr, reps 10 (paper error bars). Metric throughput_mrows_s (native 110 B/row; MB/s NOT
+    comparable to csv arms). Known tip anchors (native->JSON, for sanity NOT equality): q2og/qex ~630,
+    q22 ~197; NATIVE out should be >= JSON out (no serialization on survivors; q0 SELECT* materializes
+    all fields incl 2 varsized -> heaviest). W23 windows ~0.4-2 s = 5-arm footing (median of 10).
+    RUN: cd ~/work/piparse-bench && pkill -x main; PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/w23_native_native_regen.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mrows_s
+  higher_is_better: true
+  repetitions: 10
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: native
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  worker:
+    query_engine:
+      number_of_worker_threads: 23
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: MmapFile
+    sink_type: Monitoring
+    input_formatter:
+      type: SystemNative
+      string_length: "13,73"
+    input_parser: {}
+    output_formatter:
+      type: NATIVE
+    output_parser: {}
+  generator:
+    repeat: 8
+  worker_env:
+    NES_MMAP_POPULATE: '1'
+_wk_x: &wk_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [23]
+_arms: &arms
+  label: "arm"
+  explicit:
+    - name: native_native
+      baseline: true
+      overrides: {}
+_y: &y
+  metric: throughput_mrows_s
+  label: "Throughput (M records/s)"
+variants:
+  - { name: q0,       query: nexmark/matrix/bidstr_q0,       axes: { x: *wk_x, series: *arms }, y: *y, visualization: { type: grouped_bar } }
+  - { name: qproject, query: nexmark/matrix/bidstr_qproject, axes: { x: *wk_x, series: *arms }, y: *y, visualization: { type: grouped_bar } }
+  - { name: qroute,   query: nexmark/matrix/bidstr_qroute,   axes: { x: *wk_x, series: *arms }, y: *y, visualization: { type: grouped_bar } }
+  - { name: q1,       query: nexmark/matrix/bidstr_q1,       axes: { x: *wk_x, series: *arms }, y: *y, visualization: { type: grouped_bar } }
+  - { name: q2og,     query: nexmark/matrix/bidstr_q2og,     axes: { x: *wk_x, series: *arms }, y: *y, visualization: { type: grouped_bar } }
+  - { name: q2mod,    query: nexmark/matrix/bidstr_q2mod,    axes: { x: *wk_x, series: *arms }, y: *y, visualization: { type: grouped_bar } }
+  - { name: q10,      query: nexmark/matrix/bidstr_q10,      axes: { x: *wk_x, series: *arms }, y: *y, visualization: { type: grouped_bar } }
+  - { name: q14,      query: nexmark/matrix/bidstr_q14,      axes: { x: *wk_x, series: *arms }, y: *y, visualization: { type: grouped_bar } }
+  - { name: q22,      query: nexmark/matrix/bidstr_q22,      axes: { x: *wk_x, series: *arms }, y: *y, visualization: { type: grouped_bar } }
+  - { name: qex,      query: nexmark/matrix/bidstr_qex,      axes: { x: *wk_x, series: *arms }, y: *y, visualization: { type: grouped_bar } }

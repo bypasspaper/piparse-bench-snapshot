@@ -1,0 +1,43 @@
+query:
+  name: nexmark_q2_original
+  description: "Nexmark Q2 as in the ORIGINAL paper: 5-way OR point selection (the repo's MOD-123 rewrite lives in q2_filter_proj)"
+
+  # Paper: SELECT itemid, price FROM bid WHERE itemid = 1007 OR 1020 OR 2001 OR 2019 OR 1087.
+  # itemid -> auctionId (same mapping the nexmark-flink repo uses). Tiny output by design
+  # (~few K rows of 184M; the repo rewrote it for that reason) - the interest here is the
+  # FILTER cost: 5 equality comparisons per row amortize ONE int parse, the sharpest case
+  # for lazy eq-overloads (compare raw digit bytes 5x, parse 0x).
+  sql: |
+    SELECT auctionId, price FROM bid
+    WHERE auctionId == INT32(1007) OR auctionId == INT32(1020) OR auctionId == INT32(2001)
+    OR auctionId == INT32(2019) OR auctionId == INT32(1087)
+
+  flink_sql: |
+    SELECT auctionId, price FROM bid
+    WHERE auctionId = 1007 OR auctionId = 1020 OR auctionId = 2001
+    OR auctionId = 2019 OR auctionId = 1087
+
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/nexmark/bid_6GB.csv
+          size_bytes: 6442450944
+          rows: 183991721
+        medium:
+          file: large/nexmark/bid_1GB.csv
+          size_bytes: 1089194961
+          rows: 31300000
+        native:
+          file: large/nexmark/bid_6GB.nes
+          size_bytes: 4415801304
+          rows: 183991721
+
+  sink_schema:
+    - { name: bid.auctionId, type: INT32, not_null: true }
+    - { name: bid.price, type: FLOAT64, not_null: true }

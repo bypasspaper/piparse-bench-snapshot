@@ -1,0 +1,118 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: inmem_w16_probe
+  description: >
+    InMemory W16 CEILING PROBE (paper-workload item 5, session 2026-08-04b): does ONE InMemory
+    source thread feed 16 workers, or does hand-out become the new wall? Three CSV bid_strings
+    queries of very different per-row weight, all SIMDCSV PARALLEL W16 (the r-par rung config:
+    ccx queues + pinning + fnattr/inline/tcb), all from the SAME InMemory prefill source:
+      iso_pass     -> NATIVE out: input parse + materialise only (the input-side ceiling)
+      iso_q2       -> NATIVE out: filter %123, ~0.8% survivors, tiny output (cheapest per-row)
+      passthrough  -> CSV out: full csv->csv serialization (output-bound pole)
+    READ: query-DEPENDENT throughputs = engine-bound, InMemory feeds 16 workers fine; all three
+    pinned at the SAME MB/s = the single source thread is the new wall (then the r-par rung
+    needs sharded InMemory sources before the 480-run matrix).
+    GOTCHAS: NES_INMEM_PREFILL=1 + NES_INMEM_REPEAT=20 -- the runner counts file bytes ONCE, so
+    true_throughput = reported * 20; the x20 is IDENTICAL across variants, so the flat-vs-spread
+    read needs no correction. Prefill loads 3.6GB into a private pool at query REGISTRATION
+    (outside the timed window; needs the RAM). pkill -x main pre-flight + worker port free;
+    NEVER pkill -f (self-kill).
+    RUN: cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/inmem_w16_probe.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: true
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false }
+    output_formatter: { type: NATIVE }
+    input_parser:
+      uint64: TracedUINT64
+      int64: TracedINT64
+      int32: FastINT32
+      int16: TracedINT16
+      uint32: TracedUINT32
+      uint16: TracedUINT16
+      bool: TracedBOOL
+      f64: EiselFloatF64
+      f32: EiselFloatF32
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 20
+    NES_INMEM_BUFSIZE: 131072
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+
+_w16: &w16
+  label: "config"
+  explicit:
+    - name: w16_inmem
+      baseline: true
+      overrides: {}
+
+# The bidstr_iso_* catalog entries name their data representations json/csv/native (no 'large');
+# data_size MUST select 'csv' or the renderer falls back to the FIRST entry (json) and feeds JSON
+# bytes to the CSV parser -> "fast integer parse" failures (burned this session, 2026-08-04).
+_w16csv: &w16csv
+  label: "config"
+  explicit:
+    - name: w16_inmem
+      baseline: true
+      overrides: { data_size: csv }
+
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s, x20 for true)" }
+
+variants:
+  - name: iso_pass_native
+    description: "input-side ceiling: 5-field parse+materialise, NATIVE out"
+    query: nexmark/bidstr_iso_pass
+    axes: { x: *noop_x, series: *w16csv }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: iso_q2_native
+    description: "cheapest per-row: %123 filter, ~0.8% survivors, NATIVE out"
+    query: nexmark/bidstr_iso_q2
+    axes: { x: *noop_x, series: *w16csv }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: passthrough_csv
+    description: "output-bound pole: full csv->csv passthrough serialization"
+    query: nexmark/bid_strings_passthrough
+    axes: { x: *noop_x, series: *w16 }
+    y: *tput_y
+    visualization: { type: grouped_bar }

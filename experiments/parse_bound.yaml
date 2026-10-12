@@ -1,0 +1,84 @@
+experiment:
+  name: parse_bound
+  description: >
+    ⚠️ FLAWED — superseded by q1_float_rebaseline.yaml. This run OMITTED the ZMIJF64
+    output parser, so q1's float OUTPUT used the slow default formatter (q1 is
+    FLOAT-OUTPUT-bound). Also the worker-cli renderer at the time put output parsers
+    in the wrong YAML section (sink config vs parser_config) so they couldn't be set
+    anyway (fixed later). The worker-scaling SHAPE (scales with W, unlike passthrough)
+    is valid; absolute numbers and the "fnattr no-op / NATIVE>CSV" notes are NOT (fnattr
+    is input-parse inlining, off-target for an output-bound query; NATIVE only looked
+    faster because it skips CSV text output). Use q1_float_rebaseline.yaml instead.
+
+    Parse-bound query study (q1 = SELECT timestamp,auctionId,bidder,price*908/1000).
+    Unlike passthrough (parse elided via output_format=CSV; saturates at W=4), q1
+    COMPUTES price -> the float must be parsed (EiselFloatF64) + arithmetic, so parse
+    is real. Two questions in one sweep: (1) does parse-bound scale with workers?
+    (2) does invoke-mode inlining (default vs fnattr; tags parse_not_null + fn-attrs)
+    actually help where parsing matters (claim: +35-50%)? File source (single io
+    thread supplies ~6.7 GB/s >> parse rate, so W is the variable), stateless 512 MB
+    pool optimum (4096 x 128 KiB), repeat 4 (steady). median n=2. Companion §17/§20.4.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 2
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+
+  worker:
+    query_engine:
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr     # overridden per series
+    default_query_execution:
+      operator_buffer_size: 131072          # 128 KiB
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 4096   # 512 MB stateless optimum
+
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter:
+      type: SIMDCSV
+    input_parser:
+      uint64: TracedUINT64
+      int32: TracedINT32
+      int64: TracedINT64
+      f64: EiselFloatF64
+    output_formatter:
+      type: CSV
+
+  generator:
+    repeat: 4
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: q1_price
+    description: "q1 float arithmetic: worker scaling x invoke-mode"
+    query: nexmark/q1_price
+    axes:
+      x:
+        label: "Worker Threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [1, 2, 4, 8, 16]
+      series:
+        label: "invoke mode"
+        explicit:
+          - name: fnattr
+            baseline: true
+            overrides:
+              worker.query_engine.invoke_mode_configuration: fnattr
+          - name: default
+            overrides:
+              worker.query_engine.invoke_mode_configuration: default
+    y:
+      metric: throughput_mbps
+      label: "Throughput (MB/s)"
+    visualization:
+      type: line_chart

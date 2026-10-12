@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: Apache-2.0
+# serde-micro MIXED i2f: TOFLOAT64 cast on K=15 INT64 columns -> FLOAT64 output.
+# Reuses the pure-panel intk15 datasets; needs the TOFLOAT64 function plugin in the binary.
+query:
+  name: serde_micro_i2fk15
+  description: "serde micro mixed: int64 in -> FLOAT64 out (cheap parse, expensive float serialize), K=15"
+  sql: |
+    SELECT TOFLOAT64(c0) AS c0, TOFLOAT64(c1) AS c1, TOFLOAT64(c2) AS c2, TOFLOAT64(c3) AS c3, TOFLOAT64(c4) AS c4, TOFLOAT64(c5) AS c5, TOFLOAT64(c6) AS c6, TOFLOAT64(c7) AS c7, TOFLOAT64(c8) AS c8, TOFLOAT64(c9) AS c9, TOFLOAT64(c10) AS c10, TOFLOAT64(c11) AS c11, TOFLOAT64(c12) AS c12, TOFLOAT64(c13) AS c13, TOFLOAT64(c14) AS c14 FROM src
+  sources:
+    - name: src
+      schema:
+        - { name: c0, type: INT64, not_null: true }
+        - { name: c1, type: INT64, not_null: true }
+        - { name: c2, type: INT64, not_null: true }
+        - { name: c3, type: INT64, not_null: true }
+        - { name: c4, type: INT64, not_null: true }
+        - { name: c5, type: INT64, not_null: true }
+        - { name: c6, type: INT64, not_null: true }
+        - { name: c7, type: INT64, not_null: true }
+        - { name: c8, type: INT64, not_null: true }
+        - { name: c9, type: INT64, not_null: true }
+        - { name: c10, type: INT64, not_null: true }
+        - { name: c11, type: INT64, not_null: true }
+        - { name: c12, type: INT64, not_null: true }
+        - { name: c13, type: INT64, not_null: true }
+        - { name: c14, type: INT64, not_null: true }
+      data:
+        csv:
+          file: large/serde_micro/intk15.csv
+          size_bytes: 296663093
+          rows: 2000000
+        native:
+          file: large/serde_micro/intk15.nes
+          size_bytes: 240000000
+          rows: 2000000
+  sink_schema:
+    - { name: c0, type: FLOAT64, not_null: true }
+    - { name: c1, type: FLOAT64, not_null: true }
+    - { name: c2, type: FLOAT64, not_null: true }
+    - { name: c3, type: FLOAT64, not_null: true }
+    - { name: c4, type: FLOAT64, not_null: true }
+    - { name: c5, type: FLOAT64, not_null: true }
+    - { name: c6, type: FLOAT64, not_null: true }
+    - { name: c7, type: FLOAT64, not_null: true }
+    - { name: c8, type: FLOAT64, not_null: true }
+    - { name: c9, type: FLOAT64, not_null: true }
+    - { name: c10, type: FLOAT64, not_null: true }
+    - { name: c11, type: FLOAT64, not_null: true }
+    - { name: c12, type: FLOAT64, not_null: true }
+    - { name: c13, type: FLOAT64, not_null: true }
+    - { name: c14, type: FLOAT64, not_null: true }

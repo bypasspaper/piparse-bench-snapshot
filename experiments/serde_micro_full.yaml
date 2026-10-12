@@ -1,0 +1,227 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: serde_micro_full
+  description: >
+    Serde-overhead 2x2 micro, full K=1..20 sweep. r3 footing (compiled default-invoke, no fnattr/
+    inline/tcb, InMemory W1, EiselF64 in / ZMIJF64 out). 5 arms x 20 K x 3 reps. y-axis = rows/s
+    (throughput_mbps is input-encoding-dependent -> NOT comparable; decompose divides by bytes/row).
+    Reported throughput is PER-PASS; true = reported x NES_INMEM_REPEAT(20) (cancels in ratios).
+    Arms: no-serde SystemNative->NATIVE | only-deser CSV(eager)->NATIVE | only-ser SystemNative->JSON |
+    serde CSV(eager)->JSON | serde-naive CSV(eager)->JSONUncompiled+NES_OUTPUT_CODEC=original.
+    Smoke (serde_micro_smoke, K=4) PASSED: ordering + serialize-dominates + serialize cross-check ~12%.
+    RUN: cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/serde_micro_full.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: default
+      inline_invoke_calls: false
+      trace_constant_bytes: false
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+    output_formatter: { type: JSON }
+    input_parser: {}
+    output_parser: {}
+  generator:
+    repeat: 1
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 20
+    NES_INMEM_BUFSIZE: 131072
+
+_fin: &fin { f64: EiselFloatF64 }
+_fout: &fout { f64: ZMIJF64 }
+_env_naive: &env_naive { NES_INMEM_PREFILL: 1, NES_INMEM_REPEAT: 20, NES_INMEM_BUFSIZE: 131072, NES_OUTPUT_CODEC: original }
+
+_arms: &arms
+  label: "serde arm"
+  explicit:
+    - name: no_serde
+      baseline: true
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "1" }
+        query_config.output_formatter: { type: NATIVE }
+        query_config.input_parser: {}
+        query_config.output_parser: {}
+    - name: only_deser
+      overrides:
+        data_size: csv
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false, eager_parse: true }
+        query_config.output_formatter: { type: NATIVE }
+        query_config.input_parser: *fin
+        query_config.output_parser: {}
+    - name: only_ser
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "1" }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: {}
+        query_config.output_parser: *fout
+    - name: serde
+      overrides:
+        data_size: csv
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false, eager_parse: true }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: *fin
+        query_config.output_parser: *fout
+    - name: serde_naive
+      overrides:
+        data_size: csv
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false, eager_parse: true }
+        query_config.output_formatter: { type: JSONUncompiled }
+        query_config.input_parser: *fin
+        query_config.output_parser: {}
+        worker_env: *env_naive
+
+_noop_x: &noop_x { label: "config", parameter: topology, values: [single-node] }
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s)" }
+
+variants:
+  - name: k1
+    description: "K=1 float64 SELECT *"
+    query: serde_micro/floatk1
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k2
+    description: "K=2 float64 SELECT *"
+    query: serde_micro/floatk2
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k3
+    description: "K=3 float64 SELECT *"
+    query: serde_micro/floatk3
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k4
+    description: "K=4 float64 SELECT *"
+    query: serde_micro/floatk4
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k5
+    description: "K=5 float64 SELECT *"
+    query: serde_micro/floatk5
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k6
+    description: "K=6 float64 SELECT *"
+    query: serde_micro/floatk6
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k7
+    description: "K=7 float64 SELECT *"
+    query: serde_micro/floatk7
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k8
+    description: "K=8 float64 SELECT *"
+    query: serde_micro/floatk8
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k9
+    description: "K=9 float64 SELECT *"
+    query: serde_micro/floatk9
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k10
+    description: "K=10 float64 SELECT *"
+    query: serde_micro/floatk10
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k11
+    description: "K=11 float64 SELECT *"
+    query: serde_micro/floatk11
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k12
+    description: "K=12 float64 SELECT *"
+    query: serde_micro/floatk12
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k13
+    description: "K=13 float64 SELECT *"
+    query: serde_micro/floatk13
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k14
+    description: "K=14 float64 SELECT *"
+    query: serde_micro/floatk14
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k15
+    description: "K=15 float64 SELECT *"
+    query: serde_micro/floatk15
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k16
+    description: "K=16 float64 SELECT *"
+    query: serde_micro/floatk16
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k17
+    description: "K=17 float64 SELECT *"
+    query: serde_micro/floatk17
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k18
+    description: "K=18 float64 SELECT *"
+    query: serde_micro/floatk18
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k19
+    description: "K=19 float64 SELECT *"
+    query: serde_micro/floatk19
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k20
+    description: "K=20 float64 SELECT *"
+    query: serde_micro/floatk20
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }

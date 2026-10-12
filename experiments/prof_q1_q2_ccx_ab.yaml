@@ -1,0 +1,114 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: prof_q1_q2_ccx_ab
+  # OVERFLOW-REGIME A/B (user ask 2026-07-09): q1_price + q2_filter_proj csv, queue OFF/ON,
+  # pinned W{5,11,17,23}. q2 = the supply-bound regime already validated (sharded flat, +48.5%
+  # @W23). q1 = the COMPUTE-heavy regime the steal path must carry: ~0.82 GB/s/worker (ZMIJ
+  # float output dominates), so CCX0's 5 owners cap at ~4.1 GB/s and W11+ throughput REQUIRES
+  # remote workers stealing from shard 0. Question: does the sharded queue still PROFIT from
+  # additional workers (single-queue q1 peaked 7.04 GB/s @W11 then declined), or does the
+  # 100us steal delay strangle the overflow?
+  # EXPECT (predict-first):
+  #   q2: reproduces prof_q2_wall_ccx_queues (sharded ~flat 9.7-10; single 9.7 -> ~6.5 @W23).
+  #   q1 W5: both arms ~4.5 (compute-bound, queue irrelevant).
+  #   q1 W11 sharded: remote duty cycle ~ task(160us)/(delay 100us + task) ~= 62% -> effective
+  #     capacity ~ 4.1 + 6*0.62*0.82 ~= 7.2 GB/s ~= single's peak (WASH at W11); steal fraction
+  #     ~40% (the overflow share), which partially re-poisons the ring -> io drag returns for
+  #     that share.
+  #   q1 W17/23 sharded: single declines (6.6/6.3, coupling drag); sharded should HOLD or edge
+  #     up (~7-9?) - more remote capacity, owner share stays local. FAILURE SIGNATURE: sharded
+  #     q1 stuck at ~4.5 at W11 = the delay strangles overflow -> next knob is a smaller
+  #     NES_CCX_STEAL_DELAY_US (duty-vs-poisoning tradeoff sweep).
+  # Stats via NES_TASKQUEUE_STATS (worker.log): expect q1 stolen fraction to be LARGE (~40%)
+  # and roughly = the overflow share; valveTrips=0.
+  # GOTCHAS: dd-preflight bid_6GB.csv (page class re-rolls; ~12.4-12.6 this session -> wall
+  # ~9.7-10, NOT the historical 11.2); stray-worker check; q1 csv W5 pass ~70s (repeat 50).
+  #
+  # RESULTS (2026-07-09, 16/16 ok; bid csv dd class 11.3 GB/s this session -> wall ~9, so
+  # absolute numbers sit below the 12.4-14.9-class sessions; within-session A/B clean):
+  #   q1_price        W5           W11          W17          W23
+  #     single        4431         6300 (peak)  5745         5603
+  #     ccx_sharded   4610 (+4%)   6816 (+8%)   6681 (+16%)  6438 (+15%)
+  #     stolen frac   0%           33.8%        34.5%        34.3%
+  #   q2_filter_proj  W5           W11          W17          W23
+  #     single        9031         7173         6276         6035
+  #     ccx_sharded   8947 (-1%)   8842 (+23%)  8719 (+39%)  8750 (+45%)
+  #     stolen frac   0%           0.75%        1.5%         1.7%
+  # ANSWER (user question "does sharded still profit from additional workers?"): YES —
+  #   q1 sharded CLIMBS W5->W11 +48% (4610->6816), i.e. the steal path carries the overflow;
+  #   the stolen fraction ~34% == the predicted overflow share (owners cap ~4.1 GB/s of ~6.8).
+  #   Sharded also DECLINES far more gently past its peak (6816->6438, -5.6%) than single
+  #   (6300->5603, -11%), and beats single at EVERY W>=11 in BOTH regimes.
+  # PREDICTION SCORECARD: q1 W11 predicted "wash ~7.2 vs single peak" -> actual sharded 6816
+  #   vs single 6300 (+8%, small WIN not wash; duty-cycle estimate was conservative because
+  #   owners take the majority share locally). q2 reproduces the earlier A/B. Failure signature
+  #   (sharded stuck at 4.5) did NOT occur — the 100us delay does not strangle overflow.
+  # Residual q1 gap to ideal: the ~34% stolen share still pays cross-CCX RFO on its buffers +
+  #   the per-steal delay tax; levers if needed: NES_CCX_STEAL_DELAY_US sweep (duty vs
+  #   poisoning), or structurally multiple sources/io threads spread across CCXs so each shard
+  #   has its own feed.
+  description: "q1 (overflow regime) + q2 (supply regime) csv: CCX-sharded queue OFF/ON x W{5,11,17,23}"
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  completion_timeout_s: 300
+  worker:
+    query_engine:
+      number_of_worker_threads: 5
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser: { uint64: TracedUINT64, int32: FastINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  worker_env:
+    NES_TASKQUEUE_STATS: 1
+  generator:
+    repeat: 50
+
+_series: &ccx_series
+  label: "task queue"
+  explicit:
+    - name: single_queue
+      baseline: true
+      overrides: {}
+    - name: ccx_sharded
+      overrides:
+        worker.query_engine.ccx_aware_task_queues: true
+
+_axes_x: &w_sweep
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [5, 11, 17, 23]
+
+variants:
+  - name: q1_price_ccx_ab
+    query: nexmark/q1_price
+    axes: { x: *w_sweep, series: *ccx_series }
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: line_chart }
+
+  - name: q2_filter_proj_ccx_ab
+    query: nexmark/q2_filter_proj
+    axes: { x: *w_sweep, series: *ccx_series }
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: line_chart }

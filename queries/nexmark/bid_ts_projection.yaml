@@ -1,0 +1,45 @@
+query:
+  name: nexmark_bid_ts_projection
+  # Faithful port of the "SELECT timestamp FROM bid" pre-Nexmark warm-up query from
+  # nes-systests/benchmark/Nexmark_with_varsized.test (it appears there twice; once here).
+  # Strict 1-of-4 projection: the compiled lazy CSV path indexes all delimiters but parses ONLY
+  # the UINT64 timestamp column; SystemNative reads it at a fixed stride with no indexing at all.
+  # NOT the same as nexmark/bid_projection (that one projects auctionId+price, 2 of 4).
+  description: "SELECT timestamp (UINT64, 1 of 4 fields) FROM bid"
+
+  sql: "SELECT timestamp FROM bid"
+
+  flink_sql: "SELECT `timestamp` FROM bid"
+
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/nexmark/bid_6GB.csv
+          size_bytes: 6442450944
+          rows: 183991721
+        medium:
+          # head -n 31300000 of bid_6GB.csv (~1 GB) -- fast W1 passes for the writeRawBytes A/B.
+          file: large/nexmark/bid_1GB.csv
+          size_bytes: 1089194961
+          rows: 31300000
+        native:
+          # 183,991,721 rows x 24 B (uint64,int32,int32,float64 packed LE). Generated from
+          # bid_6GB.csv with nes-systests/testdata/small/csv_to_binary.py layout rules.
+          file: large/nexmark/bid_6GB.nes
+          size_bytes: 4415801304
+          rows: 183991721
+
+  sink_schema:
+    - { name: bid.timestamp, type: UINT64, not_null: true }
+
+  validation:
+    large: { tuples: 183991721, checksum: 127905527607 }
+    # native == large: pure-numeric roundtrip through the binary format with CSV output on the
+    # sink side produces byte-identical materialized output (confirmed by the smoke test).
+    native: { tuples: 183991721, checksum: 127905527607 }

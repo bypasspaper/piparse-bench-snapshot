@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: Apache-2.0
+query:
+  name: nexmark_person_xml_passthrough
+  description: >
+    person passthrough (5-of-8 projection, varsized-heavy) over packed record-per-line XML
+    input, parsed by the HL7 indexer configured for XML (class {<,>}, 1-byte '\n' delimiter,
+    comp/sub disabled -- see nexmark/bid_xml_passthrough.yaml for the model). Generated 1:1
+    from person_840MB.csv via scripts/xml/convert_csv_to_xml.py (tags id/nm/em/cc/ct/st/ts/ex,
+    root rec). Same 4M logical rows; XML footprint 1.18GB = +84 B/row tag glue. SCHEMA = ALL 37
+    leaves (arity 4F+5, F=8), values at slots 4f+4 (4,8,...,32); long varsized payloads (the
+    150-char extra) amortize per-event cost -- the dataset where XML should track HL7 (arity
+    25) closest.
+  sql: |
+    SELECT id, name, email_address, city, state FROM person
+  sources:
+    - name: person
+      schema:
+        - { name: x01, type: VARSIZED }
+        - { name: x02, type: VARSIZED }
+        - { name: x03, type: VARSIZED }
+        - { name: x04, type: VARSIZED }
+        - { name: id, type: INT32, not_null: true }
+        - { name: x05, type: VARSIZED }
+        - { name: x06, type: VARSIZED }
+        - { name: x07, type: VARSIZED }
+        - { name: name, type: VARSIZED, not_null: true }
+        - { name: x08, type: VARSIZED }
+        - { name: x09, type: VARSIZED }
+        - { name: x10, type: VARSIZED }
+        - { name: email_address, type: VARSIZED, not_null: true }
+        - { name: x11, type: VARSIZED }
+        - { name: x12, type: VARSIZED }
+        - { name: x13, type: VARSIZED }
+        - { name: credit_card, type: VARSIZED, not_null: true }
+        - { name: x14, type: VARSIZED }
+        - { name: x15, type: VARSIZED }
+        - { name: x16, type: VARSIZED }
+        - { name: city, type: VARSIZED, not_null: true }
+        - { name: x17, type: VARSIZED }
+        - { name: x18, type: VARSIZED }
+        - { name: x19, type: VARSIZED }
+        - { name: state, type: VARSIZED, not_null: true }
+        - { name: x20, type: VARSIZED }
+        - { name: x21, type: VARSIZED }
+        - { name: x22, type: VARSIZED }
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: x23, type: VARSIZED }
+        - { name: x24, type: VARSIZED }
+        - { name: x25, type: VARSIZED }
+        - { name: extra, type: VARSIZED, not_null: true }
+        - { name: x26, type: VARSIZED }
+        - { name: x27, type: VARSIZED }
+        - { name: x28, type: VARSIZED }
+        - { name: x29, type: VARSIZED }
+      data:
+        xml:
+          file: large/nexmark/person_840MB.xml
+          size_bytes: 1180941057
+          rows: 4000000
+  sink_schema:
+    - { name: person.id, type: INT32, not_null: true }
+    - { name: person.name, type: VARSIZED, not_null: true }
+    - { name: person.email_address, type: VARSIZED, not_null: true }
+    - { name: person.city, type: VARSIZED, not_null: true }
+    - { name: person.state, type: VARSIZED, not_null: true }

@@ -1,0 +1,84 @@
+experiment:
+  name: tcp_source_count_dram
+  description: >
+    Push the TCP aggregate-ingestion ceiling to TEST THE DRAM THEORY. The multigen
+    sweep (tcp_source_count_multigen.yaml) plateaued ~14-15 GB/s from N=4 on with
+    independent generators (so NOT the single generator) — hypothesised to be the
+    box memory/DRAM-bandwidth ceiling for the full ingestion path (gen send-copy +
+    kernel + engine recv-copy + SIMD index + lazy out-copy). PREDICTION if DRAM-bound:
+    aggregate stays FLAT ~14-15 GB/s as N rises 4 -> 24, because DRAM is a shared
+    resource that more sources/cores/generators cannot grow. If instead aggregate
+    keeps RISING with N, it was NOT DRAM-bound (some per-source/per-core cap).
+
+    Uses the 1 GB file (bid_passthrough_1gb) so N independent generators fit RAM
+    (N x ~1.09 GB; N=24 -> ~26 GB). W=8 (passthrough is io/memory-bound; W8 was the
+    multigen winner), IO=8, 512 MB pool, repeat 8 (~8.7 GB/query steady window),
+    independent generators (one process per query, own port).
+
+    GOTCHAS:
+    - Independent gen loads N x 1.09 GB into RAM; N<=24 here (~26 GB on 64 GB box).
+    - Core budget (48t): N gen (~1 thread) + IO=8 + W=8; N=24 -> ~40 threads.
+    - Aggregate = sum of N per-query MonitoringSink throughputs. Passthrough recycles
+      buffers so the 512 MB stateless pool is correct.
+    - To DIRECTLY confirm DRAM-bound, measure DRAM bandwidth during a saturated run:
+      perf stat -a -e amd_df/dram_channel_data_controller_0..7/ -- sleep 8  (x64B/transfer,
+      sum channels) vs the ESTABLISHED achievable peak ~84 GB/s (stage-1
+      dram_peak_probe.cpp / amd-uprof; the engine already hits ~76 GB/s via UNION
+      source parallelization -- this is the TCP-path cross-check). amd-uprof
+      (AMDuProfPcm) is installed as an alternative. Run that separately, not via pbench.
+
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 2
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+
+  worker:
+    query_engine:
+      number_of_worker_threads: 8
+      number_of_io_threads: 8
+      invoke_mode_configuration: fnattr
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 4096
+
+  query_config:
+    source_type: TCP
+    sink_type: Monitoring
+    input_formatter:
+      type: SIMDCSV
+    input_parser:
+      uint64: TracedUINT64
+      int32: TracedINT32
+      int64: TracedINT64
+    output_formatter:
+      type: CSV
+
+  generator:
+    repeat: 8
+    mode: burst
+    rate: 1000000
+    independent_per_query: true
+
+variants:
+  - name: dram_ceiling
+    description: "aggregate ingestion vs source count (push N), independent generators, W=8"
+    query: nexmark/bid_passthrough_1gb
+    axes:
+      x:
+        label: "Concurrent TCP sources (independent generators)"
+        parameter: num_queries
+        values: [4, 8, 12, 16, 24]
+    y:
+      metric: throughput_mbps
+      label: "Aggregate Throughput (MB/s)"
+    visualization:
+      type: line_chart

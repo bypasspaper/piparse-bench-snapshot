@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: prof_q2_csv
+  description: "Long warm window: SIMDCSV(csv) -> JSON, q2 filter (parse auctionId/row), repeat=40, for perf attach."
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: true
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: BlockingFile
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    output_formatter: { type: JSON }
+    input_parser: { uint64: TracedUINT64, int64: TracedINT64, int32: FastINT32, int16: TracedINT16, uint32: TracedUINT32, uint16: TracedUINT16, bool: TracedBOOL, f64: EiselFloatF64, f32: EiselFloatF32 }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 40
+_noop_x: &noop_x { label: "config", parameter: topology, values: [single-node] }
+variants:
+  - name: win
+    query: nexmark/bidstr_iso_q2
+    axes: { x: *noop_x, series: { label: arm, explicit: [ { name: csv_c2j, baseline: true, overrides: {} } ] } }
+    y: { metric: throughput_mbps, label: "MB/s" }
+    visualization: { type: grouped_bar }

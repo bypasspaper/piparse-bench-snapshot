@@ -1,0 +1,142 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: q22_constfold
+  description: >
+    Constant-folding microbenchmark: NEXMark q22 (SELECT auctionId, bidder, price,
+    CONCAT(VARSIZED("<lit>"), channel) AS alert FROM bid) -> JSON, sweeping the length N of the CONCAT
+    constant literal (1,8,16,24,48,96 bytes). Unconditional (no filter) => every row serializes the
+    literal into the output, so the constant copy is on the hot path for all rows. InMemory prefill, W1.
+    The two arms differ in EXACTLY ONE knob:
+      * tcb_off: trace_constant_bytes=false -> the literal (and JSON field-name glue) cross the host->JIT
+        boundary as opaque `inttoptr` host pointers -> LLVM cannot fold them (aliasing/immutability
+        unprovable) -> per-row `call memcpy` with a reload every iteration.
+      * tcb_on:  trace_constant_bytes=true  -> the literal + glue become `@nautilus_const_bytes` globals
+        -> LLVM folds them to immediate/wide stores (movabsq/vmovups), GlobalDCE'd, no call.
+    inline_invoke_calls=true and invoke_mode=fnattr are HELD ON in both arms (the output writer must be
+    inlined for the fold to be reachable -- committed nautilus_inline(json_output_formatter_plugin)).
+    IR-verified (k24): tcb off = 0 const-byte globals / 151 inttoptr; tcb on = 52 const-byte globals /
+    1 inttoptr, literal present as a global. Expectation: the tcb_on/tcb_off ratio grows with N (the
+    constant's byte-share of the output); ~flat at N=1. Prior work found glue-only folding ~+3% (numeric
+    passthrough, CSV_TO_JSON handover); this tests whether a heavy per-row literal makes it matter.
+    RUN: cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/q22_constfold.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 5
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: false
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+    output_formatter: { type: JSON }
+    input_parser: { uint64: FastUINT64, int32: FastINT32, f64: EiselFloatF64 }
+    output_parser: { f64: ZMIJF64 }
+  generator:
+    repeat: 5
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 5
+    NES_INMEM_BUFSIZE: 131072
+
+_arms: &arms
+  label: "arm"
+  explicit:
+    - name: tcb_off
+      baseline: true
+      overrides:
+        query_config.source_type: InMemory
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: { uint64: FastUINT64, int32: FastINT32, f64: EiselFloatF64 }
+        query_config.output_parser: { f64: ZMIJF64 }
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: fnattr
+        worker.query_engine.inline_invoke_calls: true
+        worker.query_engine.trace_constant_bytes: false
+        overload: false
+        generator.repeat: 5
+    - name: tcb_on
+      overrides:
+        query_config.source_type: InMemory
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: { uint64: FastUINT64, int32: FastINT32, f64: EiselFloatF64 }
+        query_config.output_parser: { f64: ZMIJF64 }
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: fnattr
+        worker.query_engine.inline_invoke_calls: true
+        worker.query_engine.trace_constant_bytes: true
+        overload: false
+        generator.repeat: 5
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s)" }
+
+variants:
+  - name: n01
+    description: "1-byte literal (anchor: minimal constant)"
+    query: q22cf/n01
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: n08
+    description: "8-byte literal"
+    query: q22cf/n08
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: n16
+    description: "16-byte literal"
+    query: q22cf/n16
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: n24
+    description: "24-byte literal (~ real q22)"
+    query: q22cf/n24
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: n48
+    description: "48-byte literal"
+    query: q22cf/n48
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: n96
+    description: "96-byte literal"
+    query: q22cf/n96
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }

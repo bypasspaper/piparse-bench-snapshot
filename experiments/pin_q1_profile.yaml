@@ -1,0 +1,33 @@
+experiment:
+  name: pin_q1_profile
+  description: "q1 float parse, IO=1/W=5 pinned pool256, long run to profile per-thread CPU (expect workers ~100%, io thread <100% with headroom => 1 io serves 5 compute-bound workers)."
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  worker:
+    query_engine: {pin_threads: true, number_of_io_threads: 1, number_of_worker_threads: 5, invoke_mode_configuration: fnattr}
+    default_query_execution: {operator_buffer_size: 131072, execution_mode: COMPILER}
+    number_of_buffers_in_global_buffer_manager: 256
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64, f64: EiselFloatF64}
+    output_formatter: {type: CSV}
+    output_parser: {f64: ZMIJF64}
+  generator: {repeat: 60, mode: burst, rate: 1000000}
+variants:
+  - name: pin_q1_profile
+    description: "q1 IO1/W5 pinned long run"
+    query: nexmark/q1_price
+    axes: {x: {label: "w", parameter: worker.query_engine.number_of_worker_threads, values: [5]}}
+    y: {metric: throughput_mbps, label: "MB/s"}
+    visualization: {type: bar_chart}

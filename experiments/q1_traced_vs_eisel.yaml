@@ -1,0 +1,130 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: q1_traced_vs_eisel
+  description: >
+    Does emitting the float INPUT parse as TRACED nautilus IR (fused into the JIT scan loop) beat the
+    Eisel-Lemire proxy on Nexmark-Q1? Motivation: the sequential q1 profile showed the float parse running
+    as SEPARATE native symbols (parseWithEiselFloat / parseNumberString ~= 33% of the DataSrc thread) --
+    i.e. a native call from the JIT loop, NOT fused -- despite nautilus_inline. The traced-INT path avoids
+    exactly this (its SWAR digit ops fuse into the loop). This tests the float analogue.
+
+    THE TWO ARMS (same sequential IoUringFile O_DIRECT read + SequentialCSV; only the F64 input parser differs):
+    - eisel  = EiselFloatF64 (hand-rolled fast_float/Eisel-Lemire in a NAUTILUS_TAGGED_INVOKE proxy). Baseline.
+    - traced = TracedFloatF64 (NEW): the common decimal fast path -- scalar accumulate mantissa + count
+      fractional digits + Clinger scale `mantissa / 10^frac` against a 23-entry pow10 table -- emitted as
+      val<> trace ops so it fuses into the JIT loop. Hard cases (exponent notation, > 15 digits, malformed)
+      fall back to a fast_float proxy. q1's bid prices are INTEGER-valued floats (exp 0) -> they hit the
+      Clinger fast path, so the whole per-row float parse should fuse.
+
+    CORRECTNESS (must pass before trusting throughput): the Clinger fast path is bit-identical to Eisel's
+    tryFastPath and the fallback is the same algorithm class, so the Checksum-sink output MUST match Eisel
+    exactly. Expected q1 large (bid_6GB): tuples 183991721, checksum 370730288260 (from queries/nexmark/
+    q1_price.yaml validation). The `checksum` variant A/Bs this; if traced != eisel, the traced scan has a bug.
+
+    EXPECTED (predict-before-measure): traced >= eisel. Baseline eisel q1 seq ~675 MB/s (this session).
+    If the parse truly fuses, expect a meaningful lift (the int-traced precedent + removing a native call
+    boundary per row). If it ties, the InliningPass was already fusing Eisel and the win is only on ARM.
+
+    ACTUAL RESULT (2026-07-04, run_group 20260703T18xx): CORRECTNESS PASS -- both arms checksum
+    183991721,370730288260 (bit-identical, == validation). THROUGHPUT: eisel 676.8 vs traced 683.0 MB/s =
+    +0.9% == A WASH (within run-to-run noise). BUT the profile of the traced arm PROVES the fusion happened:
+    parseWithEiselFloat / parseNumberString VANISH as native symbols (they were 33% of DataSrc in the eisel
+    arm) and the input float parse moves entirely into the [JIT] blocks. So tracing DID fuse the parse into
+    the JIT loop -- it just did not change throughput, because the 33% was REAL ARITHMETIC WORK, not
+    proxy-call overhead. (Contrast int: traced-int replaced a scalar/lib parse with SWAR-in-IR = a genuine
+    work reduction; here the traced loop is SCALAR while Eisel already uses SWAR, so fusion offset the
+    scalar-vs-SWAR loss and netted ~0; plus q1's integer floats do a wasted /1.0 divide where Eisel does *1.0.)
+    CONCLUSION: on x86 (InliningPass available), tracing the float INPUT parse is throughput-neutral. After
+    fusing the input parse, the top remaining NAMED cost is the float OUTPUT serialize (zmij::write +
+    parseF64ZMIJ ~24% of DataSrc, still an un-fused native proxy) -- that, not the input parse, is the next
+    lever. The TracedFloatF64 plugin stays (still valuable on ARM, where the Eisel proxy is NOT inlined).
+
+    CONFIG: fastest stack (fnattr + 131072 buffer + COMPILER + native), IoUringFile O_DIRECT+regbuf+QD64,
+    inflight128, W1/IO1, large bid_6GB single COLD pass (~6-9 s), n=3 median (checksum n=1).
+    GOTCHAS: default_max_inflight_buffers=128 (>=2*QD) or open() deadlocks; global_buffer_alignment=512 for
+    O_DIRECT+regbuf; sequential formatter needs a dedicated-thread blocking source (IoUringFile qualifies);
+    `pkill -x main` pre-flight, :8080 free (stale worker serves wrong numbers); NEVER pkill -f self-match.
+    Requires a build with the TracedFloatInputParsers plugin (nes-plugins/CMakeLists.txt).
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: true
+  completion_timeout_s: 120
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    global_buffer_alignment: 512
+    number_of_buffers_in_global_buffer_manager: 2048
+    default_max_inflight_buffers: 128
+  query_config:
+    source_type: IoUringFile
+    sink_type: Monitoring
+    input_formatter: {type: SequentialCSV, threading_mode: sequential}
+    input_parser:
+      uint64: TracedUINT64
+      int32: TracedINT32
+      int64: TracedINT64
+      f64: EiselFloatF64
+    output_formatter: {type: CSV}
+    output_parser:
+      f64: ZMIJF64
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+  worker_env:
+    NES_IOURING_DIRECT: 1
+    NES_IOURING_QD: 64
+    NES_IOURING_REGBUF: 1
+
+variants:
+  - name: throughput
+    description: "Q1 seq IoUringFile, Monitoring+CSV (double parse): EiselFloatF64 vs TracedFloatF64"
+    query: nexmark/q1_price
+    axes:
+      x:
+        label: "f64 input parser"
+        explicit:
+          - name: "eisel"
+            baseline: true
+            overrides: {query_config.input_parser.f64: EiselFloatF64}
+          - name: "traced"
+            overrides: {query_config.input_parser.f64: TracedFloatF64}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}
+
+  - name: checksum
+    description: "Q1 seq IoUringFile, Checksum sink: traced MUST match eisel (183991721, 370730288260)"
+    query: nexmark/q1_price
+    repetitions: 1
+    axes:
+      x:
+        label: "f64 input parser"
+        explicit:
+          - name: "eisel"
+            baseline: true
+            overrides:
+              query_config.sink_type: Checksum
+              query_config.input_parser.f64: EiselFloatF64
+          - name: "traced"
+            overrides:
+              query_config.sink_type: Checksum
+              query_config.input_parser.f64: TracedFloatF64
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

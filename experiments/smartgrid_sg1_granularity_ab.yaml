@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: smartgrid_sg1_granularity_ab
+  description: >
+    ANOMALY CHASE (user flag 2026-07-13): in smartgrid_native_vs_csv, native input is 17%
+    SLOWER per row than csv on the 1h-window state monsters (sg1 9.30s csv vs 11.26s
+    native; sg3 same 0.83x) - with identical rows, identical (tiny) output, and input
+    bytes negligible against the wall, there is NO legitimate format mechanism that size.
+    HYPOTHESIS UNDER TEST - source-buffer granularity: at operator_buffer_size 128KiB the
+    native file packs ~5957 rows/buffer (22 B/row) vs csv's ~4571 (28.66 B/row avg), so
+    watermarks advance in coarser event-time steps (~14.9s vs ~11.4s per buffer at ~400
+    rows/event-sec) and the sliding-window trigger/slice-emission work batches differently.
+    DESIGN: sg1 only (shortest anomalous run), 4 arms:
+      csv_128k   - control, expect ~9.3s
+      nat_128k   - control, expect ~11.3s
+      nat_row4571 - native @ operator_buffer_size 100544 (~4570 rows/buffer = csv's)
+      csv_row5957 - csv @ operator_buffer_size 170752 (~5957 rows/buffer = native's)
+    PREDICTIONS: if granularity is the whole story, nat_row4571 -> ~9.3s AND csv_row5957
+    -> ~11.3s (the anomaly follows rows/buffer, not format). If the arms do NOT move,
+    granularity is refuted and the next step is a nes-profile of the sg1 pair.
+
+    RESULTS (2026-07-13, 12/12): GRANULARITY REFUTED - row-matched arms sit on their
+    format's control (nat_row4571 [10.95,11.53,13.29] ~ nat_128k [10.59,10.98,11.94];
+    csv_row5957 [9.99,10.77,10.86] ~ csv_128k [10.82,10.86,12.06]). ALSO: pooling per-rep
+    walls across three run_groups shows the sg1 "17%" was tail luck - the persistent sg1
+    deficit is ~5-8% with overlapping distributions; sg3's 21% is real (zero overlap).
+    RESOLUTION (perf on the sg3 pair, flat -F997, 8s steady windows, _sg3_prof run):
+    both arms are CONTENTION-bound in the window-trigger path (top symbol
+    AggregationOperatorHandler::triggerSlices ~11-12%, folly::SharedMutex yieldWait ~3%,
+    plus a futex storm: entry_SYSCALL/pick_next_task/update_curr); the arm DELTA is pure
+    lock contention: native_queued_spin_lock_slowpath 17.4% (native) vs 10.8% (csv), with
+    triggerSlices itself LOWER in native, and native burns MORE total thread-CPU (190s vs
+    175s at the same capture point) despite strictly less input work. MECHANISM: cheap
+    native ingestion delivers buffers to the shared slice/trigger state at higher
+    concurrency; the CSV arm's index+parse cost acts as accidental PACING that spreads
+    lock acquisitions out. "Native slower" = contention collapse in the 1h/1s sliding
+    trigger machinery, not a format cost - the real finding is that sg1/sg3's trigger
+    path is lock-bound at W16 (an engine scalability target, format-independent).
+    GOTCHAS: operator_buffer_size is GLOBAL (also resizes the window/sink buffers - both
+    row-matched arms shrink/grow those identically per arm, watch for second-order
+    effects); everything else from smartgrid_native_vs_csv (x120 file, repeat=1,
+    TracedINT16/EiselFloatF32 stack, string_length for SystemNative).
+  primary_metric: processing_time_s
+  higher_is_better: false
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: xlarge
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser:
+      uint64: TracedUINT64
+      int16: TracedINT16
+      f32: EiselFloatF32
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  generator:
+    repeat: 1
+
+variants:
+  - name: sg1_granularity
+    query: smartgrid/sg1_global_avg
+    axes:
+      x:
+        label: "worker threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [16]
+      series:
+        label: "arm"
+        explicit:
+          - name: csv_128k
+            baseline: true
+            overrides: {}
+          - name: nat_128k
+            overrides:
+              data_size: xlarge_native
+              query_config.input_formatter: { type: SystemNative, string_length: "16" }
+              query_config.input_parser: {}
+          - name: nat_row4571
+            overrides:
+              data_size: xlarge_native
+              query_config.input_formatter: { type: SystemNative, string_length: "16" }
+              query_config.input_parser: {}
+              worker.default_query_execution.operator_buffer_size: 100544
+          - name: csv_row5957
+            overrides:
+              worker.default_query_execution.operator_buffer_size: 170752
+    y: { metric: processing_time_s, label: "Processing time (s)" }
+    visualization: { type: grouped_bar }

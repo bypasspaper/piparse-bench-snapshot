@@ -1,0 +1,132 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: shredder_fragments_source_scaling
+  description: >
+    FRAGMENT-SHREDDER A/B over source fan-in (session 2026-07-12): sequence_shredder_mode
+    LOCK_FREE (classic, pins ~1 buffer/source in the shredder frontier) vs LOCK_FREE_FRAGMENTS
+    (FragmentSequenceShredder: copies the boundary bytes, drops the buffer ref immediately).
+    Setup = prof_ccx_source_scaling_128k_p192: bid_passthrough on bid_1GB (medium), 8io+16w
+    striped cells, cell pools ON at 128 KiB x 192/cell, generator repeat 6.
+
+    TWO CLAIMS UNDER TEST:
+    (1) PARITY at N<=256: fragments are a liveness/working-set fix, NOT a throughput lever
+    (the lazy passthrough pin is unaffected; per FRAGMENT_SHREDDER_PLAN.md A.1 the acceptance
+    bar is "must not regress"). EXPECT both arms ~equal: knee at N~8, plateau ~38-39.5 GB/s,
+    p999 <= 5.7 ms. Watch p50/p99/p999 columns too - the fragment copy adds ~2 x row-size
+    memcpy per buffer (~0.1% of bytes), so any latency delta should be noise.
+    (2) LIVENESS at N>=512 (fragments arm only): classic LOCK_FREE with pool 192 FREEZES
+    reproducibly at N=512 (128 src/cell; 26-368 queries complete then total silence -- the
+    2026-07-11 N=512 EPISODE, discriminator: pool 512 completes at ~19.9 GB/s). The frontier
+    hold is the wedge term (liveness law: pool >= 2 x sources_per_cell). Fragments remove that
+    term, so N=512 AND N=1024 at pool 192 must COMPLETE. Throughput there may sit below the
+    plateau (N=1024 = 256 src/cell on a 192 pool -> sources contend for buffers = throttling,
+    which is fine); the datapoint is COMPLETION, not the rate. We deliberately do NOT re-run
+    the classic N=512 negative control (wedge established 3x on 2026-07-11; a rerun costs a
+    600 s timeout + hung-worker cleanup).
+
+    GOTCHAS: dd-preflight bid_1GB; deployment scales ~1 min per 256 queries (N=1024 ~4 min ->
+    high-N variant gets completion_timeout_s 1200); operator_buffer_size is GLOBAL;
+    DIAG_FRAGSHREDDER (vs DIAG_SHREDDER) in worker.log proves which shredder ran + its CPU
+    share; SIMDCSV publishes the last-delimiter offset eagerly, so the fragments arm really
+    exercises fragment copies, not the pinned fallback. FragmentSequenceShredder ring is 4096
+    entries (vs 65536 classic) - in-flight SN spread per source is bounded by the cell pool
+    (<=192) so out-of-range repeats should be absent; NES_WARNING "out of range" in worker.log
+    would falsify that.
+
+    RESULTS (2026-07-12, 19/20 ok): BOTH CLAIMS CONFIRMED, plus one new finding.
+    (1) PARITY at N<=256: arms equal within single-rep noise; fragments even slightly ahead at
+    N=32/64 (40671/41486 vs 38884/39294). Plateau ~38.8-41.5 GB/s both arms; latency parity
+    (p50 within noise everywhere, p999 <= 5.9 ms both arms; classic's low p50 at N=256 [1723 vs
+    2285 us] is single-rep ramp noise). No out-of-range warnings -> ring 4096 is enough.
+    (2) LIVENESS at N=512 pool 192: COMPLETES at 39768 MB/s = FULL plateau speed with normal
+    tails (p50 2.3 ms, p999 5.8 ms), where classic LOCK_FREE freezes and even classic pool-512
+    only reached ~19.9 GB/s (spilled ring). The frontier-hold wedge is REMOVED and the pool no
+    longer needs to scale with fan-in.
+    (3) RESIDUAL STALL at N=1024 (run 20 FAILED at 1200 s): NOT the shredder, NOT a pool leak
+    -- ROOT-CAUSED same day (see shredder_fragments_stall_repro + FRAGMENT_SHREDDER_RESULTS.md):
+    the ASYNC source runner called BufferManager::getBufferBlocking(), which THROWS
+    BufferAllocationFailure after 1 s of pool dryness; the exception unwound the source
+    coroutine SILENTLY (swallowed by co_spawn's unobserved future), leaving the query
+    zombie-Running forever (~21% of sources whenever shared-pool dry spells exceed 1 s:
+    N=1024 @ 192 and N=512 @ 96 trip it, N<=512 @ 192 stays under). At the freeze the cell
+    pools are FULL and all straggler sources' fds closed. FIXED in the runner (yielding
+    cancellation-aware retry loop + loud Error on loop exceptions); N=512 @ pool 96 then
+    completes 512/512 (throttled ~5 GB/s as expected of the undersized pool), N=1024 close-out
+    in shredder_fragments_n1024_close.yaml. The A/B parity numbers above are unaffected (both
+    arms ran the same old runner; no stragglers below N=512).
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 600
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 8
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+    ccx_shared_source_pools: true
+    ccx_source_pool_buffers: 192
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV }
+    input_parser: { uint64: TracedUINT64, int32: TracedINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  worker_env:
+    NES_TASKQUEUE_STATS: 1
+  generator:
+    repeat: 6
+
+_series: &shredder_series
+  label: "sequence shredder"
+  explicit:
+    - name: lock_free
+      baseline: true
+      overrides:
+        query_config.input_formatter.sequence_shredder_mode: LOCK_FREE
+    - name: lock_free_fragments
+      overrides:
+        query_config.input_formatter.sequence_shredder_mode: LOCK_FREE_FRAGMENTS
+
+_axes_x: &n_sweep
+  label: "Concurrent Queries (= Concurrent Sources)"
+  parameter: num_queries
+  values: [1, 2, 4, 8, 16, 32, 64, 128, 256]
+
+_axes_x_high: &n_high
+  label: "Concurrent Queries (= Concurrent Sources)"
+  parameter: num_queries
+  values: [512, 1024]
+
+variants:
+  - name: ab_pool192
+    query: nexmark/bid_passthrough
+    axes: { x: *n_sweep, series: *shredder_series }
+    y: { metric: throughput_mbps, label: "Aggregate System Throughput (MB/s)" }
+    visualization: { type: line_chart, x_scale: log }
+
+  - name: fragments_high_n_pool192
+    query: nexmark/bid_passthrough
+    overrides:
+      query_config.input_formatter.sequence_shredder_mode: LOCK_FREE_FRAGMENTS
+      completion_timeout_s: 1200
+    axes: { x: *n_high }
+    y: { metric: throughput_mbps, label: "Aggregate System Throughput (MB/s)" }
+    visualization: { type: line_chart, x_scale: log }

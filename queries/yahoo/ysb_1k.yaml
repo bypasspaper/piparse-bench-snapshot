@@ -1,0 +1,70 @@
+query:
+  name: yahoo_ysb_1k
+  description: "Yahoo Streaming Benchmark: tumbling window aggregation, 1k campaign IDs"
+
+  sql: |
+    SELECT
+    start,
+    end,
+    campaign_id, 
+    SUM(user_id) AS sum_user_id
+    FROM ysb1k
+    WHERE event_type < UINT64(1)
+    GROUP BY campaign_id
+    WINDOW TUMBLING(current_ms, SIZE 30 SEC)
+
+  flink_sql: |
+    SELECT CAST(TIMESTAMPDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', CAST(window_start AS TIMESTAMP(3))) AS BIGINT) * 1000 AS `start`, CAST(TIMESTAMPDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', CAST(window_end AS TIMESTAMP(3))) AS BIGINT) * 1000 AS `end`, campaign_id, SUM(user_id) AS sum_user_id
+    FROM TABLE(TUMBLE(TABLE ysb1k, DESCRIPTOR(`__rt`), INTERVAL '30' SECOND))
+    WHERE event_type < 1
+    GROUP BY window_start, window_end, campaign_id
+
+  sources:
+    - name: ysb1k
+      flink_rowtime: { column: current_ms, delay: "0.001 SECOND" }
+      schema:
+        - { name: user_id, type: UINT64, not_null: true }
+        - { name: page_id, type: UINT64, not_null: true }
+        - { name: campaign_id, type: UINT64, not_null: true }
+        - { name: ad_type, type: UINT64, not_null: true }
+        - { name: event_type, type: UINT64, not_null: true }
+        - { name: current_ms, type: UINT64, not_null: true }
+        - { name: ip, type: UINT64, not_null: true }
+        - { name: d1, type: UINT64, not_null: true }
+        - { name: d2, type: UINT64, not_null: true }
+        - { name: d3, type: UINT32, not_null: true }
+        - { name: d4, type: UINT16, not_null: true }
+      data:
+        large:
+          # LF in place (2026-07-14): ExternalData ships CRLF (trailing \r on d4 UINT16 breaks
+          # fast parsers); this name now holds the tr -d '\r' copy - REGENERATE after build-dir wipe
+          file: large/ysb/ysb_1k_data_474M.csv
+          size_bytes: 492214231
+          rows: 5000000
+        native:
+          # 5,000,000 rows x 78 B (u64 x9, u32, u16 packed LE)
+          file: large/ysb/ysb_1k_data_474M.nes
+          size_bytes: 390000000
+          rows: 5000000
+        xlarge:
+          # 24 copies of large with current_ms += 5,000,000 per copy (forward-moving event
+          # time -> a real longer stream; replaying the 1x file instead SIGSEGVs stateful
+          # windows, see cmysb_repeat_probe). No validation entry: checksums differ from 1x
+          # by construction.
+          file: large/ysb/ysb_1k_ext24_11G.csv
+          size_bytes: 11968696938
+          rows: 120000000
+        xlarge_native:
+          # same 24x shift applied to packed field 5 via numpy; 120M x 78 B
+          file: large/ysb/ysb_1k_ext24_9G.nes
+          size_bytes: 9360000000
+          rows: 120000000
+
+  sink_schema:
+    - { name: ysb1k.start, type: UINT64, not_null: true }
+    - { name: ysb1k.end, type: UINT64, not_null: true }
+    - { name: ysb1k.campaign_id, type: UINT64, not_null: true }
+    - { name: ysb1k.sum_user_id, type: UINT64, not_null: true }
+
+  validation:
+    large: { tuples: 167167, checksum: 232106578 }

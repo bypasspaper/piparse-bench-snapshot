@@ -1,0 +1,68 @@
+experiment:
+  name: q5_pool
+  description: >
+    q5 (sliding-window COUNT aggs 10s/2s + tumbling MAX + equi-join on aggregate
+    outputs; self-joins bid twice; NO pre-join filter). Sweep pool count @ 4 KiB to
+    see whether q5 behaves like q8 (works at modest counts — windows trigger since
+    bid is full, no trigger-stall) or like q3 (count-hungry). Sliding windows = 5x
+    overlap + multi-stage aggregation may need more slices than q8. File, single
+    pass, W=4, slice_cache on, bid_6GB. NOTE: q5 reads bid TWICE (self-join) so
+    ~12.9 GB actually flows but MonitoringSink size = one 6.44 GB pass -> reported
+    throughput is per-logical-pass. Companion HANDOVER §21.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+
+  worker:
+    query_engine:
+      number_of_worker_threads: 4
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+    default_query_execution:
+      operator_buffer_size: 4096
+      execution_mode: COMPILER
+      slice_cache:
+        enable_slice_cache: true
+
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter:
+      type: SIMDCSV
+    input_parser:
+      uint64: TracedUINT64
+      int32: TracedINT32
+      int64: TracedINT64
+      f64: EiselFloatF64
+    output_formatter:
+      type: CSV
+
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: q5_pool
+    description: "q5 sliding-window agg+join: pool-count sweep @ 4 KiB"
+    query: nexmark/q5_window_join
+    axes:
+      x:
+        label: "buffer count (x 4 KiB)"
+        parameter: worker.number_of_buffers_in_global_buffer_manager
+        values: [2000000, 1000000, 500000, 250000]
+    y:
+      metric: throughput_mbps
+      label: "Throughput (MB/s)"
+    visualization:
+      type: line_chart
+      x_scale: log

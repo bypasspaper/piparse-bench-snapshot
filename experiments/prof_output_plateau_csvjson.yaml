@@ -1,0 +1,86 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: prof_output_plateau_csvjson
+  description: >
+    PROFILING harness (2026-08-06c, output-serialization-plateau probe): csv->json q0 at W23
+    healthy r_par config, InMemory prefill + NES_INMEM_REPEAT=1000 -> ~3.7 min steady window
+    (16.4 GB/s true) for perf attach. NOT a throughput datapoint. Purpose: distinguish
+    write-side DRAM amplification (RFO/memset/scratch passes -> workers backend-stalled, high
+    ls_any_fills_from_sys.mem_io_local) from contention/convoy (lock/futex/CAS hotspots,
+    per-worker IPC high but time in spin). Companion control = prof_output_plateau_csvcsv
+    (coalesced raw-forward output, 589 Mrows/s at the same W). Kill worker by saved PID +
+    pkill -9 -x main after capture; run marked failed in the store = expected, ignore.
+    RESULT (2026-08-06c): W23 = IPC 0.78-0.81, 552-561 insn/row, store_queue_rsrc_stall
+    0.285/cycle (load-queue ~0), all 23 workers 99% duty, locks ~0 -> store-queue-full is
+    the plateau mechanism. See OUTPUT_PLATEAU_PROBE_RESULTS.md.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 23
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: true
+      pin_threads: false
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false }
+    output_formatter: { type: JSON }
+    input_parser:
+      uint64: TracedUINT64
+      int64: TracedINT64
+      int32: FastINT32
+      int16: TracedINT16
+      uint32: TracedUINT32
+      uint16: TracedUINT16
+      bool: TracedBOOL
+      f64: EiselFloatF64
+      f32: EiselFloatF32
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 1000
+    NES_INMEM_BUFSIZE: 131072
+
+_cfg: &cfg
+  label: "config"
+  explicit:
+    - name: prof_window
+      baseline: true
+      overrides: {}
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+
+variants:
+  - name: csvjson_q0
+    query: nexmark/matrix/bidstr_q0
+    axes: { x: *noop_x, series: *cfg }
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: grouped_bar }

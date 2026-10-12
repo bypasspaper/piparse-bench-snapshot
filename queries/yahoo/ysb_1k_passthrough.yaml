@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0
+query:
+  name: ysb_1k_passthrough
+  description: >
+    YSB ad-event 4-field passthrough (SELECT user_id, campaign_id, event_type, current_ms --
+    matches ysb_1k_hl7_passthrough's SQL) over the raw 11-field event stream, csv + json arms
+    for the HL7 format matrix. Same 5M logical rows in every representation:
+      csv  -> ysb_1k_data_474M.csv  (492214231 B, the LF copy)
+      json -> ysb_1k_data_474M.json (977214231 B, NDJSON keys in schema order --
+              generated 1:1 from the csv 2026-07-30)
+  sql: "SELECT user_id, campaign_id, event_type, current_ms FROM ysb"
+  sources:
+    - name: ysb
+      schema:
+        - { name: user_id, type: UINT64, not_null: true }
+        - { name: page_id, type: UINT64, not_null: true }
+        - { name: campaign_id, type: UINT64, not_null: true }
+        - { name: ad_type, type: UINT64, not_null: true }
+        - { name: event_type, type: UINT64, not_null: true }
+        - { name: current_ms, type: UINT64, not_null: true }
+        - { name: ip, type: UINT64, not_null: true }
+        - { name: d1, type: UINT64, not_null: true }
+        - { name: d2, type: UINT64, not_null: true }
+        - { name: d3, type: UINT32, not_null: true }
+        - { name: d4, type: UINT16, not_null: true }
+      data:
+        csv:
+          file: large/ysb/ysb_1k_data_474M.csv
+          size_bytes: 492214231
+          rows: 5000000
+        json:
+          file: large/ysb/ysb_1k_data_474M.json
+          size_bytes: 977214231
+          rows: 5000000
+  sink_schema:
+    - { name: ysb.user_id, type: UINT64, not_null: true }
+    - { name: ysb.campaign_id, type: UINT64, not_null: true }
+    - { name: ysb.event_type, type: UINT64, not_null: true }
+    - { name: ysb.current_ms, type: UINT64, not_null: true }

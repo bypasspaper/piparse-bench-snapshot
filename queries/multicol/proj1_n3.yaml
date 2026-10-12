@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+# Fig2 PROJECTION sweep (2026-09-26): SELECT c0 FROM t over an N=3-column FLOAT64 (.6f) row -- ONE output field,
+# plain (no compute) so the compiled LAZY arm forwards c0 as a raw span and touches no other field (the SIMD index
+# still scans all N delimiters = the only per-field cost); the NAIVE uncompiled arm parses ALL N (no pushdown) and
+# serialises 1; Flink's csv format tokenises all N. csv->json. Same nf{N}.csv (large) / nf{N}_x10.csv (xlarge, Flink).
+query:
+  name: multicol_proj1_n3
+  description: "Fig2 projection point: SELECT c0 over 3 FLOAT64 columns (csv->json, one output field)."
+  sql: "SELECT c0 FROM t"
+  # Flink dialect: identical (plain projection).
+  flink_sql: "SELECT c0 FROM t"
+  sources:
+    - name: t
+      schema:
+        - { name: c0, type: FLOAT64, not_null: true }
+        - { name: c1, type: FLOAT64, not_null: true }
+        - { name: c2, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/multicol/nf3.csv
+          size_bytes: 200000031
+          rows: 6121831
+        xlarge:
+          # nf3.csv concatenated 10x (2026-09-03, Fig2-on-Flink: JVM-length run; same bytes/row)
+          file: large/multicol/nf3_x10.csv
+          size_bytes: 2000000310
+          rows: 61218310
+  sink_schema:
+    - { name: t.c0, type: FLOAT64, not_null: true }

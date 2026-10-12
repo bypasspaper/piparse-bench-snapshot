@@ -1,0 +1,78 @@
+# CORRECTNESS GATE: the person XML twin through the UNMODIFIED HL7 indexer (XML config)
+# must reproduce the checksum of the XML-independent CSV arm (person_csv_checksum_gate.yaml)
+# over the same rows -- the cross-format anchor for the ysb/person XML datasets.
+query: SELECT id, name, email_address, credit_card, city, state, timestamp, extra FROM person INTO chk
+logical:
+  - name: person
+    schema:
+      - { name: x01, type: VARSIZED }
+      - { name: x02, type: VARSIZED }
+      - { name: x03, type: VARSIZED }
+      - { name: x04, type: VARSIZED }
+      - { name: id, type: INT32 }
+      - { name: x05, type: VARSIZED }
+      - { name: x06, type: VARSIZED }
+      - { name: x07, type: VARSIZED }
+      - { name: name, type: VARSIZED }
+      - { name: x08, type: VARSIZED }
+      - { name: x09, type: VARSIZED }
+      - { name: x10, type: VARSIZED }
+      - { name: email_address, type: VARSIZED }
+      - { name: x11, type: VARSIZED }
+      - { name: x12, type: VARSIZED }
+      - { name: x13, type: VARSIZED }
+      - { name: credit_card, type: VARSIZED }
+      - { name: x14, type: VARSIZED }
+      - { name: x15, type: VARSIZED }
+      - { name: x16, type: VARSIZED }
+      - { name: city, type: VARSIZED }
+      - { name: x17, type: VARSIZED }
+      - { name: x18, type: VARSIZED }
+      - { name: x19, type: VARSIZED }
+      - { name: state, type: VARSIZED }
+      - { name: x20, type: VARSIZED }
+      - { name: x21, type: VARSIZED }
+      - { name: x22, type: VARSIZED }
+      - { name: timestamp, type: UINT64 }
+      - { name: x23, type: VARSIZED }
+      - { name: x24, type: VARSIZED }
+      - { name: x25, type: VARSIZED }
+      - { name: extra, type: VARSIZED }
+      - { name: x26, type: VARSIZED }
+      - { name: x27, type: VARSIZED }
+      - { name: x28, type: VARSIZED }
+      - { name: x29, type: VARSIZED }
+physical:
+  - logical: person
+    type: File
+    host: "localhost:8080"
+    parser_config:
+      type: HL7
+      message_delimiter: '\n'
+      segment_delimiter: '<'
+      field_delimiter: '>'
+      component_delimiter: ""
+      subcomponent_delimiter: ""
+    source_config:
+      file_path: __TESTDATA__/large/nexmark/person_840MB.xml
+sinks:
+  - name: chk
+    type: Checksum
+    host: "localhost:8080"
+    schema:
+      - { name: person$id, type: INT32 }
+      - { name: person$name, type: VARSIZED }
+      - { name: person$email_address, type: VARSIZED }
+      - { name: person$credit_card, type: VARSIZED }
+      - { name: person$city, type: VARSIZED }
+      - { name: person$state, type: VARSIZED }
+      - { name: person$timestamp, type: UINT64 }
+      - { name: person$extra, type: VARSIZED }
+    config:
+      file_path: __OUTPUT__
+      legacy_output_format: CSV
+    ## the nes-cli Sink decoder requires the key even when empty
+    parser_config: {}
+workers:
+  - host: "localhost:8080"
+    max_operators: 10000

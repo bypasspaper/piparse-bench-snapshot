@@ -1,0 +1,49 @@
+# REFERENCE ARM for the ysb XML gate: same SELECT over the source CSV through SIMDCSV
+# into the identical Checksum sink config.
+query: SELECT user_id, page_id, campaign_id, ad_type, event_type, current_ms, ip, d1, d2, d3, d4 FROM ysb INTO chk
+logical:
+  - name: ysb
+    schema:
+      - { name: user_id, type: UINT64 }
+      - { name: page_id, type: UINT64 }
+      - { name: campaign_id, type: UINT64 }
+      - { name: ad_type, type: UINT64 }
+      - { name: event_type, type: UINT64 }
+      - { name: current_ms, type: UINT64 }
+      - { name: ip, type: UINT64 }
+      - { name: d1, type: UINT64 }
+      - { name: d2, type: UINT64 }
+      - { name: d3, type: UINT32 }
+      - { name: d4, type: UINT16 }
+physical:
+  - logical: ysb
+    type: File
+    host: "localhost:8080"
+    parser_config:
+      type: SIMDCSV
+    source_config:
+      file_path: __TESTDATA__/large/ysb/ysb_1k_data_474M.csv
+sinks:
+  - name: chk
+    type: Checksum
+    host: "localhost:8080"
+    schema:
+      - { name: ysb$user_id, type: UINT64 }
+      - { name: ysb$page_id, type: UINT64 }
+      - { name: ysb$campaign_id, type: UINT64 }
+      - { name: ysb$ad_type, type: UINT64 }
+      - { name: ysb$event_type, type: UINT64 }
+      - { name: ysb$current_ms, type: UINT64 }
+      - { name: ysb$ip, type: UINT64 }
+      - { name: ysb$d1, type: UINT64 }
+      - { name: ysb$d2, type: UINT64 }
+      - { name: ysb$d3, type: UINT32 }
+      - { name: ysb$d4, type: UINT16 }
+    config:
+      file_path: __OUTPUT__
+      legacy_output_format: CSV
+    ## the nes-cli Sink decoder requires the key even when empty
+    parser_config: {}
+workers:
+  - host: "localhost:8080"
+    max_operators: 10000

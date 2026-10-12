@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+query:
+  name: gridsweep_int_n16_w5
+  description: >
+    Fine-grained follow-up: 16-field schema, 5-digit values; PROJECT+parse only c0 (index scales with N,
+    parse fixed at 1 UINT64). Data large/multicol/n16_w5.csv (209715360 B). Probing the W4->W8 index jump at single-byte granularity.
+  sql: "SELECT c0 * UINT64(1) AS c0 FROM t"
+  sources:
+    - name: t
+      schema:
+        - { name: c0, type: UINT64, not_null: true }
+        - { name: c1, type: UINT64, not_null: true }
+        - { name: c2, type: UINT64, not_null: true }
+        - { name: c3, type: UINT64, not_null: true }
+        - { name: c4, type: UINT64, not_null: true }
+        - { name: c5, type: UINT64, not_null: true }
+        - { name: c6, type: UINT64, not_null: true }
+        - { name: c7, type: UINT64, not_null: true }
+        - { name: c8, type: UINT64, not_null: true }
+        - { name: c9, type: UINT64, not_null: true }
+        - { name: c10, type: UINT64, not_null: true }
+        - { name: c11, type: UINT64, not_null: true }
+        - { name: c12, type: UINT64, not_null: true }
+        - { name: c13, type: UINT64, not_null: true }
+        - { name: c14, type: UINT64, not_null: true }
+        - { name: c15, type: UINT64, not_null: true }
+      data:
+        large: { file: large/multicol/n16_w5.csv, size_bytes: 209715360 }
+  sink_schema:
+    - { name: c0, type: UINT64, not_null: true }

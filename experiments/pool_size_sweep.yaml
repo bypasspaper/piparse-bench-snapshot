@@ -1,0 +1,78 @@
+experiment:
+  name: pool_size_sweep
+  description: >
+    Steady-state passthrough throughput vs buffer-pool size, for File and TCP sources.
+    Reveals the buffer-pool optimum: throughput is NOT monotonic — it peaks around
+    ~400-800 MB (3072-6144 x 128 KiB buffers) and falls off at both ends (small =
+    buffer-starvation/contention, large = cache-eviction / DRAM amplification). The
+    production-default 8.59 GB pool sits ~37% below the peak. See engine_to_e2e
+    HANDOVER. Requires the FIXED blocking tcp-generator (async generator deadlocks
+    under the backpressure large pools create).
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+    default_query_execution:
+      operator_buffer_size: 131072          # 128 KiB
+      execution_mode: COMPILER
+    # number_of_buffers_in_global_buffer_manager is the X axis below.
+
+  query_config:
+    source_type: TCP                        # overridden per series
+    sink_type: Monitoring
+    input_formatter:
+      type: SIMDCSV
+    input_parser:
+      uint64: TracedUINT64
+      int32: TracedINT32
+      int64: TracedINT64
+    output_formatter:
+      type: CSV
+
+  generator:                                # repeat = pass count for BOTH sources
+    repeat: 4                               # TCP: -m 4 ; File: NES_FILE_REPEAT=4
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: bid_passthrough_pool
+    description: "bid_6GB passthrough -> Monitoring, sweep pool x {File,TCP}"
+    query: nexmark/bid_passthrough
+
+    axes:
+      x:
+        label: "Buffer pool (buffers x 128 KiB)"
+        parameter: worker.number_of_buffers_in_global_buffer_manager
+        values: [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
+      series:
+        label: "Source"
+        explicit:
+          - name: File
+            baseline: true
+            overrides:
+              query_config.source_type: File
+          - name: TCP
+            overrides:
+              query_config.source_type: TCP
+
+    y:
+      metric: throughput_mbps
+      label: "Throughput (MB/s)"
+
+    visualization:
+      type: line_chart
+      x_scale: log

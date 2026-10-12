@@ -1,0 +1,59 @@
+query:
+  name: nexmark_bid_star
+  description: "SELECT * FROM bid (full projection on Nexmark bid dataset)"
+
+  sql: "SELECT * FROM bid"
+
+  # Flink dialect is identical for the star projection (reserved-word `timestamp` is only
+  # backticked in the auto-derived DDL, not here).
+  flink_sql: "SELECT * FROM bid"
+
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/nexmark/bid_6GB.csv
+          size_bytes: 6442450944
+          rows: 183991721
+        medium:
+          # head -n 31300000 of bid_6GB.csv (~1 GB) -- fast W1 passes for the writeRawBytes A/B.
+          file: large/nexmark/bid_1GB.csv
+          size_bytes: 1089194961
+          rows: 31300000
+        small:
+          file: large/nexmark/bid_653M.csv
+          size_bytes: 666738765
+          rows: 18106394
+        native:
+          # 183,991,721 rows x 24 B (uint64,int32,int32,float64 packed LE); generated from
+          # bid_6GB.csv via nes-systests/testdata/small/csv_to_binary.py
+          file: large/nexmark/bid_6GB.nes
+          size_bytes: 4415801304
+          rows: 183991721
+
+  sink_schema:
+    - { name: bid.timestamp, type: UINT64, not_null: true }
+    - { name: bid.auctionId, type: INT32, not_null: true }
+    - { name: bid.bidder, type: INT32, not_null: true }
+    - { name: bid.price, type: FLOAT64, not_null: true }
+
+  validation:
+    large: { tuples: 183991721, checksum: 353216217968 }
+    # small STALE since the 2026-07-14 in-place LF conversion: the old value was measured on
+    # CRLF bytes (passthrough output rode them along); byte-sum arithmetic predicts
+    # 32912685685 (= 33146443404 - 13 x 17,981,363 CR bytes; the file has MIXED line endings,
+    # ~125k of the 18.1M rows were already LF). NOT re-measurable on the fast stack: bid_653M
+    # is the 5-FIELD bid file, and any full parse (e.g. Checksum sink, which defeats lazy
+    # elision) throws "fast integer parse" - the old numbers came from systest's lenient
+    # default parsers. Real fix: regenerate small as a 4-field prefix of bid_6GB.csv.
+    small: { tuples: 18106394, checksum: 33146443404 }
+    # MEASURED 2026-07-08 (systest, fused CSV output): NOT equal to `large` — the CSV arm's
+    # SELECT * rides the lazy passthrough ELISION (output = original input bytes, e.g. price
+    # "73134520"), while the native arm must ZMIJ-format the double (different shortest-form
+    # text). Same doubles, different text. Queries that format floats in BOTH arms (q1) agree.
+    native: { tuples: 183991721, checksum: 388223174259 }

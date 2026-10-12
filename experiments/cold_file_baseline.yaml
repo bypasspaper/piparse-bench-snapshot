@@ -1,0 +1,109 @@
+experiment:
+  name: cold_file_baseline
+  description: >
+    COLD single-source File ingestion baseline for the io_uring deep-QD work
+    (HANDOVER 2_engine_to_e2e §20 NEXT / §3 rung-1 / §21p). Establishes what the
+    CURRENT async FileSource (QD1) does when the page cache is COLD, and whether the
+    pinning + small-pool levers that won BIG on WARM data still pay when the limiter
+    is disk latency rather than DRAM handoff.
+
+    WHY COLD MATTERS (premises 2/3): production reads are uncached — files bigger than
+    RAM, first-touch streaming data. The warm numbers (rung-2b ~6.2 GB/s File, §21n
+    pinned ~8.8) are a page-cache INSTRUMENT, not production. The representative disk
+    number is the uncached NVMe cap (~6.9 GB/s, §2). This experiment measures the cold
+    baseline the io_uring variant must then beat.
+
+    HOW COLD IS FORCED: cold_read: true makes the runner posix_fadvise(DONTNEED) the
+    data file out of the page cache after the worker is up and before the query reads
+    it (rung-1 method, no root). It mincore-verifies eviction and prints
+    "[cold_read] COLD bid_6GB.csv: resident 6369 -> 0 MB" per run; a STILL-WARM line
+    means the measurement is suspect. cold_read REQUIRES generator.repeat: 1 (the
+    runner raises otherwise) — a 2nd pass would read warm from the cache pass 1 just
+    populated, and the whole-run MonitoringSink window would average to a warm number.
+    So the window is ONE 6.44 GB cold pass.
+
+    CONFIG: bid_6GB passthrough (parse-elided lazy CSV), W=4 / IO=1 (a single File
+    source = one fillBuffer coroutine on one io thread, §21p; IO=2 leaves the 2nd
+    thread idle), full fastest stack (SIMDCSV + Traced int parsers + 128 KiB +
+    output_format=CSV). Axes: pool size x pin_threads on/off.
+
+    PREDICTIONS (reason first, per the predict-before-measure rule):
+    - COLD BASELINE ~2.36 GB/s (rung-1 §3): the QD1 async read is a BLOCKING read on
+      one io thread (a regular file is always epoll-"ready" so asio falls back to a
+      sync read = queue depth 1) -> disk-LATENCY-bound, ~34% of the 6.9 GB/s cap. This
+      is the number io_uring deep-QD (target ~6.7) must beat.
+    - PINNING/SMALL-POOL GAIN SHRINKS vs WARM. The §21n warm win (+50-88% at small
+      pool) came from keeping the producer->worker HANDOFF L3-resident (handoff DRAM
+      ->L3, amp 3.7->1.54). COLD, the io thread is BLOCKED IN THE DISK READ, not
+      CPU/DRAM-bound on _copy_to_iter, so the limiter is QD1 disk latency that pinning
+      cannot touch. Expect pin on ~= off and the pool sweep ~FLAT (all near ~2.4),
+      i.e. the warm levers DON'T transfer to the cold-latency regime. If pinning DOES
+      help cold, that's a surprise worth chasing (would mean copy CPU still matters at
+      2.4 GB/s).
+    - POOL SWEEP roughly FLAT cold (vs the warm peak-at-512MB / cliff-at-8.6GB shape):
+      cache-residency of recycled buffers is irrelevant when each fill waits on disk.
+
+    A/B CONTRACT: this is the BASELINE arm. The io_uring deep-QD FileSource variant
+    (next step) is measured at the SAME points (same query/W/IO/pool/pin, cold) and
+    should lift the ~2.4 -> ~6.7 GB/s by issuing many concurrent reads (QD>=16) on the
+    one io thread. Keep this experiment as the canonical cold A/B reference.
+
+    GOTCHAS:
+    - Needs the bid_6GB.csv generated under <build>/nes-systests/testdata/large/nexmark/
+      (gitignored generated data; regen recipe in bid_passthrough_1gb.yaml's sibling).
+    - Run with sandbox OFF (spawns the worker, binds gRPC :8080). Verify :8080 free first
+      (a stale worker silently serves the query -> wrong numbers).
+    - High-ish variance is expected cold (disk) -> median of 3. Each rep re-evicts (fresh
+      worker per execute()), so every rep is independently cold.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: true
+  worker:
+    query_engine:
+      number_of_worker_threads: 4
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 4096
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64}
+    output_formatter: {type: CSV}
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: cold_file_baseline
+    description: "W=4 IO=1 COLD bid_6GB passthrough, pool sweep x pin_threads"
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "Buffer pool (buffers x 128 KiB)"
+        parameter: worker.number_of_buffers_in_global_buffer_manager
+        values: [128, 256, 1024, 4096]
+      series:
+        label: "pin_threads"
+        explicit:
+          - name: "off"
+            baseline: true
+            overrides: {worker.query_engine.pin_threads: false}
+          - name: "on"
+            overrides: {worker.query_engine.pin_threads: true}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: line_chart, x_scale: log}

@@ -1,0 +1,57 @@
+query:
+  name: lrb_q2_vehicle_count
+  description: "Linear Road Q2: sliding window COUNT speed per vehicle/highway/direction"
+
+  sql: |
+    SELECT start, end, vehicle, highway, direction, positionDiv5280, COUNT(speed) AS cntSpeed
+    FROM (SELECT creationTS, vehicle, highway, direction, position / INT32(5280) AS positionDiv5280, speed FROM lrb)
+    GROUP BY (vehicle, highway, direction, positionDiv5280)
+    WINDOW SLIDING(creationTS, SIZE 30 SEC, ADVANCE BY 1 SEC)
+
+  flink_sql: |
+    SELECT CAST(TIMESTAMPDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', CAST(window_start AS TIMESTAMP(3))) AS BIGINT) * 1000 AS `start`, CAST(TIMESTAMPDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', CAST(window_end AS TIMESTAMP(3))) AS BIGINT) * 1000 AS `end`, vehicle, highway, direction,
+    `position` / 5280 AS positionDiv5280, COUNT(speed) AS cntSpeed
+    FROM TABLE(HOP(TABLE lrb, DESCRIPTOR(`__rt`), INTERVAL '1' SECOND, INTERVAL '30' SECOND))
+    GROUP BY window_start, window_end, vehicle, highway, direction, `position` / 5280
+
+  sources:
+    - name: lrb
+      flink_rowtime: { column: creationTS, delay: "0.001 SECOND" }
+      schema:
+        - { name: creationTS, type: UINT64, not_null: true }
+        - { name: vehicle, type: INT16, not_null: true }
+        - { name: speed, type: FLOAT32, not_null: true }
+        - { name: highway, type: INT16, not_null: true }
+        - { name: lane, type: INT16, not_null: true }
+        - { name: direction, type: INT16, not_null: true }
+        - { name: position, type: INT32, not_null: true }
+      data:
+        large:
+          # see q1_avg_speed.yaml for the LF-conversion/size/tiling story (shared source)
+          file: large/lrb/linear_road_benchmark_560K.csv
+          size_bytes: 557176
+          rows: 16384
+        native:
+          file: large/lrb/linear_road_benchmark_560K.nes
+          size_bytes: 393216
+          rows: 16384
+        xlarge:
+          file: large/lrb/lrb_ext200_111M.csv
+          size_bytes: 111435200
+          rows: 3276800
+        xlarge_native:
+          file: large/lrb/lrb_ext200_111M.nes
+          size_bytes: 78643200
+          rows: 3276800
+
+  sink_schema:
+    - { name: lrb.start, type: UINT64, not_null: true }
+    - { name: lrb.end, type: UINT64, not_null: true }
+    - { name: lrb.vehicle, type: INT16, not_null: true }
+    - { name: lrb.highway, type: INT16, not_null: true }
+    - { name: lrb.direction, type: INT16, not_null: true }
+    - { name: positionDiv5280, type: INT32, not_null: true }
+    - { name: lrb.cntSpeed, type: UINT64, not_null: true }
+
+  validation:
+    large: { tuples: 491460, checksum: 991265094 }

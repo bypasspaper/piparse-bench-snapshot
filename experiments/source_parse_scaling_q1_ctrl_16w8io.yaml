@@ -1,0 +1,78 @@
+experiment:
+  name: source_parse_scaling_q1_ctrl_16w8io
+  description: >
+    Thread-budget CONTROL for source_parse_scaling_q1 (async arm, N=100 only, ONE rep).
+    Question (raised 2026-07-06): the base experiment's async arm runs 24 workers + 4 io =
+    28 busy threads on a 24c/48t box -> constant SMT-sibling sharing of physical cores.
+    Does an SMT-free budget change the ceiling? This point: workers=16 + io=8 = 24 threads
+    == 24 physical cores (no sharing), same q1 workload, N=100.
+
+    BASELINE (source_parse_scaling_q1, async, N=100, 24w/4io): 12601 MB/s, p50 1.2 ms,
+    p99 12.3 ms.
+
+    PREDICTION: if the ~12.5 GB/s plateau is DRAM/io-bound, 16w/8io lands within a few % of
+    12601 (SMT sharing was free, worker count not binding). If worker-CPU-bound, throughput
+    drops toward ~2/3 of baseline (~8.5-10 GB/s) despite the SMT-free layout. The extra io
+    threads (8 vs 4) should help ingestion multiplexing/tail latency (less HOL), not peak
+    throughput (4 io were nowhere near saturated for warm file reads).
+
+    GOTCHAS: all of source_parse_scaling_q1's apply. ONE rep by design (quick probe).
+
+    RESULT (2026-07-06, 1 rep): 11530 MB/s (-8.5% vs 24w/4io's 12601), p50 12.6 ms (10x
+      WORSE than baseline's 1.2), p99 15.1 / p999 15.9 ms. READING: cutting workers 24->16
+      (-33%) costs only 8.5% throughput -> the plateau is mostly NOT worker-count-bound
+      (near-DRAM/memory-stall-bound; SMT sharing on this Threadripper is cheap for this
+      stall-heavy workload). But 16 workers run much closer to capacity -> queueing delay
+      dominates the WHOLE latency distribution (p50 ~= p99 ~= 13-15 ms). Extra io threads
+      (8 vs 4) did not help the tail. VERDICT: the base config's 28-threads-on-24-cores
+      "constant oversubscription" is the BETTER operating point, not a distortion -- more
+      workers beat an SMT-free layout on both throughput and (dramatically) median latency.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 600
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 8
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV }
+    input_parser: { uint64: TracedUINT64, int32: TracedINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  generator:
+    repeat: 6
+
+variants:
+  - name: async_16w8io
+    description: "q1, async File+SIMDCSV, N=100, workers=16 io=8 (24 threads = 24 physical cores)"
+    query: nexmark/q1_price
+    axes:
+      x:
+        label: "Concurrent Queries"
+        parameter: num_queries
+        values: [100]
+    y:
+      metric: throughput_mbps
+      label: "Aggregate System Throughput (MB/s)"
+    visualization:
+      type: bar_chart

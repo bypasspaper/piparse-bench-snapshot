@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: Apache-2.0
+query:
+  name: multicol_proj_k16
+  description: >
+    STRICT PROJECTION variant of parse_k16: 16-FLOAT64-column input row (integer-valued, ~104 B/row) but
+    the SELECT emits ONLY the 16 parsed column(s) (cI*FLOAT64(1)) -- the other 0 columns are neither
+    output nor computed, so they are SKIPPED (not parsed, NOT passthrough-copied to output). Removes the
+    passthrough byte-copy + wide-output-framing confound of parse_k16, isolating: index-the-row + parse 16
+    + serialize 16 + emit a 16-wide output row. Data large/multicol/f16.csv (2.0M rows). Compare the fixed
+    cost `a` to parse_k's 88.7 ns/row (the delta = passthrough copy + wide framing).
+  sql: "SELECT c0 * FLOAT64(1) AS c0, c1 * FLOAT64(1) AS c1, c2 * FLOAT64(1) AS c2, c3 * FLOAT64(1) AS c3, c4 * FLOAT64(1) AS c4, c5 * FLOAT64(1) AS c5, c6 * FLOAT64(1) AS c6, c7 * FLOAT64(1) AS c7, c8 * FLOAT64(1) AS c8, c9 * FLOAT64(1) AS c9, c10 * FLOAT64(1) AS c10, c11 * FLOAT64(1) AS c11, c12 * FLOAT64(1) AS c12, c13 * FLOAT64(1) AS c13, c14 * FLOAT64(1) AS c14, c15 * FLOAT64(1) AS c15 FROM t"
+  sources:
+    - name: t
+      schema:
+        - { name: c0, type: FLOAT64, not_null: true }
+        - { name: c1, type: FLOAT64, not_null: true }
+        - { name: c2, type: FLOAT64, not_null: true }
+        - { name: c3, type: FLOAT64, not_null: true }
+        - { name: c4, type: FLOAT64, not_null: true }
+        - { name: c5, type: FLOAT64, not_null: true }
+        - { name: c6, type: FLOAT64, not_null: true }
+        - { name: c7, type: FLOAT64, not_null: true }
+        - { name: c8, type: FLOAT64, not_null: true }
+        - { name: c9, type: FLOAT64, not_null: true }
+        - { name: c10, type: FLOAT64, not_null: true }
+        - { name: c11, type: FLOAT64, not_null: true }
+        - { name: c12, type: FLOAT64, not_null: true }
+        - { name: c13, type: FLOAT64, not_null: true }
+        - { name: c14, type: FLOAT64, not_null: true }
+        - { name: c15, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/multicol/f16.csv
+          size_bytes: 209715304
+  sink_schema:
+    - { name: c0, type: FLOAT64, not_null: true }
+    - { name: c1, type: FLOAT64, not_null: true }
+    - { name: c2, type: FLOAT64, not_null: true }
+    - { name: c3, type: FLOAT64, not_null: true }
+    - { name: c4, type: FLOAT64, not_null: true }
+    - { name: c5, type: FLOAT64, not_null: true }
+    - { name: c6, type: FLOAT64, not_null: true }
+    - { name: c7, type: FLOAT64, not_null: true }
+    - { name: c8, type: FLOAT64, not_null: true }
+    - { name: c9, type: FLOAT64, not_null: true }
+    - { name: c10, type: FLOAT64, not_null: true }
+    - { name: c11, type: FLOAT64, not_null: true }
+    - { name: c12, type: FLOAT64, not_null: true }
+    - { name: c13, type: FLOAT64, not_null: true }
+    - { name: c14, type: FLOAT64, not_null: true }
+    - { name: c15, type: FLOAT64, not_null: true }

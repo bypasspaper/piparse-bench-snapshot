@@ -1,0 +1,75 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: native_json_w1_probe_oldtip
+  description: >
+    REPLICATION PROBE for the user's paper 'native' column: hypothesis = those values are
+    SystemNative -> JSON (5-arm output config) at W1, NOT native->native. Same rig as
+    shredder_ideal_scaling_q2mod (MmapFile .nes + populate + warm, repeat 8, 128 KiB, fnattr)
+    but output JSON+ZMIJ. Expected if hypothesis holds: q2mod ~92.6 M rows/s (paper native_med)
+    vs the native->NATIVE arm's 129.5 @W1. reps=3, single query q2mod first (quick gate before
+    a 10-query column replication). Metric throughput_mrows_s.
+    RUN: cd ~/work/piparse-bench && pkill -x main; PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/native_json_w1_probe.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mrows_s
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: probe-oldtip
+  mode: worker-cli
+  build: native
+  data_size: native
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: MmapFile
+    sink_type: Monitoring
+    input_formatter:
+      type: SystemNative
+      string_length: "13,73"
+    input_parser: {}
+    output_formatter:
+      type: JSON
+    output_parser:
+      f64: ZMIJF64
+      f32: ZMIJF32
+  generator:
+    repeat: 8
+  worker_env:
+    NES_MMAP_POPULATE: '1'
+variants:
+  - name: native_json_q2mod
+    description: "SystemNative -> JSON, W1, q2mod (paper native_med replication)"
+    query: nexmark/matrix/bidstr_q2mod
+    axes:
+      x:
+        label: "worker threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [1]
+      series:
+        label: "arm"
+        explicit:
+          - name: native_json
+            baseline: true
+            overrides: {}
+    y:
+      metric: throughput_mrows_s
+      label: "Throughput (M records/s)"
+    visualization:
+      type: line_chart

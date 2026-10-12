@@ -1,0 +1,81 @@
+experiment:
+  name: source_parse_scaling_q1_ctrl_n250
+  description: >
+    Fourth thread-budget control (async q1, ONE rep per point): does the N=100 picture
+    transfer to N=250? Points: 24w/6io (the N=100 winner) and 20w/4io (the SMT-free
+    minimal config that matched the 24w/4io baseline at N=100).
+
+    CONTEXT: at N=100 -- 24w/6io 13634 p50 1.1 | 20w/4io 12645 p50 1.2 | 24w/4io baseline
+    12601 p50 1.2. At N=250 the 24w/4io baseline (source_parse_scaling_q1_ext) = 12382
+    MB/s, p50 2.7 ms, p99 14.1.
+
+    PREDICTION: the io-supply story should transfer: 24w/6io ~13.3-13.7 GB/s (+8-10% over
+    the N=250 baseline) with p50 ~2-3 ms (2.5x more sources per io thread than at N=100
+    may add a little multiplexing latency but 6 io threads should still cover ingestion).
+    20w/4io ~= the 12382 baseline (io-bound identically; 20 workers stays above the
+    queueing knee since offered load is capped by the same 4-io supply). If 24w/6io's gain
+    SHRINKS at 250 (e.g. <13.0), io demand scales with source count and 6 threads is no
+    longer enough -> would argue for scaling io with N.
+
+    RESULTS (2026-07-06, 1 rep each) -- TRANSFERS CLEANLY:
+      24w/6io = 13491 MB/s (+9.0% over the 12382 baseline), p50 2.5 ms, p99 13.7
+      20w/4io = 12341 MB/s (== baseline within noise), p50 2.7 ms (identical), p99 13.5
+      VERDICT: the io-supply lift is source-count-INDEPENDENT (+8% @N=100, +9% @N=250) --
+      io threads cap aggregate BYTES, not source count; 6 io threads cover 250 sources as
+      well as 100. 20w/4io == 24w/4io again -> worker count beyond 20 irrelevant when
+      4-io-bound. Reinforces: 24w/6io is the tuned default for these scaling benches.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  worker:
+    query_engine:
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV }
+    input_parser: { uint64: TracedUINT64, int32: TracedINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  generator:
+    repeat: 6
+  num_queries: 250
+
+variants:
+  - name: n250_split
+    description: "q1, async File+SIMDCSV, N=250: 24w/6io vs 20w/4io"
+    query: nexmark/q1_price
+    axes:
+      x:
+        label: "workers/io split"
+        explicit:
+          - name: 24w_6io
+            overrides:
+              worker.query_engine.number_of_worker_threads: 24
+              worker.query_engine.number_of_io_threads: 6
+          - name: 20w_4io
+            overrides:
+              worker.query_engine.number_of_worker_threads: 20
+              worker.query_engine.number_of_io_threads: 4
+    y:
+      metric: throughput_mbps
+      label: "Aggregate System Throughput (MB/s)"
+    visualization:
+      type: bar_chart

@@ -1,0 +1,84 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: floatcol_price_src
+  description: >
+    How close does the engine get to the isolated Eisel+ZMIJ ceiling (43.5 M rows/s) for ONE float
+    parse+serialize per row, and how much of the residual gap is the READ path? Same stripped query on the
+    single-column price.csv -- `SELECT price * FLOAT64(1) AS price` (the *1 defeats passthrough elision at
+    the plan level so Eisel+ZMIJ actually run; profile-confirmed) -- across two sources:
+      - BlockingFile (warm, NES_FILE_REPEAT): buffered ::read copies page-cache -> tuple buffer each pass
+        (the _copy_to_iter ~1.7% seen in the profile). Baseline (197 MB/s = 30.4 M rows/s = 70% of ceiling).
+      - InMemory (prefill): reads the file into TupleBuffers in the CTOR (outside the timed window) and the
+        sequential runner drains them via takePreFilledBuffer() -- ZERO I/O and ZERO copy in the measured
+        loop. This is the true engine analogue of the isolated harness's in-RAM vector: it removes the read
+        confound entirely, so it isolates the pure engine compute (index + JIT-codec + dispatch) vs the
+        native -O3 codec loop.
+
+    Expected: InMemory >= BlockingFile by ~the read fraction (~2%). If the gap to the 43.5 M/s ceiling
+    barely moves, the residual is NOT the read -- it is index + running the codec as native calls out of
+    the JIT loop (no cross-iteration ILP) + buffer/dispatch, i.e. irreducible engine overhead per float.
+
+    W1 sequential SequentialCSV, Eisel in + ZMIJ out, Monitoring sink + CSV out. generator.repeat=20 sets
+    the MonitoringSink size accounting (file_size x 20); the InMemory arm also gets NES_INMEM_REPEAT=20 so
+    its actual replay passes match that accounting (true_throughput = reported). NES_INMEM_* are ignored by
+    the BlockingFile arm. single-column price.csv (78 MB, ~6.5 B/row) => rows/s = MB/s / 6.5e-3.
+    GOTCHAS: pkill -x main pre-flight, :8080 free. InMemory + sequential is valid (prefill drained inline).
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: false
+  completion_timeout_s: 180
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384   # prefill bypasses the pool for INPUT, but the CSV
+    # OUTPUT (ZMIJ serialize) allocates from it; 2048 exhausts under 20x replay -> source stall. 16384=2GB.
+  query_config:
+    source_type: BlockingFile
+    sink_type: Monitoring
+    input_formatter: {type: SequentialCSV, threading_mode: sequential}   # SEQUENTIAL (1 thread, tightest
+    # match to the single-thread isolated harness). The earlier InMemory+sequential "deadlock" was the SAME
+    # timestamp bug (empty MonitoringSink CSV -> pbench timeout), fixed by stamping in takePreFilledBuffer.
+    input_parser: {f64: EiselFloatF64}
+    output_formatter: {type: CSV}
+    output_parser: {f64: ZMIJF64}
+  generator:
+    repeat: 20
+    mode: burst
+    rate: 1000000
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 20
+    NES_INMEM_BUFSIZE: 131072
+
+variants:
+  - name: price_src
+    description: "SELECT price*1 (1 FLOAT64 col), seq W1 -- BlockingFile(warm) vs InMemory(prefill)"
+    query: floatcol/price_only
+    axes:
+      x:
+        label: "source"
+        explicit:
+          - name: "blockingfile_warm"
+            baseline: true
+            overrides: {query_config.source_type: BlockingFile}
+          - name: "inmem_prefill"
+            overrides: {query_config.source_type: InMemory}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

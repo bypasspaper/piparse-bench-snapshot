@@ -1,0 +1,73 @@
+experiment:
+  name: tcp_pin_pool_2src
+  description: >
+    The per-CCX MIRROR of §45B (which used 2 FILE sources) for TCP: do 2 asio TCP sources profit from
+    a small L3-resident private pool + pinning, the way 2 warm File sources did (§45B: pin_on + small
+    pool 64 -> 12.6 GB/s, +20% over pin_off)? Never measured for TCP (user Q2 follow-up).
+
+    2 independent TCP sources (num_queries=2, generator.independent_per_query -> one generator process
+    per query on its own port, so supply is NOT single-generator-capped), bid_passthrough -> Monitoring
+    (output_format=CSV, parse elided), COLD (repeat 1). IO=2 / W=4 = 6 threads = ONE 6-core CCX when
+    pinned (the §21q/§45B building block). Sweep per-source private pool 64 (2x8MB=16MB, L3-resident on
+    a 32MB/CCD L3) vs 4096 (2x512MB, DRAM) x pinning off/on. Aggregate = sum of both sources.
+
+    HYPOTHESIS: pinning IO=2/W=4 onto one CCX should make the producer->worker handoff L3-resident ->
+    pin_on > pin_off, small pool > large -- BUT smaller than the File +20%, because TCP recv copies
+    FRESH kernel data (only the copy-destination buffers stay L3-resident, not warm source data). Also
+    watch for GENERATOR-bound: 2 independent generators supply ~7-11 GB/s (loopback); if the engine
+    (IO=2/W=4, limited compute) wants more, it could be supply-capped -> pinning signal masked. Report
+    aggregate; if pin shows no delta, check whether it's supply- or compute-bound.
+
+    GOTCHAS: each independent generator loads bid_6GB (~6 GB) -> 2x ~12 GB RAM (fine on 64 GB). repeat 1
+    = cold. MonitoringSink proc-time throughput reliable for asio (smooth). W=4 chosen so IO=2+W=4=6
+    fills one CCX exactly (the pinned per-CCX unit); not a worker sweep.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  completion_timeout_s: 180
+  worker:
+    query_engine:
+      number_of_io_threads: 2
+      number_of_worker_threads: 4
+      invoke_mode_configuration: fnattr
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+  query_config:
+    source_type: TCP
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64}
+    output_formatter: {type: CSV}
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+    independent_per_query: true
+
+variants:
+  - name: tcp_pin_pool_2src
+    description: "2 cold asio TCP sources, IO=2/W=4 (one CCX), private-pool {64,4096} x pinning {off,on}, aggregate"
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "per-source private pool (buffers)"
+        parameter: worker.default_max_inflight_buffers
+        values: [64, 4096]
+      series:
+        label: "pin"
+        explicit:
+          - {name: "pin_off", baseline: true, overrides: {num_queries: 2, worker.query_engine.pin_threads: false}}
+          - {name: "pin_on", overrides: {num_queries: 2, worker.query_engine.pin_threads: true}}
+    y: {metric: throughput_mbps, label: "Aggregate Throughput (MB/s)"}
+    visualization: {type: bar_chart}

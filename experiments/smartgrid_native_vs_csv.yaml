@@ -1,0 +1,186 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: smartgrid_native_vs_csv
+  description: >
+    SMART GRID parsed-vs-native (session 2026-07-13, third suite after nexmark and CM/YSB).
+    The three LightSaber/DEBS14 smart-grid queries: SG1 = global AVG(value) sliding 1h/1s
+    (keyless), SG2 = per-(plugId,householdId,houseId) AVG sliding 128s/1s (= the disabled
+    SmartGrid.test's Query 2, recorded count 98176 on the seed), SG3 = the DEBS outlier
+    query: per-plug 1h avg joined with the global 1h avg per window-start, WHERE avg_local >
+    avg_global (windowed self-join + post-join filter; the .test's Query 1 = SG3's local
+    side, kept as smoke-only entry sg0 with recorded count 1730016). NES's own .test is
+    DISABLED for f32-AVG combine-order nondeterminism - counts are the correctness gate,
+    checksums only arm-vs-arm-informative (the .test itself records THREE checksum variants
+    for Q2).
+
+    DATA: the shipped seed is 963766 B / 33627 rows spanning 84 SECONDS - the 1h windows
+    never fill on it (that's WHY the .test's Q1 "worked": every window merges <= 84 slices).
+    Measured variants run the x120 forward-shifted tiling (creationTS += 84000/copy, 2.8h
+    span, 4.04M rows, 115.7MB csv / 88.8MB nes, footprint 1.303); smoke runs the seed.
+    470 distinct plug groups, ~400 rows/s of event time.
+
+    EXPECT (predict-first): all three are state/window-bound like CM - sliding 1h/1s with
+    470 groups costs ~span x 3600 slices x ~400 present-groups of merge work (~14G entry
+    ops for sg0-shaped aggs on the x120 file; sg2 is 28x lighter at 128 slices; sg1 keyless
+    ~36M). Format gap should be ABSENT (rows/s ratio ~0.95-1.05) on sg2/sg3 and at most
+    footprint-bounded on sg1; the input side (115MB) is negligible against state work.
+    If sg3's plan fails to build (start-alias in the global subquery, or the non-equi WHERE
+    after join), that is itself a finding - record the error verbatim.
+
+    GOTCHAS: seed is CRLF -> catalog points at the _lf copy (houseId INT16 tail-\r trap);
+    f32 values need EiselFloatF32 + int16 TracedINT16 (fast stack); AVG outputs FLOAT64
+    regardless of input type (WindowAggregationDifferentDataTypes sink evidence); join sink
+    fields use the concatenated-prefix convention (smartGridsmartGrid.start, q5 precedent);
+    generator repeat MUST stay 1 (replay corrupts stateful windows, cmysb_repeat_probe);
+    sg0/sg3 push 1.7M+ rows through the single-threaded Checksum sink materialization in
+    smoke - minutes, not a hang; completion_timeout 900 for the 1h-window variants.
+
+    SG3 SHAPE (found by bisect after 12/12 deploy failures; probes A-E in session log,
+    working SQL + full explanation in queries/smartgrid/sg3_outlier_join.yaml): outlier
+    condition goes IN the ON (non-equi -> NL join), window alignment comes from the 1s
+    tumbling JOIN window, and `start` must stay selected UNRENAMED on both sides. TWO
+    ENGINE BUGS documented there: (a) frontend alias misbind for window fields inside an
+    aggregation SELECT; (b) worker bad_optional_access crash at registration
+    (TimestampField::getTimestampLeftAndRight, unguarded optional) when a join input
+    renames/drops the join-window time field.
+
+    RESULTS (2026-07-13, rerun 42/42 ok after the sg3 fix, reps=3 median):
+    SMOKE (seed): ALL FOUR queries byte-identical across arms AND across reps (even the
+    f32 AVG checksums are deterministic in this harness): sg0 1730016,4957318851 (count =
+    recorded); sg1 3683,9717993; sg2 98176,281259914 (count = recorded); sg3
+    279928,1153754155 (16.2% of local rows above global avg - plausible for skewed load).
+    MEASURED (x120 file):    CSV wall  Mr/s  | NAT wall  Mr/s  | Mr/s x (NAT/CSV)
+      sg1_global (1h/1s)   |  9.30s   0.434 | 11.26s   0.358  |  0.83
+      sg2_plug  (128s/1s)  |  0.82s   4.911 |  0.77s   5.260  |  1.07
+      sg3_outlier (1h/1s)  | 16.06s   0.251 | 19.40s   0.208  |  0.83
+    READING: (1) all three are state/window-bound as predicted - input is ~115MB against
+    0.8-19s walls, the format's input-side cost is invisible. (2) sg2 (128 slices): native
+    +7% rows/s < the 1.303 footprint -> per-byte 0.82 csv-favored, the CM/YSB pattern.
+    (3) THE ANOMALY - RESOLVED same day (smartgrid_sg1_granularity_ab + perf, see there):
+    sg1's "17%" was run-to-run tail luck (pooled: ~5-8%, overlapping distributions); sg3's
+    21% is real (zero rep overlap) and is LOCK CONTENTION, not format cost - both arms are
+    contention-bound in AggregationOperatorHandler::triggerSlices (+ futex storm), native
+    pays MORE contention (spinlock slowpath 17.4% vs 10.8%, total thread-CPU 190s vs 175s)
+    because its cheap ingestion hits the shared slice/trigger state at higher concurrency;
+    csv's parse cost is accidental pacing. Buffer-granularity hypothesis REFUTED by the
+    row-matched A/B. (4) PARSING-OVERHEAD ANSWER for the suite: zero - and on the 1h
+    trigger-bound queries the parse cost even masks an engine scalability problem (the
+    trigger path is lock-bound at W16, format-independent).
+  primary_metric: processing_time_s
+  higher_is_better: false
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser:
+      uint64: TracedUINT64
+      int16: TracedINT16
+      f32: EiselFloatF32
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  generator:
+    repeat: 1
+
+_series_smoke: &smoke_series
+  label: "input format"
+  explicit:
+    - name: csv_optimized
+      baseline: true
+      overrides: {}
+    - name: native
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "16" }
+        query_config.input_parser: {}
+
+_series_measured: &measured_series
+  label: "input format"
+  explicit:
+    - name: csv_optimized
+      baseline: true
+      overrides: {}
+    - name: native
+      overrides:
+        data_size: xlarge_native
+        query_config.input_formatter: { type: SystemNative, string_length: "16" }
+        query_config.input_parser: {}
+
+_axes_x: &w16_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [16]
+
+_y: &time_y { metric: processing_time_s, label: "Processing time (s)" }
+
+variants:
+  - name: smoke_sg0
+    description: "GATE (seed): .test Q1 shape, recorded count 1730016"
+    query: smartgrid/sg0_plug_avg_1h
+    overrides: { query_config.sink_type: Checksum }
+    axes: { x: *w16_x, series: *smoke_series }
+    y: *time_y
+  - name: smoke_sg1
+    description: "GATE (seed): keyless 1h/1s global AVG, arm-vs-arm counts"
+    query: smartgrid/sg1_global_avg
+    overrides: { query_config.sink_type: Checksum }
+    axes: { x: *w16_x, series: *smoke_series }
+    y: *time_y
+  - name: smoke_sg2
+    description: "GATE (seed): .test Q2, recorded count 98176"
+    query: smartgrid/sg2_plug_avg
+    overrides: { query_config.sink_type: Checksum }
+    axes: { x: *w16_x, series: *smoke_series }
+    y: *time_y
+  - name: smoke_sg3
+    description: "GATE (seed): outlier join plan builds + arm-vs-arm counts"
+    query: smartgrid/sg3_outlier_join
+    overrides: { query_config.sink_type: Checksum }
+    axes: { x: *w16_x, series: *smoke_series }
+    y: *time_y
+
+  - name: sg1_global
+    description: "SG1 global AVG 1h/1s, x120 data, csv vs native"
+    query: smartgrid/sg1_global_avg
+    overrides: { data_size: xlarge }
+    axes: { x: *w16_x, series: *measured_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: sg2_plug
+    description: "SG2 per-plug AVG 128s/1s, x120 data, csv vs native"
+    query: smartgrid/sg2_plug_avg
+    overrides: { data_size: xlarge }
+    axes: { x: *w16_x, series: *measured_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: sg3_outlier
+    description: "SG3 outlier join 1h/1s, x120 data, csv vs native"
+    query: smartgrid/sg3_outlier_join
+    overrides: { data_size: xlarge }
+    axes: { x: *w16_x, series: *measured_series }
+    y: *time_y
+    visualization: { type: grouped_bar }

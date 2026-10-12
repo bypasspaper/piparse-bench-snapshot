@@ -1,0 +1,100 @@
+experiment:
+  name: source_parse_scaling_q1_n1000
+  description: >
+    N=1000 endpoint for the q1 async-vs-blocking scaling curve (ONE rep per arm -- the
+    blocking rep alone moves ~6 TB). Async runs the TUNED 24w/6io budget (io=4 numbers are
+    ~8-9% understated per the thread-budget controls); blocking runs the same config as
+    source_parse_scaling_q1{,_ext} (BlockingFile ignores io threads).
+
+    SCALE CHECKS (verified before running, 2026-07-06): fd limit 99999 (1000 queries need
+    >2000 fds); RAM 62 GB total / 55 available vs ~12 GB needed (1000 x 8 MB private
+    source pools + 4 GB global pool); 1024 blocking threads is ~21x HW-thread
+    oversubscription. completion_timeout_s=3600: blocking at an extrapolated ~2-2.5 GB/s
+    needs ~2400-3000 s of data time + JIT-compiling 1000 pipelines at submit (expect a
+    LONG silent start -- not a hang).
+
+    CONTEXT (blocking 24w: N=250 5102, N=500 3545 -- gradual nonvoluntary-preemption
+    decline; async tuned: 13491 @250, expect ~13-13.5 @1000 if flat).
+
+    PREDICTION:
+      - async 24w/6io @1000: stays ~12.8-13.5 GB/s (the io pool multiplexes 1000 warm
+        sources as well as 250 -- io caps bytes, not source count); p50 ~8-12 ms (queue
+        depth scales with N), p99 ~18-25 ms.
+      - blocking @1000: decline continues but sub-linearly (per-src 7 MB/s @500 -> maybe
+        3-4 @1000): ~2.5-3.5 GB/s aggregate. Tail brutal: p50 ~80-120 ms, p99 200-400 ms.
+        RISK: with 1024 runnable threads, scheduler/JIT-compile interference could push
+        wall time toward the timeout; if it times out, rerun with repeat lowered to 3
+        (halves the window) rather than raising the timeout.
+      - Gap widens to ~4-5x.
+
+    RESULTS (2026-07-06, 1 rep each, 0 failures):
+      async 24w/6io = 13062 MB/s, p50 9.6 ms, p99 19.4, p999 23.0 -- throughput STILL FLAT
+        at 1000 sources (prediction hit); queueing pushes p50 to ~10 ms as expected.
+      blocking = 2115 MB/s (per-src 2.1 MB/s), p50 106.8 ms, p99 363 ms, p999 524 ms --
+        BELOW the predicted 2.5-3.5 band: the decline steepens (500->1000 = -40%), 1024
+        runnable parse threads on 48 HT is deep thrash territory; tail crosses half a
+        second at p999.
+      GAP = 6.2x throughput, ~11x p50, ~19x p99. JIT-compiling 1000 pipelines + submitting
+        took several minutes before the window (as warned); completion_timeout 3600 fine.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 3600
+  worker:
+    query_engine:
+      number_of_worker_threads: 24
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+  query_config:
+    sink_type: Monitoring
+  generator:
+    repeat: 6
+  num_queries: 1000
+
+variants:
+  - name: parse_thread_model_q1_n1000
+    description: "Nexmark Q1 at N=1000: async tuned (24w/6io) vs blocking uncompiled sequential"
+    query: nexmark/q1_price
+    axes:
+      x:
+        label: "Concurrent Queries (= Concurrent Sources)"
+        parameter: num_queries
+        values: [1000]
+      series:
+        label: "Ingestion + parse model"
+        explicit:
+          - name: async_compiled
+            baseline: true
+            overrides:
+              worker.query_engine.number_of_io_threads: 6
+              query_config.source_type: File
+              query_config.input_formatter: { type: SIMDCSV }
+              query_config.input_parser: { uint64: TracedUINT64, int32: TracedINT32, f64: EiselFloatF64 }
+              query_config.output_formatter: { type: CSV }
+              query_config.output_parser: { f64: ZMIJF64 }
+          - name: blocking_uncompiled
+            overrides:
+              worker.query_engine.number_of_io_threads: 4
+              query_config.source_type: BlockingFile
+              query_config.input_formatter: { type: SequentialUncompiledCSV, threading_mode: sequential }
+              query_config.output_formatter: { type: CSVUncompiled }
+    y:
+      metric: throughput_mbps
+      label: "Aggregate System Throughput (MB/s)"
+    visualization:
+      type: bar_chart

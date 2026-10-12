@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+query:
+  name: multicol_projf_n5
+  description: >
+    Field-count sweep point: 5-FLOAT64-column row (.6f floats), project+parse ONLY c0
+    (c0*FLOAT64(1) forces parse+serialize of c0). All 5 delimiters are INDEXED; the COMPILED
+    formatter parses only c0 (projection pushdown) while the UNCOMPILED formatter parses all 5
+    (no pushdown). csv->json. Data large/multicol/nf5.csv (200000030 B, 3673124 rows).
+  sql: "SELECT c0 * FLOAT64(1) AS c0 FROM t"
+  sources:
+    - name: t
+      schema:
+        - { name: c0, type: FLOAT64, not_null: true }
+        - { name: c1, type: FLOAT64, not_null: true }
+        - { name: c2, type: FLOAT64, not_null: true }
+        - { name: c3, type: FLOAT64, not_null: true }
+        - { name: c4, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/multicol/nf5.csv
+          size_bytes: 200000030
+          rows: 3673124
+  sink_schema:
+    - { name: c0, type: FLOAT64, not_null: true }

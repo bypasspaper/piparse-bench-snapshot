@@ -1,0 +1,156 @@
+experiment:
+  name: source_parse_scaling
+  description: >
+    PART 2 of the "interpreted parsing in the source thread" session (2026-07-06). Successor to
+    source_thread_scaling (async File vs BlockingFile, passthrough/elided, where throughput was
+    a DRAM-bound WASH ~15-17 GB/s at high N and only the LATENCY SHAPE differed). This run puts
+    REAL PER-ROW WORK in the picture and asks: how does INTERPRETED parsing in the source thread
+    (naive setup) scale with source count, vs the fully optimized async setup?
+
+      series async_compiled   = async File source (FIXED pool of 4 io threads for all N sources)
+                                + parallel compiled SIMDCSV + lazy parse elision (projection ->
+                                only the 2 projected of 4 fields are materialized) + fast traced/
+                                Eisel parsers in, JIT ZMIJ CSV out. Parsing happens ON THE 24
+                                WORKERS. = fastest known setup.
+      series blocking_uncompiled = BlockingFile (1 dedicated OS thread PER source) +
+                                SequentialUncompiledCSV pinned to that source thread: EVERY
+                                source thread runs the INTERPRETED formatter and parses ALL 4
+                                fields (uncompiled has no lazy elision), hardcoded fast_float in,
+                                CSVUncompiled (legacy direct-buffer to_chars+zmij) out. Workers
+                                only run the downstream projection + output + sink.
+
+    KEY STRUCTURAL DIFFERENCE vs the old passthrough experiment: there the blocking source
+    threads were ~idle (byte-copy, DRAM-bound) -> oversubscription at N=100 only thrashed
+    scheduling. HERE each blocking source thread WANTS a full core (interpreted read+index+
+    parse+materialize, ~450-520 MB/s/thread ceiling from Part 1 / fullstack_uncompiled_seq
+    466 MB/s) -> N source threads + 24 workers COMPETE for 24c/48t. The async arm keeps its
+    28-thread budget regardless of N and parses lazily (half the fields) with JIT code.
+
+    WORKLOAD: nexmark/bid_projection (SELECT auctionId, price = INT32 + FLOAT64, 2 of 4) on
+    the warm 1 GB bid cut, repeat=6 steady window, Monitoring sink (aggregate throughput =
+    wall-span aggregate; p50/p99/p999 latency). Identical worker side (24 workers, shared
+    global queue) across arms.
+
+    PREDICTIONS (write before running; per-thread numbers anchored on Part 1 results):
+      - N=1: async ~2-6 GB/s (single File source, workers parse lazily; producer-bound
+        territory ~5.8 GB/s in the passthrough run, projection parse cost will pull it below
+        that). blocking_uncompiled ~0.45-0.55 GB/s (the ONE interpreted source thread is the
+        ceiling; Part-1 uncompiled_seq number should match almost exactly).
+      - N=10: blocking ~N x 0.45 = ~4.5-5 GB/s (10 parse threads + 24 workers = 34 threads
+        < 48 HT, little contention yet). async rises toward its worker-side ceiling.
+      - N=50: blocking source threads (50) + workers (24) = 74 threads > 48 HT ->
+        oversubscription starts; aggregate plateaus around the CPU budget: ~48 HT of which
+        workers need a share -> expect ~8-14 GB/s if parse-limited, with p50 latency
+        exploding (multi-ms) like the old run.
+      - N=100: 124 threads on 48 HT, every source thread CPU-hungry -> context-switch storm
+        ON TOP of full CPU saturation; aggregate flat-to-DECLINING vs N=50 (unlike the old
+        passthrough run where it stayed ~flat because source threads slept on DRAM). Tail
+        latency catastrophic (tens of ms).
+      - async arm: throughput roughly flat-to-rising with N, ceiling set by 24 workers doing
+        lazy 2-field parse + 2-col output; possibly DRAM-shadowed like before (~15 GB/s).
+        Latency: good p50 at all N, tail degrades at N=100 (io-pool HOL blocking, prior run
+        p99 ~12 ms).
+      - Crossover: async >> blocking at N=1; blocking may CLOSE PART of the gap in the
+        N=10-50 midrange (many dedicated parse cores vs 24 shared workers), then falls away
+        again at N=100. If blocking NEVER gets close, interpreted source-thread parsing is
+        strictly dominated on this box.
+
+    GOTCHAS / CAVEATS (load-bearing -- keep with care):
+      - warm_read: true (page-cache resident; no disk component). BlockingFile+File both loop
+        on EOF with NES_FILE_REPEAT=repeat(6) -> steady-state window, not single-pass ramp.
+        Do NOT swap in IoUringFile here: it IGNORES NES_FILE_REPEAT and its private-pool/QD
+        interaction at N=100 is untested.
+      - SequentialUncompiledCSV REQUIRES threading_mode sequential + a blocking source; the
+        carry-accumulator handles multi-buffer rows only in the pinned sequential routine.
+      - Parser-registry split: compiled parser overrides (TracedUINT64 etc.) ERROR on the
+        uncompiled formatter -> parser config lives ONLY in the async series overrides.
+      - number_of_io_threads(=4) only affects the ASYNC arm (BlockingFile ignores it). Fixed.
+      - 24 workers SHARED across all N queries (one global MPMC task queue). Fixed across arms.
+      - Global pool 32768 x 128 KiB = 4 GB for pipeline outputs + each source takes a private
+        64-buffer pool (100 sources ~= 800 MB). Raise the pool on "buffer allocation failure".
+      - Throughput = wall-span aggregate across queries (post-fix semantics, NOT the old
+        overcounting sum); latency percentiles come from the MonitoringSink _us columns.
+      - N=100 means JIT-compiling 100 pipelines at submit -- slow start is expected, it is
+        outside the throughput window but inside wall time (completion_timeout generous).
+      - Build: full fast stack, InlineTagConfig lazy_overload+output_parse+input_parse enabled
+        (verified 2026-07-06). Rebuild nes-single-node-worker (worker-cli!) after any change.
+      - `pkill -x main` pre-flight (stray workers steal cores and poison the numbers).
+      - REQUIRES the sourceCreationTimestamp propagation fix in the uncompiled formatter task
+        (UncompiledInputFormatterTask.hpp, fixed 2026-07-06); without it Monitoring records
+        ~0 throughput + garbage latency for the blocking_uncompiled arm.
+
+    RESULTS (2026-07-06, reps=3 -- all predictions confirmed):
+      async_compiled:      N=1/10/50/100 = 5404 / 12780 / 13043 / 13230 MB/s (saturates ~13.2
+        GB/s by N=10, FLAT; ~2 GB/s below the old passthrough run's 15.2 = the real parse
+        work). Latency STAYS GOOD: p50 0.09 -> 1.0 ms, p99 <= 1.3 ms, p999 1.5 ms at N=100
+        (far better than the old passthrough run's p99 ~12 ms at N=100).
+      blocking_uncompiled: N=1/10/50/100 = 444 / 4886 / 9001 / 8178 MB/s. N=1 matches the
+        Part-1 sequential ceiling (444; BlockingFile pays the read copy vs io_uring's 500).
+        LINEAR to N=10 (489/src == full solo rate, 34 threads < 48 HT). N=50: contention
+        plateau (180/src, 74 threads > 48 HT). N=100: DECLINES (82/src) -- unlike the old
+        passthrough run (flat 15.7 GB/s), because parse-hungry source threads turn
+        oversubscription from scheduling noise into real throughput loss. Latency collapses
+        past the HW-thread budget: p50 0.4 -> 6.5 -> 17.2 ms, p99 25 ms at N=100.
+      GAP: 12.2x at N=1, NARROWS to 1.45x at N=50 (dedicated parse cores partially
+        compensate), widens again to 1.6x at N=100. Naive interpreted-in-source-thread is
+        competitive-ish in the N=10-50 midrange for THROUGHPUT but never on tail latency.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 600
+  worker:
+    query_engine:
+      number_of_worker_threads: 24
+      number_of_io_threads: 4
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+  query_config:
+    sink_type: Monitoring
+  generator:
+    repeat: 6
+
+variants:
+  - name: parse_thread_model
+    description: "bid 2-of-4 projection: async compiled+lazy (parse on workers) vs blocking uncompiled sequential (parse on N source threads)"
+    query: nexmark/bid_projection
+    axes:
+      x:
+        label: "Concurrent Queries (= Concurrent Sources)"
+        parameter: num_queries
+        values: [1, 10, 50, 100]
+      series:
+        label: "Ingestion + parse model"
+        explicit:
+          - name: async_compiled
+            baseline: true
+            overrides:
+              query_config.source_type: File
+              query_config.input_formatter: { type: SIMDCSV }
+              query_config.input_parser: { uint64: TracedUINT64, int32: TracedINT32, f64: EiselFloatF64 }
+              query_config.output_formatter: { type: CSV }
+              query_config.output_parser: { f64: ZMIJF64 }
+          - name: blocking_uncompiled
+            overrides:
+              query_config.source_type: BlockingFile
+              query_config.input_formatter: { type: SequentialUncompiledCSV, threading_mode: sequential }
+              query_config.output_formatter: { type: CSVUncompiled }
+    y:
+      metric: throughput_mbps
+      label: "Aggregate System Throughput (MB/s)"
+    visualization:
+      type: line_chart
+      x_scale: log

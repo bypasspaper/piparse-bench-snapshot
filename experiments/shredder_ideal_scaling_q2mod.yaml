@@ -1,0 +1,110 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: shredder_ideal_scaling_q2mod
+  description: >
+    IDEAL-CONDITIONS thread-scaling follow-up to the 4KiB spanning shredder study: 128 KiB buffers,
+    small NEXMark bidstr tuples (~115 B/row, no spanning), x = worker threads, y = records/s
+    (throughput_mrows_s, format-invariant). Query = matrix bidstr_q2mod (SELECT auctionId, price
+    WHERE auctionId % 123 == 0, ~0.82% survivors -> output cost ~0, per-row work cheap).
+    Config replicates nes_vs_flink_vs_spark_stateless_5arm NES arms verbatim (MmapFile + repeat 8 +
+    NES_MMAP_POPULATE, W23 anchor: NES-Native 515.9 / NES-SIMD 497.6 M rows/s ~= 57 GB/s memory
+    bandwidth). 4 arms: no_serde (SystemNative -> NATIVE, native->native), bypass (all contributions:
+    SIMDCSV lazy elision + LOCK_FREE shredder + fast codecs, csv -> JSON as in 5-arm), lockfree and
+    locking (eager_parse=true kills lazy elision -> real per-field parse; LOCK_FREE vs LOCKING
+    shredder). EXPECT: lockfree ~= locking (128K = low shredder call-rate, parse masks the mutex);
+    bypass converges to no_serde with enough threads (parse near-free under pushdown at bandwidth).
+    GOTCHAS: (1) W23 windows ~0.5 s (repeat 8 = 250.4M rows @ ~500M rows/s) -- same footing as the
+    5-arm (10 reps median accepted it); do NOT bump generator.repeat, 16x staging = 54 GB > page
+    cache. (2) staged repeat-8 files = 26.8 GB csv + 25.6 GB nes; warm both (warm_read: true does
+    it) -- first staging write is slow, not a hang. (3) eager_parse knob is UNCOMMITTED working-tree
+    code (compiled into the Aug-31 binary at b5d757c9f6); verify binary predates no source changes.
+    (4) string_length "13,73" required for SystemNative on the bidstr schema (2 varsized leaves).
+    (5) throughput_mrows_s is the cross-arm metric; MB/s is NOT (csv 114.865 vs native 110 B/row).
+    RUN: cd ~/work/piparse-bench && pkill -x main; PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/shredder_ideal_scaling_q2mod.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mrows_s
+  higher_is_better: true
+  repetitions: 5
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  worker:
+    query_engine:
+      number_of_worker_threads: 23
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: MmapFile
+    sink_type: Monitoring
+    input_formatter:
+      type: SIMDCSV
+      allow_commas_in_strings: false
+    input_parser:
+      uint64: TracedUINT64
+      int64: TracedINT64
+      int32: FastINT32
+      int16: TracedINT16
+      uint32: TracedUINT32
+      uint16: TracedUINT16
+      f64: EiselFloatF64
+      f32: EiselFloatF32
+      bool: TracedBOOL
+    output_formatter:
+      type: JSON
+    output_parser:
+      f64: ZMIJF64
+      f32: ZMIJF32
+  generator:
+    repeat: 8
+  worker_env:
+    NES_MMAP_POPULATE: '1'
+variants:
+  - name: ideal_q2mod
+    description: "4-arm ideal-conditions worker sweep, bidstr q2_mod, 128KiB"
+    query: nexmark/matrix/bidstr_q2mod
+    axes:
+      x:
+        label: "worker threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [1, 2, 4, 8, 12, 16, 20, 23]
+      series:
+        label: "arm"
+        explicit:
+          - name: no_serde
+            baseline: true
+            overrides:
+              data_size: native
+              query_config.input_formatter: { type: SystemNative, string_length: "13,73" }
+              query_config.output_formatter: { type: NATIVE }
+              query_config.input_parser: {}
+              query_config.output_parser: {}
+          - name: bypass
+            overrides:
+              query_config.input_formatter: { type: SIMDCSV, allow_commas_in_strings: false, sequence_shredder_mode: LOCK_FREE }
+          - name: lockfree
+            overrides:
+              query_config.input_formatter: { type: SIMDCSV, allow_commas_in_strings: false, sequence_shredder_mode: LOCK_FREE, eager_parse: true }
+          - name: locking
+            overrides:
+              query_config.input_formatter: { type: SIMDCSV, allow_commas_in_strings: false, sequence_shredder_mode: LOCKING, eager_parse: true }
+    y:
+      metric: throughput_mrows_s
+      label: "Throughput (M records/s)"
+    visualization:
+      type: line_chart

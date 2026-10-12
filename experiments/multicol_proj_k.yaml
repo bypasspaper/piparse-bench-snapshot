@@ -1,0 +1,97 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: multicol_proj_k
+  description: >
+    ENGINE analogue of the isolated field_scaling "parse k of 16 fields" sweep. A fixed 16-FLOAT64-column
+    row (integer-valued, large/multicol/f16.csv, 2.0M rows, 104 B/row -- byte-identical to the isolated
+    harness dataset). Each variant parses+serializes the first k columns (cI*FLOAT64(1) defeats lazy
+    elision -> Eisel parse + ZMIJ serialize) and passes the other 16-k through (lazily elided + coalesced
+    byte-copy, NOT parsed). Sweep k in {1,2,4,8,16}. Throughput = full-row-bytes ingested / time.
+
+    PURPOSE: (1) confirm the free-bytes model -- k=1 (1 parsed + 15 free) should land in MULTI-GB/s,
+    reconciling the isolated PURE parse+write 4348 MB/s vs the matched single-column engine 222 MB/s
+    (that gap is bytes/parsed-field, NOT engine inefficiency). (2) get the ENGINE MB/s-vs-k curve to
+    compare against the isolated INDEX+parse table (float: 1449->464 with SCALAR memchr index; the engine
+    uses SIMD index ~1.5 ns/row so the low-k end should sit MUCH higher, close to the isolated PURE curve).
+
+    CONFIG (fastest known, matched to the isolated single-core harness + the floatcol_inline template):
+      - InMemory PREFILL source (zero-copy, zero-I/O in the timed window -- no read cost, matches the
+        isolated in-memory vector). Needs the takePreFilledBuffer sourceCreationTimestamp fix (applied,
+        uncommitted) + number_of_buffers_in_global_buffer_manager >= 16384 for CSV out.
+      - sequential SequentialCSV, W1, io=1 (single thread = cleanest, matches isolated single core).
+      - BUILD-TIME inlining of BOTH parse proxies: InlineTagConfig.yaml enable input_parse + output_parse
+        (reconfigure + rebuild). This is the real inlining knob (NOT runtime invoke_mode); both together
+        gave +16.1% on float q1 (output_parse is the always-win, input_parse via synergy). invoke_mode
+        stays fnattr.
+      - EiselFloatF64 in + ZMIJF64 out, 131072 buffer, native, Monitoring sink + CSV output_formatter.
+      - generator.repeat=20 == NES_INMEM_REPEAT=20 for a ~4 GB steady window + correct MonitoringSink
+        accounting.
+
+    EXPECTED (predict before running): k=1 ~ several GB/s (index+dispatch bound, codec touches 1/16);
+    falls toward k=16 which should approach the matched single-column ceiling scaled by 16 fields. The
+    curve should sit between the isolated PURE (no index) and scalar-INDEX curves, nearer PURE at low k
+    (SIMD index cheap). Fit ns/row = a + b*k: a = per-row fixed (index+dispatch, SIMD-cheap), b = float
+    chained per-field (~ engine's ~26-32 ns, vs isolated 23.3).
+
+    GOTCHAS: pkill -x main pre-flight + :8080 free; InMemory prefill holds ~1600 input buffers resident
+    (200MB/131072) + output buffers -> 16384 pool ok; the inline knob is BUILD-TIME (rebuild before this
+    run, verify with a symbol check); MonitoringSink needs the InMemory timestamp fix or it writes no CSV.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: false
+  completion_timeout_s: 180
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: {type: SequentialCSV, threading_mode: sequential}
+    input_parser: {f64: EiselFloatF64}
+    output_formatter: {type: CSV}
+    output_parser: {f64: ZMIJF64}
+  generator:
+    repeat: 20
+    mode: burst
+    rate: 1000000
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 20
+    NES_INMEM_BUFSIZE: 131072
+
+variants:
+  - name: proj_k_sweep
+    description: "parse k of 16 float cols (rest passthrough), InMemory-prefill seq W1, inlined codec"
+    queries:
+      - multicol/proj_k1
+      - multicol/proj_k2
+      - multicol/proj_k4
+      - multicol/proj_k8
+      - multicol/proj_k16
+    axes:
+      x:
+        label: "fields parsed (of 16)"
+        explicit:
+          - name: "sweep"
+            baseline: true
+            overrides: {}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

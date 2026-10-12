@@ -1,0 +1,84 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: nes_vs_flink_vs_spark_scaling_step20_spark_mb
+  description: >
+    SPARK-ONLY step-20 latency+throughput sweep (N=1,20,40,..,1000, 51 pts) on the FULL
+    bid_strings_3GB.csv, using the CUSTOM `file-microbatch-csv` DataSource V2 source (spark-ext) so
+    Spark yields REAL per-batch ingest->sink latencies instead of a single whole-file number.
+    Replaces nes_vs_flink_vs_spark_scaling_step20_spark (which read the file with the built-in CSV
+    source => exactly 1 whole-file micro-batch/stream => "per-batch" latency was whole-stream time,
+    53 s -> 1980 s). The custom source reads the SAME single file (byte-identical bytes, no physical
+    split) in byte-range, line-aligned micro-batches of 64 MiB -- a native Spark / HDFS-block
+    granularity (Spark's default file partition is 128 MiB), so no accusation of handicapping Spark;
+    it is data-dominated (~880 ms work + ~120 ms fixed trigger overhead per batch at N=1) and holds
+    92% of Spark's whole-file throughput ceiling (vs 42% at 4 MiB, where the ~80-100 ms fixed
+    per-batch trigger overhead dominates). ~54 batches/stream. The source reuses Spark's own
+    UnivocityParser (parse cost byte-identical to native; A/B-verified no throughput degradation),
+    tmpfs checkpoint (RAM-backed, fair analog to Flink's disabled checkpointing), 24 cores, FAIR
+    scheduler. NES+Flink are REUSED from the main sweep (run_group 20260817T164347-3ec56b98,
+    experiment nes_vs_flink_vs_spark_scaling_step20) -- do NOT re-run them. The figure merges this
+    run_group's Spark with that run_group's NES+Flink:
+      plot_nes_flink_spark_scaling.py nes_vs_flink_vs_spark_scaling_step20 nes_vs_flink_vs_spark_scaling_step20_spark_mb
+    Pre-flight: spark-ext/build.sh (jar), warm cache (dd file to /dev/null). Run: pbench run
+    --detach + PBENCH_SPARK_TIMEOUT=3600 PBENCH_KEEP_LOGS=1 --worker-port 9099.
+  primary_metric: p99_latency_us
+  higher_is_better: false
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: spark
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: spark
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 3600
+  query_mix:
+    - nexmark/matrix/bidstr_q0
+    - nexmark/matrix/bidstr_qproject
+    - nexmark/matrix/bidstr_qroute
+    - nexmark/matrix/bidstr_q1
+    - nexmark/matrix/bidstr_q2og
+    - nexmark/matrix/bidstr_q2mod
+    - nexmark/matrix/bidstr_q10
+    - nexmark/matrix/bidstr_q14
+    - nexmark/matrix/bidstr_q22
+    - nexmark/matrix/bidstr_qex
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+  spark_output_format: json_void_latency
+  spark_source: file-microbatch-csv
+  spark_batch_bytes: 67108864
+  spark_parallelism: 24
+  generator:
+    repeat: 1
+
+_series_engines: &engines
+  label: "engine"
+  explicit:
+    - name: Spark
+      baseline: true
+
+_axis_n: &n_x
+  label: "concurrent sources/queries"
+  parameter: num_queries
+  # REVERSED (N=1000 -> N=1): the heaviest, riskiest point runs FIRST so any OOM / driver-thread
+  # blowup surfaces in ~35 min (not at hour 14). pbench stores each point incrementally, and the
+  # figure merges by N, so execution order does not affect the output.
+  values: [1000, 980, 960, 940, 920, 900, 880, 860, 840, 820, 800, 780, 760, 740, 720,
+           700, 680, 660, 640, 620, 600, 580, 560, 540, 520, 500, 480, 460, 440, 420,
+           400, 380, 360, 340, 320, 300, 280, 260, 240, 220, 200, 180, 160, 140, 120,
+           100, 80, 60, 40, 20, 1]
+
+_y: &lat_y { metric: p99_latency_us, label: "p99 per-batch ingest->sink latency (us)" }
+
+variants:
+  - name: mix
+    description: "Spark-only step-20 sweep, custom file-microbatch-csv source @ 64 MiB"
+    query: nexmark/matrix/bidstr_q0
+    axes: { x: *n_x, series: *engines }
+    y: *lat_y
+    visualization: { type: line_chart }

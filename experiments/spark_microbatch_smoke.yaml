@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: spark_microbatch_smoke
+  description: >
+    Smoke test of the custom `file-microbatch-csv` Spark source THROUGH the pbench harness
+    (renderer + spark runner), N=4 concurrent streams over the full bid_strings_3GB.csv, csv->json
+    void sink with per-batch latency. Confirms the harness wiring (spark_source knob + jar
+    injection + _register branch) works end-to-end and that PBENCH_LATENCY_SAMPLES is populated
+    with MANY per-batch samples (~1 s each), not one whole-file number. Batch size 64 MiB (a native
+    Spark / HDFS-block granularity; ~54 batches/stream on the 3.6 GB file).
+    Run: pbench run experiments/spark_microbatch_smoke.yaml --worker-port 9099 (Spark-only, no NES
+    worker needed). Warm cache first (dd the file to /dev/null).
+  primary_metric: p99_latency_us
+  higher_is_better: false
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: spark
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: spark
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 3000
+  query_mix:
+    - nexmark/matrix/bidstr_q0
+    - nexmark/matrix/bidstr_qproject
+    - nexmark/matrix/bidstr_qroute
+    - nexmark/matrix/bidstr_q1
+    - nexmark/matrix/bidstr_q2og
+    - nexmark/matrix/bidstr_q2mod
+    - nexmark/matrix/bidstr_q10
+    - nexmark/matrix/bidstr_q14
+    - nexmark/matrix/bidstr_q22
+    - nexmark/matrix/bidstr_qex
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+  spark_output_format: json_void_latency
+  spark_source: file-microbatch-csv
+  spark_batch_bytes: 67108864
+  spark_parallelism: 24
+  generator:
+    repeat: 1
+
+_series_engines: &engines
+  label: "engine"
+  explicit:
+    - name: Spark
+      baseline: true
+
+_axis_n: &n_x
+  label: "concurrent sources/queries"
+  parameter: num_queries
+  values: [4]
+
+_y: &lat_y { metric: p99_latency_us, label: "p99 per-batch ingest->sink latency (us)" }
+
+variants:
+  - name: mix
+    description: "N=4 custom-source smoke"
+    query: nexmark/matrix/bidstr_q0
+    axes: { x: *n_x, series: *engines }
+    y: *lat_y
+    visualization: { type: line_chart }

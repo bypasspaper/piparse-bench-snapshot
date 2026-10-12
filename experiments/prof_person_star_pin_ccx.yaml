@@ -1,0 +1,103 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: prof_person_star_pin_ccx
+  # PROBE (user ask 2026-07-08): person_star (SELECT * FROM person) under the pinned 1io+5w CCX0
+  # protocol + fast-class files (person_840MB.nes rewritten 12.9 GB/s dd; csv 13.0). Prior state
+  # (nexmark_native_vs_csv, W16 UNPINNED, pre-rewrite): csv 8.14 GB/s (passthrough ELISION -
+  # workers touch nothing, Monitoring sink) vs native 6.93 (fixed-slot->varsized materialization
+  # + CSV string serialize; prof_person_star_native showed it PRODUCER-bound, io 1.05 cores,
+  # workers only ~2 of 16 cores) -> "native loses per byte 0.85x".
+  # EXPECT (predict-first): both arms io-thread-bound at the pinned warm ceiling.
+  #   csv ~10.5+ GB/s (elided: NO worker scan drag - possibly slightly ABOVE person_projection's
+  #   10.49 where workers SIMD-scanned every byte; a clean test of the scan-drag size);
+  #   native ~10-10.5 GB/s (worker compute ~2 cores at 7.6 GB/s scales to ~2.8 < 5 workers ->
+  #   still supply-bound; RISK: varsized child-buffer + output-buffer traffic pressures CCX0 L3
+  #   and drags the io copy somewhat below csv). Mr/s csv ~47-48 vs native ~28 (density).
+  #   If confirmed: yesterday's per-byte 0.85x "native pays serialize/varsized per byte" was the
+  #   same placement/file-class artifact stack, and person_star per-byte is ~a WASH too.
+  # Windows: csv 881MB@~10.5 = 0.084 s/pass x500 ~ 42s; native 1472MB@~10.4 = 0.142 x380 ~ 54s.
+  # Gotchas: person CSV keeps \r in the last VARSIZED col (irrelevant: elided passthrough +
+  # Monitoring sink); allow_commas=false correct (person csv quote-free).
+  #
+  # RESULTS (2026-07-08, n=1/arm; probe = rchar rate + io/worker CPU ticks over 10s mid-window):
+  #   PREFLIGHT CAUGHT: person files were COLD (2.5-2.7 dd - the cold_direct experiment's
+  #   fadvise-evict left them evicted); re-warmed to csv 13.5 / nes 15.3 GB/s dd - the class is
+  #   RE-ROLLED at every eviction (nes rolled BETTER than its previous 12.9; the earlier
+  #   "evict+re-read does not heal" was itself a dice roll). dd ceilings must be measured
+  #   per-session, not assumed.
+  #   csv_optimized  10869.9 MB/s / 49.4 Mr/s (rchar 10.93; io PEGGED 999/1000 ticks;
+  #                  workers 2.18 of 5 cores incl. idle-spin)
+  #   native         11868.2 MB/s / 32.3 Mr/s (rchar 11.87; io PEGGED 994/1000;
+  #                  workers 3.10 of 5 cores - the varsized+serialize compute, fits easily)
+  # VERDICT - per-byte WASH confirmed for person_star too, once normalized to each file's OWN
+  #   dd ceiling: csv 10.87/13.5 = 80.5%, native 11.87/15.3 = 77.6% (native's higher ABSOLUTE
+  #   GB/s is just its luckier page roll, 15.3 vs 13.5). Cross-check person_projection: csv
+  #   80.7%, native 80.9% -> the engine's warm single-source supply efficiency is ~78-81% of dd
+  #   REGARDLESS of format and of whether workers idle (elided csv), scan (projection csv), or
+  #   materialize varsized+serialize (native star; its 77.6% = the only hint of the predicted
+  #   L3-pressure drag, ~3%). Yesterday's "native loses per byte 0.85x" on person_star =
+  #   placement + file-class artifacts, same as person_projection's 1.28x.
+  #   Mr/s ratio 0.654 = GB/s ratio 1.092 x footprint 0.599 (consistency check passes).
+  # METRIC IMPLICATION: for supply-bound queries report %-of-own-file-dd-ceiling as the honest
+  #   per-byte engine-efficiency metric; raw GB/s comparisons across files are confounded by the
+  #   page-roll (+-15% within the fast class alone).
+  description: "probe: person_star csv-vs-native, pinned 1io+5w CCX0, fast-class files"
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  completion_timeout_s: 300
+  worker:
+    query_engine:
+      number_of_worker_threads: 5
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser: { uint64: TracedUINT64, int32: FastINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  generator:
+    repeat: 500
+
+_series: &format_series
+  label: "input format"
+  explicit:
+    - name: csv_optimized
+      baseline: true
+      overrides: {}
+    - name: native
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "16,32,32,16,4,256" }
+        query_config.input_parser: {}
+        generator.repeat: 380
+
+variants:
+  - name: person_star_pin_ccx0
+    query: nexmark/person_star
+    axes:
+      x:
+        label: "worker threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [5]
+      series: *format_series
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: grouped_bar }

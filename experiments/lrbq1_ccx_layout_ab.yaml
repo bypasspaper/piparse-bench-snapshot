@@ -1,0 +1,115 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: lrbq1_ccx_layout_ab
+  description: >
+    CCX-LAYOUT CONTROL for the trigger-contention finding (user question 2026-07-13:
+    "couldn't the W-sweep anti-scaling be a cross-CCX effect?"). Box = TR PRO 5965WX,
+    4 CCX x 6 cores, 32MB L3 each. The lrbq1_contention_wsweep ran the STRIPED layout
+    (verified via taskset on live workers: W4 = cpus 1,6,12,18 = one worker per CCX -
+    the MAXIMALLY cross-CCX placement), so its W4 optimum already tolerated 4-way L3
+    bouncing of the lock line. This A/B pins the same query with
+    NES_CCX_PIN_LAYOUT=compact (contiguous fill: W4 = cpus 1-4, all CCX0 with the io
+    thread; W8 = CCX0 5 workers + CCX1 3; W16 = CCX0-2 full + CCX3 1) vs the default
+    striped layout, both formats, W in {4,8,16}.
+    HYPOTHESES SEPARATED: if the anti-scaling is mostly CROSS-CCX line bouncing, compact
+    should (a) beat striped substantially at equal W and (b) scale further before
+    degrading (the knee moves right); the perf spinlock/futex signature CANNOT
+    distinguish the two mechanisms (same symbols either way - the user's point), only
+    this placement A/B can. If it is thread-COUNT convoy on the futex (wake storm),
+    layout barely matters and W4 stays optimal in both layouts.
+    Caveat: compact confounds LOWER lock-line latency (same L3) with SHARED L3 capacity
+    (slices + band data now compete in one 32MB slice); at these tiny working sets
+    (~115MB stream, slice state) capacity pressure is minor.
+
+    RESULTS (2026-07-13, 36/36, reps=3 median) - BOTH mechanisms real, CONVOY DOMINATES:
+      W  | csv striped | csv compact | nat striped | nat compact
+       4 |   7.35s     |  5.63s(-23%)|   7.05s     |  5.23s(-26%)  <- new global best
+       8 |   8.68s     |  6.84s(-21%)|  12.16s     |  9.07s(-25%)
+      16 |  12.82s     | 11.60s(-10%)|  18.95s     | 17.20s(-9%)
+    (1) CCX TERM CONFIRMED but MINOR: same-L3 placement saves 21-26% at W4/8 and only
+    ~9-10% at W16 (compact spans 3+ CCXs there anyway). Cleanest same-thread-count
+    isolation: nat W8 striped (4 CCX) 12.16 -> compact (2 CCX) 9.07 = 25% for halving
+    CCX spread. (2) CONVOY TERM DOMINATES and survives layout control: WITHIN compact,
+    W4->W16 still degrades 2.06x (csv) / 3.29x (native); the knee does NOT move right
+    (compact W8 > compact W4 in both arms; note W8-compact crosses into a 2nd CCX -
+    with 6-core CCXs a >5-worker single-CCX point does not exist, so the W8 step keeps
+    a small boundary confound; the W16-within-compact degradation is boundary-free
+    evidence). (3) Format ordering (native worse) holds in BOTH layouts at W>=8 -
+    the ingestion-pacing story is layout-independent. (4) NEW BEST CONFIG for
+    trigger-bound queries: COMPACT W4 (1 io + 4 workers, all CCX0): nat 5.23s /
+    csv 5.63s = 3.3-3.6x faster than the default striped W16. Rough decomposition at
+    W16: convoy term ~5-7x the CCX term. Engine-fix expectation unchanged (shard the
+    slice store); the CCX saving is a placement-policy bonus for lock-heavy plans.
+  primary_metric: processing_time_s
+  higher_is_better: false
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: xlarge
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser:
+      uint64: TracedUINT64
+      int32: FastINT32
+      int16: TracedINT16
+      f32: EiselFloatF32
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+
+_axes_x: &w_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [4, 8, 16]
+
+variants:
+  - name: lrbq1_layout
+    query: lrb/q1_avg_speed
+    axes:
+      x: *w_x
+      series:
+        label: "format x pin layout"
+        explicit:
+          - name: csv_striped
+            baseline: true
+            overrides: {}
+          - name: csv_compact
+            overrides:
+              worker_env.NES_CCX_PIN_LAYOUT: compact
+          - name: nat_striped
+            overrides:
+              data_size: xlarge_native
+              query_config.input_formatter: { type: SystemNative, string_length: "16" }
+              query_config.input_parser: {}
+          - name: nat_compact
+            overrides:
+              data_size: xlarge_native
+              query_config.input_formatter: { type: SystemNative, string_length: "16" }
+              query_config.input_parser: {}
+              worker_env.NES_CCX_PIN_LAYOUT: compact
+    y: { metric: processing_time_s, label: "Processing time (s)" }
+    visualization: { type: line_chart }

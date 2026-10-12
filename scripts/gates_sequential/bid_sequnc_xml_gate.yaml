@@ -1,0 +1,81 @@
+# SEQUENTIAL-RUNG GATE (r-base XML-as-config): derived from the proven parallel gate; same schema,
+# same 5-field projection, same Checksum sink -> must reproduce 31300000,269477267979.
+# Sequential/uncompiled rungs need BlockingFile + threading_mode SEQUENTIAL.
+# CORRECTNESS GATE: the XML arm must reproduce the cross-format bid passthrough checksum
+# USING THE UNMODIFIED HL7 INDEXER, configured for packed XML (the phase-0 generality claim
+# of XML_INDEXER_PLAN.md -- "fixed-schema packed XML is a delimiter-class config, not a new
+# parser"). Structural class {<,>}, tuple delimiter '\n' (trailing -> no EOF-flush trap, 1
+# byte -> no cross-buffer delimiter splitting). Splitting at every structural byte yields
+# arity 4F+5 = 29 leaves for bid's F=6, values at 0-indexed slots 4,8,12,16,20,24; tag
+# names/close tags/empties are junk leaves (VARSIZED, never projected, lazy = free).
+# SELECT auctionId, bidder, price, channel, url over bid_strings_3GB.xml into the Checksum
+# sink with legacy CSV materialization -- comparable with the known csv/json/hl7 values:
+#   count 31300000, checksum 269477267979
+# A match proves the generated XML dataset AND the config-only XML claim end-to-end at scale.
+# NOTE: '\n' below is single-quoted on purpose -- it arrives as escape TEXT (the SQL/config
+# layer does no escape processing) and validateAndFormat unescapes it to the LF byte.
+query: SELECT auctionId, bidder, price, channel, url FROM bid INTO bidChecksum
+logical:
+  - name: bid
+    schema:
+      - { name: x01, type: VARSIZED }
+      - { name: x02, type: VARSIZED }
+      - { name: x03, type: VARSIZED }
+      - { name: x04, type: VARSIZED }
+      - { name: timestamp, type: UINT64 }
+      - { name: x05, type: VARSIZED }
+      - { name: x06, type: VARSIZED }
+      - { name: x07, type: VARSIZED }
+      - { name: auctionId, type: INT32 }
+      - { name: x08, type: VARSIZED }
+      - { name: x09, type: VARSIZED }
+      - { name: x10, type: VARSIZED }
+      - { name: bidder, type: INT32 }
+      - { name: x11, type: VARSIZED }
+      - { name: x12, type: VARSIZED }
+      - { name: x13, type: VARSIZED }
+      - { name: price, type: FLOAT64 }
+      - { name: x14, type: VARSIZED }
+      - { name: x15, type: VARSIZED }
+      - { name: x16, type: VARSIZED }
+      - { name: channel, type: VARSIZED }
+      - { name: x17, type: VARSIZED }
+      - { name: x18, type: VARSIZED }
+      - { name: x19, type: VARSIZED }
+      - { name: url, type: VARSIZED }
+      - { name: x20, type: VARSIZED }
+      - { name: x21, type: VARSIZED }
+      - { name: x22, type: VARSIZED }
+      - { name: x23, type: VARSIZED }
+physical:
+  - logical: bid
+    type: BlockingFile
+    host: "localhost:8080"
+    parser_config:
+      type: SequentialUncompiledHL7
+      threading_mode: SEQUENTIAL
+      message_delimiter: '\n'
+      segment_delimiter: '<'
+      field_delimiter: '>'
+      component_delimiter: ""
+      subcomponent_delimiter: ""
+    source_config:
+      file_path: __TESTDATA__/large/nexmark/bid_strings_3GB.xml
+sinks:
+  - name: bidChecksum
+    type: Checksum
+    host: "localhost:8080"
+    schema:
+      - { name: bid$auctionId, type: INT32 }
+      - { name: bid$bidder, type: INT32 }
+      - { name: bid$price, type: FLOAT64 }
+      - { name: bid$channel, type: VARSIZED }
+      - { name: bid$url, type: VARSIZED }
+    config:
+      file_path: __OUTPUT__
+      legacy_output_format: CSV
+    ## the nes-cli Sink decoder requires the key even when empty
+    parser_config: {}
+workers:
+  - host: "localhost:8080"
+    max_operators: 10000

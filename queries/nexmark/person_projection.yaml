@@ -1,0 +1,38 @@
+query:
+  name: nexmark_person_projection
+  description: "SELECT id FROM person (single column projection on varsized source)"
+
+  sql: "SELECT id FROM person"
+
+  flink_sql: "SELECT id FROM person"
+
+  sources:
+    - name: person
+      schema:
+        - { name: id, type: INT32, not_null: true }
+        - { name: name, type: VARSIZED, not_null: true }
+        - { name: email_address, type: VARSIZED, not_null: true }
+        - { name: credit_card, type: VARSIZED, not_null: true }
+        - { name: city, type: VARSIZED, not_null: true }
+        - { name: state, type: VARSIZED, not_null: true }
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: extra, type: VARSIZED, not_null: true }
+      data:
+        large:
+          file: large/nexmark/person_840MB.csv
+          size_bytes: 876941057
+          rows: 4000000
+        native:
+          # 4,000,000 rows x 368 B; VARSIZED stored as fixed \x00-padded slots, schema-order
+          # lengths string_length='16,32,32,16,4,256'. Generated via csv_to_binary.py.
+          file: large/nexmark/person_840MB.nes
+          size_bytes: 1472000000
+          rows: 4000000
+
+  sink_schema:
+    - { name: person.id, type: INT32, not_null: true }
+
+  validation:
+    large: { tuples: 4000000, checksum: 1444868000 }
+    # native == large: INT32 id column roundtrips exactly
+    native: { tuples: 4000000, checksum: 1444868000 }

@@ -1,0 +1,118 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: prof_q2_wall_ccx_queues
+  # VALIDATION of the CCX-aware task-queue prototype (nebulastream commit "feat(query-engine):
+  # CCX-aware task queue sharding", branch benchmark-piparse-lazyparse-fast-csv): re-runs the
+  # prof_q2_wall_mechanism sweep (q2_filter_proj csv, pinned, W{5,11,23}) as an OFF/ON A/B of
+  # worker.query_engine.ccx_aware_task_queues.
+  # MECHANISM being fixed (prof_q2_wall_mechanism, 2026-07-09): task-scattering poisons the
+  # recycled source ring - any worker on any CCX scans any raw buffer, the pegged io thread then
+  # pays a cross-CCX RFO per line on recycle (LLC-miss/line 0.30->0.77, cyc/B +76% W5->W23,
+  # -43% throughput; wake churn refuted <1%). The sharded queue keeps a source's tasks on its
+  # own CCX (io=cpu0 emits to shard 0 = CCX0 workers cpu1-5), other CCXs steal only when idle.
+  # EXPECT (predict-first): OFF arm reproduces the decline (~11 / ~8.2 / ~6.7 GB/s at W5/11/23,
+  # modulo the bid csv file's page-roll class - dd-verify ~14.9 first). ON arm: W5 unchanged
+  # (single CCX anyway, ~= OFF W5 minus epsilon for the wrapper branch); W11/W23 RECOVER most
+  # of the loss (CCX0's 5 workers can absorb q2's index+parse at the wall, so steal traffic
+  # should be a thin tail; expected ~10-11 GB/s flat-in-W; residual loss = the ~1.4 busy-core
+  # equivalents of steal + the remote workers' wake-scan touching remote shard heads).
+  # STEAL VISIBILITY: worker_env NES_TASKQUEUE_STATS=1 -> per-shard enqueued/takenByOwner/stolen
+  # + rescanRounds/valveTrips printed to the worker's stderr at shutdown (PBENCH_KEEP_LOGS=1 to
+  # keep worker.log). Healthy signature: shard0 enqueued ~= all tasks, takenByOwner dominant,
+  # stolen small at W11/23 and ~0 at W5, valveTrips=0.
+  # GOTCHAS: dd-preflight bid_6GB.csv (page class re-rolls on eviction; rewrite to ~14.9 GB/s
+  # if ~9); stray-worker check; the ON arm requires pin_threads=true (unpinned degenerates to
+  # shard 0 = OFF behavior with extra empty scans).
+  #
+  # RESULTS (2026-07-09, two iterations; bid csv page-class 12.4-12.6 GB/s dd both runs, so the
+  # wall sits ~9.7-10 rather than the historical 11.2):
+  # ITERATION 1 - EAGER STEALING FAILS: first prototype stole the moment a woken worker found
+  #   its own shard empty. Stats: stolen fraction 0% (W5) / 32% (W11) / 52% (W23) -> the global
+  #   semaphore wakes an ARBITRARY parked worker, and with CCX0's 5 workers borderline-saturated
+  #   the remote workers win the race to shard 0 for a third to half of all tasks. Result: ON
+  #   arm ~= OFF arm (W5 9879 vs 9641, W11 7303 vs 7807, W23 6537 vs 6359) - sharding without
+  #   wake/steal discipline does NOT restore locality. (Shard binding itself verified: all
+  #   2,547,702 source tasks entered shard 0; valveTrips=0.)
+  # ITERATION 2 - STEAL DELAY (NES_CCX_STEAL_DELAY_US, default 100us): a woken worker whose own
+  #   shard is empty returns its permit and sleeps OFF the wake pool; it steals only if the
+  #   foreign backlog persists past the delay (per-call, so each remote worker's steal rate is
+  #   capped at ~1/delay). RESULTS:
+  #       W5: single 9718 | sharded 9965 (+2.5%)
+  #       W11: single 7799 | sharded 9804 (+26%)
+  #       W23: single 6540 | sharded 9712 (+48.5%)
+  #   sharded is FLAT-IN-W (-2.5% W5->W23) while single reproduces the -33% decline. Steal
+  #   fraction collapses to 0% / 1.3% / 2.4%; valveTrips=0; rescanRounds = the cheap narrow
+  #   8-round misses of dancing remote workers. PREDICTION CONFIRMED (after one design
+  #   iteration): the W-degradation was cross-CCX task-scattering, and CCX-sharded admission
+  #   + reluctant stealing removes it. Oversized worker sets are now ~free instead of -33%.
+  # LESSON (ground truth for the eventual upstream design): per-CCX queues alone are NOT the
+  #   fix - the wake path must be locality-aware too. With one global semaphore, steal
+  #   RELUCTANCE (delay + off-pool sleep) is the minimal sufficient discipline; per-CCX
+  #   semaphores with hierarchical wakeup would be the structural version.
+  # STRIPED-LAYOUT RE-RUN (2026-07-10, after the CCX-striped pinning layout landed; bid csv dd
+  #   class 10.9 this run -> wall ~8.7, lower than the 12.4-12.6 sessions above):
+  #     W5: single 8712 | ccx striped 6954 (-20%)   <- striping leaves only ~2 owner workers on
+  #     W11: single 7266 | ccx striped 8153 (+12%)     CCX0 at W5 while ALL single-source traffic
+  #     W23: single 6333 | ccx striped 8377 (+32%)     is shard 0 - the predicted low-W tradeoff
+  #   Striped still wins at W>=11 but less than compact (+48% at W23 was compact). RULE:
+  #   many-source/default = striped (fixes fan-in, see prof_file_scaling_ccx_probe); few-source
+  #   low-W tuned runs = NES_CCX_PIN_LAYOUT=compact.
+  description: "CCX-sharded task queue OFF/ON A/B on the q2 worker-degradation curve (W 5/11/23)"
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  completion_timeout_s: 300
+  worker:
+    query_engine:
+      number_of_worker_threads: 5
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser: { uint64: TracedUINT64, int32: FastINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  worker_env:
+    NES_TASKQUEUE_STATS: 1
+  generator:
+    repeat: 50
+
+_series: &ccx_series
+  label: "task queue"
+  explicit:
+    - name: single_queue
+      baseline: true
+      overrides: {}
+    - name: ccx_sharded
+      overrides:
+        worker.query_engine.ccx_aware_task_queues: true
+
+_axes_x: &w_sweep
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [5, 11, 23]
+
+variants:
+  - name: q2_csv_ccx_ab
+    query: nexmark/q2_filter_proj
+    axes: { x: *w_sweep, series: *ccx_series }
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: line_chart }

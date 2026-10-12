@@ -1,0 +1,9 @@
+# InvokeConfig for the NES query engine (read by --worker.query_engine.invoke_mode_configuration).
+# The worker parses `global_mode` / `global_fn_attr`; see nes-query-engine/interface/InvokeConfiguration.cpp.
+# Mirrors testing/configurations/invokeModeConfGlobalFnAttr.yaml — proxy-inlining attributes
+# (+35-50% in the formatter benchmarks). This is the fastest invoke mode.
+global_mode: fnattr  # "default", "fnattr", or "inline"
+global_fn_attr:      # only relevant when global_mode is fnattr
+  mod_ref_info: ref
+  will_return: true
+  no_unwind: true

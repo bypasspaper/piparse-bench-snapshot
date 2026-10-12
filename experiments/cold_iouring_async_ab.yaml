@@ -1,0 +1,108 @@
+experiment:
+  name: cold_iouring_async_ab
+  description: >
+    Cold-read A/B for the NEW async io_uring file source, under O_DIRECT (the config that
+    actually exercises deep QD). Mirrors cold_iouring_direct.yaml (File QD1 vs io_uring
+    O_DIRECT QD16) but swaps in a THIRD arm: the new IoUringFileAsync. The question: does
+    deep-QD io_uring inside the ASYNC (asio io_context) framework match the BLOCKING
+    io_uring source on a cold read?
+
+    Why O_DIRECT and not buffered: buffered io_uring QD16 gives NO cold win over QD1
+    (~2.14 -> ~2.24 GB/s, cold_iouring_ab) because buffered sequential reads are kernel-
+    READAHEAD-bound -- readahead already drives the one sequential stream at its cold rate
+    regardless of app queue depth. O_DIRECT bypasses the page cache AND readahead, so each
+    of the QD16 reads is an independent device request -> true device QD16 (§2: QD>=16 =
+    6.7 GB/s, ~= NVMe cap 6.9). This is the ONLY config under which the async-vs-blocking
+    parity question is meaningful (buffered would bunch all three arms at ~2 GB/s). Note:
+    cold_read still evicts bid_6GB before each run -- O_DIRECT ignores the cache anyway, the
+    eviction just keeps the File (buffered QD1) baseline honest.
+
+    Three source arms over identical bid_6GB passthrough (W=4 / IO=1, pool 4096 = 512 MB,
+    pin off, cold single 6.44 GB pass):
+    - File_QD1               = async FileSource. QD1, buffered, disk-latency-bound ~2.1 GB/s.
+    - IoUringFile_O_DIRECT    = the BLOCKING deep-QD source (own thread, prefill hook,
+      io_uring_wait_cqe), O_DIRECT QD16. The established cold win; the TARGET to match.
+    - IoUringFileAsync_O_DIRECT = the NEW source. Same deep-QD O_DIRECT ring + in-order
+      emission, but on the shared asio io_context, suspending on an eventfd registered with
+      the ring (co_await) instead of io_uring_wait_cqe, so it does not block sibling sources.
+
+    PREDICTION: File_QD1 ~2.1. IoUringFile_O_DIRECT -> ~5-6 (toward the single-thread
+    O_DIRECT ceiling). IoUringFileAsync_O_DIRECT should land WITHIN ~5-10% of the blocking
+    arm -- identical ring mechanics; the only async overhead is the eventfd round-trip per
+    wait, amortized because we only wait when the CQ momentarily drains (peek_batch hits the
+    fast path under deep QD). If the async arm collapses toward File (~2), the eventfd bridge
+    is serializing (waking per-CQE not per-burst) or QD isn't reaching the device --
+    investigate waitForCompletion() firing frequency and io-wq/submission batching.
+
+    CORRECTNESS: validated separately via systests (single + 200-row multi-buffer; in-order
+    emission via takePreFilledBuffer() so the CSV formatter stitches partial tuples across
+    buffers). Throughput only here.
+
+    GOTCHAS:
+    - source_type values: File / IoUringFile / IoUringFileAsync. The async ones are new
+      plugins (add_plugin IoUringFileAsync / IoUringTCP); worker rebuilt on this branch.
+    - O_DIRECT via worker_env NES_IOURING_DIRECT=1, depth via NES_IOURING_QD=16. The async
+      source honours the SAME env knobs as the blocking one. O_DIRECT needs 512-byte
+      (device block) alignment of offset/length/buffer; the source rounds the partial tail
+      up and asserts the pool buffer is aligned (128 KiB stride from a page-aligned slab ->
+      aligned in practice). If the alignment INVARIANT trips, the worker dies and the run
+      fast-fails -> switch the source to a private 512-aligned pool.
+    - cold_read evicts bid_6GB before each run. NO generator process for file sources.
+    - Sandbox OFF (spawns worker, binds :8080); verify :8080 free first.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: true
+  completion_timeout_s: 120
+  worker:
+    query_engine:
+      number_of_worker_threads: 4
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 4096
+  query_config:
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64}
+    output_formatter: {type: CSV}
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: cold_iouring_async_ab
+    description: "COLD bid_6GB passthrough: async File QD1 vs blocking IoUringFile O_DIRECT QD16 vs async IoUringFileAsync O_DIRECT QD16"
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "source"
+        explicit:
+          - name: "File_QD1"
+            baseline: true
+            overrides: {query_config.source_type: File}
+          - name: "IoUringFile_O_DIRECT"
+            overrides:
+              query_config.source_type: IoUringFile
+              worker_env.NES_IOURING_DIRECT: 1
+              worker_env.NES_IOURING_QD: 16
+          - name: "IoUringFileAsync_O_DIRECT"
+            overrides:
+              query_config.source_type: IoUringFileAsync
+              worker_env.NES_IOURING_DIRECT: 1
+              worker_env.NES_IOURING_QD: 16
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

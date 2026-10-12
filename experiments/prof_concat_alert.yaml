@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: prof_concat_alert
+  description: >
+    PROFILING harness for the concat_alert query (session 2026-07-22). Purpose: attach perf to the
+    single-node FUSED pipeline and see WHERE time goes (read/ifstream copy vs SIMDCSV index vs numeric
+    parse vs CONCAT rope vs JSON serialize), to decide whether the raw-forwarding CAST idea has headroom.
+    NOT a throughput datapoint.
+
+    Matches the concat_alert_nautilus_ab.yaml benchmark config (single-node, BlockingFile+SequentialCSV,
+    JSON out, FastINT32/Eisel/ZMIJ, fnattr+inline+trace_constant_bytes, W1, 128KiB buffers) so the profile
+    reflects the benchmarked rope pipeline. WARM (cold_read false) + generator.repeat=80 so bid_strings_3GB
+    (3.6GB, ~1.9s/pass at ~1856 MB/s) replays ~80x for a ~150s steady window; attach perf ~10-12s mid-run.
+
+    GOTCHAS: worker comm is `main` (not nes-single-node-worker); find it by its gRPC listen port with
+    `ss -ltnHp`. Kill by saved PID + `pkill -9 -x main`. Port 9099 (pass --worker-port). governor perf.
+    RUN: cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+      experiments/prof_concat_alert.yaml --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099 &
+    then: NES_PROFILE_OUTDIR=<scratch> <repo>/.claude/skills/nes-profile/nes-profile.sh --port <worker-listen-port> --secs 12 --stat
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: false
+  completion_timeout_s: 400
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: true
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+  query_config:
+    source_type: BlockingFile
+    sink_type: Monitoring
+    input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+    output_formatter: { type: JSON }
+    input_parser: { uint64: TracedUINT64, int64: TracedINT64, int32: FastINT32, int16: TracedINT16, uint32: TracedUINT32, uint16: TracedUINT16, bool: TracedBOOL, f64: EiselFloatF64, f32: EiselFloatF32 }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 80
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: prof_concat_alert
+    description: "WARM bid_strings_3GB x80, single-node fused CONCAT->JSON -- perf target"
+    query: nexmark/concat_alert
+    axes:
+      x:
+        label: "config"
+        explicit:
+          - name: "concat_alert"
+            baseline: true
+            overrides: {}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

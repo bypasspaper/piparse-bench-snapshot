@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: Apache-2.0
+query:
+  name: multicol_projK_k10
+  description: >
+    ACCESS-sweep on the fixed 10-FLOAT64-col dataset (nf10.csv): project+parse the first 10 of 10
+    fields (cI*FLOAT64(1) forces parse+serialize). All 10 delimiters INDEXED. COMPILED parses only
+    the 10 accessed (projection pushdown); UNCOMPILED parses all 10 regardless. csv->json.
+  sql: "SELECT c0 * FLOAT64(1) AS c0, c1 * FLOAT64(1) AS c1, c2 * FLOAT64(1) AS c2, c3 * FLOAT64(1) AS c3, c4 * FLOAT64(1) AS c4, c5 * FLOAT64(1) AS c5, c6 * FLOAT64(1) AS c6, c7 * FLOAT64(1) AS c7, c8 * FLOAT64(1) AS c8, c9 * FLOAT64(1) AS c9 FROM t"
+  sources:
+    - name: t
+      schema:
+        - { name: c0, type: FLOAT64, not_null: true }
+        - { name: c1, type: FLOAT64, not_null: true }
+        - { name: c2, type: FLOAT64, not_null: true }
+        - { name: c3, type: FLOAT64, not_null: true }
+        - { name: c4, type: FLOAT64, not_null: true }
+        - { name: c5, type: FLOAT64, not_null: true }
+        - { name: c6, type: FLOAT64, not_null: true }
+        - { name: c7, type: FLOAT64, not_null: true }
+        - { name: c8, type: FLOAT64, not_null: true }
+        - { name: c9, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/multicol/nf10.csv
+          size_bytes: 200000013
+          rows: 1836532
+  sink_schema:
+    - { name: c0, type: FLOAT64, not_null: true }
+    - { name: c1, type: FLOAT64, not_null: true }
+    - { name: c2, type: FLOAT64, not_null: true }
+    - { name: c3, type: FLOAT64, not_null: true }
+    - { name: c4, type: FLOAT64, not_null: true }
+    - { name: c5, type: FLOAT64, not_null: true }
+    - { name: c6, type: FLOAT64, not_null: true }
+    - { name: c7, type: FLOAT64, not_null: true }
+    - { name: c8, type: FLOAT64, not_null: true }
+    - { name: c9, type: FLOAT64, not_null: true }

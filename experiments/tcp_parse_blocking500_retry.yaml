@@ -1,0 +1,87 @@
+experiment:
+  name: tcp_parse_blocking500_retry
+  description: >
+    RETRY of the blocking arm at N=500 from tcp_parse_scaling_ext (READ ITS RESULTS
+    FIRST): the first attempt DNF'd because BlockingTCPSource's SO_RCVTIMEO ==
+    connect_timeout_seconds (default 10 s) also gates the FIRST byte -- 226/500 sources
+    released together died at start with EAGAIN before their first bytes arrived from
+    the collapsed consumer. THIS RUN raises connect_timeout_seconds to 600 via the new
+    query_config.source_config renderer passthrough (added 2026-07-07), so sources
+    survive the start storm and we measure the POST-START collapse economics.
+
+    Same method as tcp_parse_scaling: engine cores 0-13 (w14, io4), generator 10 threads
+    on 14-23, one shared async generator, -n 500, -m 6, ONE rep,
+    --generator-bin .../async-tcp-generator.
+
+    PREDICTIONS:
+      - With the timeout out of the way, ~all 500 queries should finalize (n_ok ~= 500;
+        mid-stream drops would be a NEW finding). Aggregate ~1-1.7 GB/s (the 250-conn
+        collapse at 1.73 deepening; passthrough blocking flattened ~2.9 at 300-500, but
+        parse-hungry threads have no such floor). p50 150-400 ms, p99 0.5-1.5 s.
+      - Wall time: 3 TB at ~1.2-1.7 GB/s ~= 30-45 min + 500-pipeline JIT + start storm
+        (now surviving, up to several minutes of first-byte waits) -> timeout 5400.
+      - SECONDARY CHECK: EAGAIN errors in worker.log should be ~gone; if sources still
+        die (mid-stream this time), blocking TCP at this scale drops connections under
+        backpressure itself -- report n_ok.
+
+    RESULTS (2026-07-07, 1 rep): 1130 MB/s, p50 159 / p99 385 / p999 522 ms,
+      n_ok = 500/500, ZERO EAGAIN lines (was 226 dead sources at default timeout) --
+      the fix works and there are NO mid-stream drops: blocking TCP + interpreted parse
+      at 500 conns is a stable-but-deeply-collapsed equilibrium (~2.3 MB/s per conn,
+      backpressure pacing the generator), NOT a connection-dropping death spiral.
+      Mid-run loopback sample ~1.09 GB/s matched the final wall-span 1.13. Collapse
+      curve: 3770 (peak, N=10-50) -> 2839 (100) -> 1733 (250) -> 1130 (500) = -70% from
+      peak; async holds 7.8-7.9 flat -> GAP 6.9x at 500. Use THIS point (not the ext
+      DNF) for the blocking-500 value in figures.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  completion_timeout_s: 5400
+  worker_cpus: "0-13"
+  num_queries: 500
+  worker:
+    query_engine:
+      number_of_worker_threads: 14
+      number_of_io_threads: 4
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+  query_config:
+    source_type: BlockingTCP
+    sink_type: Monitoring
+    input_formatter: { type: SequentialUncompiledCSV, threading_mode: sequential }
+    output_formatter: { type: CSVUncompiled }
+    source_config:
+      connect_timeout_seconds: 600
+  generator:
+    kind: async
+    cpus: "14-23"
+    threads: 10
+    chunk_size_kb: 128
+    repeat: 6
+    rate: 1000000
+
+variants:
+  - name: blocking500_retry
+    description: "q1 over TCP, blocking uncompiled seq, N=500, connect_timeout_seconds=600"
+    query: nexmark/q1_price
+    axes:
+      x:
+        label: "Concurrent Queries"
+        parameter: num_queries
+        values: [500]
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: bar_chart }

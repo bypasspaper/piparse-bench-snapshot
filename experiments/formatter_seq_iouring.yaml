@@ -1,0 +1,99 @@
+experiment:
+  name: formatter_seq_iouring
+  description: >
+    STEP 2, worker-cli edition (single nes-single-node-worker process -> clean to profile, unlike
+    bench-runner which spawns a child worker). Tests whether the io_uring BLOCKING file source
+    (IoUringFile, O_DIRECT + registered fixed buffers = zero-copy DMA into the pinned pool) lifts the
+    SEQUENTIAL formatter's single-thread throughput, by removing the page-cache COPY from the source
+    thread's cycles. In the fused sequential model the ONE source thread does read+parse serially; with
+    a plain BlockingFile it pays the read() copy inline (steals cycles from parse). io_uring REGBUF DMA's
+    the bytes in with no CPU copy -> the thread can spend (nearly) all cycles on index+parse.
+
+    WORKLOAD: SELECT * on bid_1GB, all 4 fields parsed as INT (TracedINT), NATIVE output (forces the
+    parse -- CSV->NATIVE defeats passthrough elision), MonitoringSink (throughput meter; small metering
+    cost, equal across arms). W=1, IO=1.
+
+    ARMS: async File+SIMDCSV (parallel, io read + worker parse on 2 cores); blocking BlockingFile+
+    SequentialCSV (read+parse fused on 1 thread, pays read copy); iouring IoUringFile+SequentialCSV
+    (read+parse fused, read is zero-copy DMA). io_uring env only affects the iouring arm.
+
+    PRIOR (bench-runner Void, --repeat 1, thin window): async 1139, blocking 497 MB/s (2.3x). async is
+    worker-bound (WorkerThread-0 ~0.98 core saturated) + io ~0.6 => pipelines read||parse across ~1.6
+    cores; the 2.3x is pipeline parallelism, not cache locality. Question here: does zero-copy io_uring
+    close the gap for the single sequential thread by giving parse the whole core?
+
+    EXPECTED: iouring_seq > blocking_seq (497) -- how much depends on how big the read-copy share is.
+    If iouring_seq approaches async's per-core parse rate (~1160 MB/s/core), the read copy was the tax
+    and a single fused thread IS competitive per core (the async lead was purely the 2nd thread).
+
+    GOTCHAS:
+    - Sequential formatter REQUIRES a blocking source (BlockingFile / IoUringFile). NATIVE forces parse.
+    - IoUringFile uses the PREFILL hook -> reads happen; O_DIRECT re-reads from device each pass (cold,
+      but zero-copy fast, NVMe ~6.9 GB/s >> parse rate so not the bottleneck). REGBUF needs a slab-backed
+      pool + alignment; falls back to non-fixed reads with a warning if unmet (check worker.log).
+    - `pkill -x main` pre-flight. bid_1GB = 4-int data (do NOT use bid_653M).
+    - worker-cli MonitoringSink measures throughput; single 'main' process -> profile with /proc per-thread.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  completion_timeout_s: 120
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 4096
+  query_config:
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser:
+      uint64: TracedUINT64
+      int32: TracedINT32
+      int64: TracedINT64
+    output_formatter: {type: NATIVE}
+  generator:
+    repeat: 1
+
+variants:
+  - name: formatter_seq_iouring
+    description: "SELECT * (4 int) -> NATIVE -> Monitoring, W=1: async vs BlockingFile-seq vs IoUringFile-seq"
+    query: nexmark/bid_star_int
+    axes:
+      x:
+        label: "source execution model"
+        explicit:
+          - name: "async_File_SIMDCSV"
+            baseline: true
+            overrides:
+              query_config.source_type: File
+              query_config.input_formatter.type: SIMDCSV
+          - name: "blocking_BlockingFile_SequentialCSV"
+            overrides:
+              query_config.source_type: BlockingFile
+              query_config.input_formatter.type: SequentialCSV
+              query_config.input_formatter.threading_mode: sequential
+          - name: "blocking_IoUringFile_SequentialCSV"
+            overrides:
+              query_config.source_type: IoUringFile
+              query_config.input_formatter.type: SequentialCSV
+              query_config.input_formatter.threading_mode: sequential
+              worker.global_buffer_alignment: 512   # REQUIRED for REGBUF: O_DIRECT payloads must be 512-aligned, else it falls back to non-fixed reads (no zero-copy)
+              worker_env.NES_IOURING_DIRECT: 1
+              worker_env.NES_IOURING_REGBUF: 1
+              worker_env.NES_IOURING_QD: 16
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

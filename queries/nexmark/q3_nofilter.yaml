@@ -1,0 +1,57 @@
+query:
+  name: nexmark_q3_nofilter
+  description: "q3 (auction JOIN person) with the WHERE filters REMOVED — isolates whether q3's huge buffer appetite is filter-driven (watermark/slice accumulation). Same join/window/varsized×3 output as q3."
+
+  sql: |
+    SELECT name, city, state, id
+    FROM (SELECT id, seller, timestamp FROM auction)
+    INNER JOIN
+    (SELECT personId, name, city, state, timestamp FROM person)
+    ON seller = personId WINDOW TUMBLING (timestamp, size 10 sec)
+
+  sources:
+    - name: auction
+      schema:
+        - {name: timestamp, type: UINT64, not_null: true}
+        - {name: id, type: INT32, not_null: true}
+        - {name: initialbid, type: INT32, not_null: true}
+        - {name: reserve, type: INT32, not_null: true}
+        - {name: expires, type: UINT64, not_null: true}
+        - {name: seller, type: INT32, not_null: true}
+        - {name: category, type: INT32, not_null: true}
+      data:
+        large:
+          file: large/nexmark/auction_707MB.csv
+          size_bytes: 729852154
+          rows: 12000000
+        small:
+          file: large/nexmark/auction_modified_74M.csv
+          size_bytes: 75841947
+    - name: person
+      schema:
+        - { name: personId, type: INT32, not_null: true }
+        - { name: name, type: VARSIZED, not_null: true }
+        - { name: email_address, type: VARSIZED, not_null: true }
+        - { name: credit_card, type: VARSIZED, not_null: true }
+        - { name: city, type: VARSIZED, not_null: true }
+        - { name: state, type: VARSIZED, not_null: true }
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: extra, type: VARSIZED, not_null: true }
+      data:
+        large:
+          file: large/nexmark/person_840MB.csv
+          size_bytes: 876941057
+          rows: 4000000
+        small:
+          file: "nan"
+          size_bytes: 0
+
+  sink_schema:
+    - { name: person.name, type: VARSIZED, not_null: true }
+    - { name: person.city, type: VARSIZED, not_null: true }
+    - { name: person.state, type: VARSIZED, not_null: true }
+    - { name: auction.id, type: INT32, not_null: true }
+
+  validation:
+    large: { tuples: 0, checksum: 0 }
+    small: { tuples: 0, checksum: 0 }

@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: json_csv_agg_perf
+  description: >
+    Aggregation arm of the json-vs-csv query spectrum: event-time windowed COUNT(auctionId) TUMBLING(
+    timestamp, 10 SEC) over bid_strings. 4-arm matrix (csv->csv, csv->json, sjson->csv, sjson->json),
+    Mrows/s (fair cross-input). State-bound, tiny output (342 windows) => input/parse-bound. Verified
+    viable + value-identical across arms (checksum 342,580177). r6 fullopt, W1, FUSED, 128KiB, n=5 median.
+    RUN: cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+      experiments/json_csv_agg_perf.yaml --build-dir ~/work/nebulastream-public/cmake-build-release \
+      --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 5
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: true
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: BlockingFile
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    output_formatter: { type: JSON }
+    input_parser: { uint64: TracedUINT64, int64: TracedINT64, int32: FastINT32, int16: TracedINT16, uint32: TracedUINT32, uint16: TracedUINT16, bool: TracedBOOL, f64: EiselFloatF64, f32: EiselFloatF32 }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (compare csv-vs-json on Mrows/s)" }
+
+variants:
+  - name: agg_count
+    description: "event-time windowed COUNT(auctionId) TUMBLING(timestamp,10s)"
+    query: nexmark/bid_json_agg
+    axes:
+      x: *noop_x
+      series:
+        label: "arm"
+        explicit:
+          - name: csv_c2c
+            baseline: true
+            overrides: { data_size: csv, query_config.input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }, query_config.output_formatter: { type: CSV } }
+          - name: csv_c2j
+            overrides: { data_size: csv, query_config.input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }, query_config.output_formatter: { type: JSON } }
+          - name: sjson_j2c
+            overrides: { data_size: large, query_config.input_formatter: { type: SchemaJSON }, query_config.output_formatter: { type: CSV } }
+          - name: sjson_j2j
+            overrides: { data_size: large, query_config.input_formatter: { type: SchemaJSON }, query_config.output_formatter: { type: JSON } }
+    y: *tput_y
+    visualization: { type: grouped_bar }

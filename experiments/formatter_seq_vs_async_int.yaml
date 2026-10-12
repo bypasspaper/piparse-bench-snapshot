@@ -1,0 +1,92 @@
+experiment:
+  name: formatter_seq_vs_async_int
+  description: >
+    STEP 2 harness: formatter-bound async-vs-(blocking+sequential) comparison, to expose the sequential
+    CSV formatter's cache-locality / branchless-index advantage that q1 masked. q1 was compute-bound
+    (Eisel float parse + x908/1000 + ZMIJ float serialize + sink) -> both arms converged at ~719 MB/s
+    because the input formatter is a small slice of q1's per-tuple cost. Here we make the FORMATTER the
+    bottleneck: SELECT * on bid_1GB with all four fields parsed as INTEGERS, NATIVE output format, Void
+    sink. NATIVE output (!= CSV input) defeats the lazy passthrough elision so the parse actually runs;
+    Void sink + NATIVE (cheap binary) strip serialization + sink cost. So throughput ~= input formatter
+    (branchless SIMD index + int parse), single-thread.
+
+    ARMS (W=1, single-thread each): async = File + SIMDCSV (parallel; io thread reads, worker parses
+    cross-core); blocking = BlockingFile + SequentialCSV + threading_mode=sequential (index+parse INLINE
+    on the source thread, cache-hot). This is the paper axis: does inline cache-hot sequential parsing
+    beat the async cross-core handoff when the formatter is the bottleneck?
+
+    MODE: bench-runner (nes-bench-runner consumes the same .test format as systest, supports File /
+    BlockingFile, runs N internal iterations and reports throughput from BenchRunnerResults.json). This
+    is the Void-sink measurement path (worker-cli/MonitoringSink can't measure a Void sink). Sink is
+    rendered as a NAMED Void sink (bench-runner's binder rejects inline `INTO Void`).
+
+    BASELINE CONTEXT (q1, same bid_1GB, W=1, worker-cli): async 719.7, blocking+seq(rewritten) 719.3
+    MB/s -- a wash because q1 wasn't formatter-bound. Microbench (index only, 1 core AVX2): scalar
+    quote-aware 1.29, SIMDCSV structured 1.99, flat-band 5.64 GB/s.
+
+    EXPECTED (predict-first): higher than q1's 0.72 GB/s (no float parse/serialize). Hypotheses:
+    (H1) blocking+seq > async -- inline cache-hot parse (read+parse same thread, no cross-core buffer
+    handoff) wins once the formatter dominates; (H2) ~wash again if the int parse (TracedINT) still
+    dominates over the index/handoff difference. The delta async-vs-seq here = the cache-locality signal.
+
+    GOTCHAS:
+    - Sequential formatter REQUIRES a blocking source (BlockingFile). Void sink REQUIRES bench-runner.
+    - NATIVE output is what forces the parse (CSV->NATIVE breaks passthrough elision). Without it,
+      SELECT * CSV->CSV to Void would byte-copy (elided) and measure nothing.
+    - `pkill -x main` pre-flight; verify no stray worker. bid_1GB warm in page cache (fits).
+    - price is INT64 here (bid_1GB is 4-int data); do NOT use bid_653M (5-field variant).
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: bench-runner
+  build: native
+  data_size: medium
+  topology: single-node
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 4096
+  query_config:
+    sink_type: Void
+    input_formatter: {type: SIMDCSV}
+    input_parser:
+      uint64: TracedUINT64
+      int32: TracedINT32
+      int64: TracedINT64
+    # NOTE: no output_formatter. SELECT * already materializes+parses all 4 int fields in the compiled
+    # pipeline (confirmed: plain Void 405 MB/s == Void+NATIVE 409, and both << the ~5-7 GB/s elided
+    # passthrough -> genuinely parse-bound). Adding output_formatter forces a non-empty sink_config which
+    # the renderer emits as inline `INTO Void(...)`, and nes-bench-runner rejects inline Void (only NAMED
+    # Void sinks bind). Plain Void => named-sink render => binds, and stays formatter/int-parse-bound.
+
+variants:
+  - name: formatter_seq_vs_async_int
+    description: "SELECT * (4 int fields) -> NATIVE -> Void, single-thread: async File+SIMDCSV vs blocking BlockingFile+SequentialCSV"
+    query: nexmark/bid_star_int
+    axes:
+      x:
+        label: "source execution model"
+        explicit:
+          - name: "async_File_SIMDCSV"
+            baseline: true
+            overrides:
+              query_config.source_type: File
+              query_config.input_formatter.type: SIMDCSV
+          - name: "blocking_SequentialCSV"
+            overrides:
+              query_config.source_type: BlockingFile
+              query_config.input_formatter.type: SequentialCSV
+              query_config.input_formatter.threading_mode: sequential
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

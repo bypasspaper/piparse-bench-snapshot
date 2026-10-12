@@ -1,0 +1,251 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: nes_vs_flink_native_cells
+  description: >
+    NES vs FLINK, the remaining 3 matrix cells on the STATELESS all_queries variants
+    (2026-07-14; csv->json lives in nes_vs_flink_csv_json): csv->native, native->json,
+    native->native. HEADLINE METRIC = throughput_mrows_s (input BYTES differ per cell:
+    csv vs .nes footprints; rows are format-invariant).
+    ARMS (per variant, 6 series):
+    - NES csv->native: fast csv stack -> sink output_format NATIVE + Monitoring NoneFormat
+      (zero output serialization = NES's blackhole; the uncompiled-formatter machinery).
+      NOTE: forces a FULL PARSE (no lazy passthrough elision - output is binary, not text).
+    - NES native->json / native->native: data_size native (.nes packed-LE), SystemNative
+      input formatter (string_length REQUIRED, slot widths must match csv_to_binary layout),
+      input_parser cleared; JSON output formatter or NATIVE.
+    - Flink csv->native: csv source -> plain blackhole (the original parse-only arm).
+    - Flink native->json / native->native: SEQUENTIAL nes-native reader (fair single-stream
+      arm per the 2026-07-14 ruling - NOT the split connector) -> json_blackhole | blackhole.
+      Layout derived from catalog schema + input_formatter.string_length (flink ignores the
+      formatter type). VERIFIED pre-run: person 368 B/row and q22 110 B/row layouts read
+      exactly (4M / 31.3M rows, NUL padding respected, url max 72).
+    PROTOCOL: as nes_vs_flink_csv_json (W16 fast stack, NES repeat 24 / q22 repeat 4 for
+    steady windows - SAFE, stateless; Flink repeat pinned 1; warm reads; reps 3).
+    GOTCHAS: .nes files are build-dir-local (regenerate after wipe via csv_to_binary.py);
+    q10's datetime cost dominates BOTH engines in every cell (CASTFROMUNIXTS invoke wall /
+    java DATE_FORMAT); NES q2_original native needs the constantEq int fold (4fc52e0757, on
+    branch). LAUNCH WITH `pbench run --detach`.
+    EXPECTED (2026-07-14/15 first full run, 198/198 clean, Mrows/s 3-rep medians,
+    GEOMEAN NES/Flink per cell): csv->native 41.1x (8.3-77x), native->json 27.1x (6.8-97x),
+    native->native 8.0x (3.0-15x); csv->json (companion yaml) 53.8x. LAWS:
+    - Removing text parsing from Flink's single stream collapses the gap: native->native =
+      NES 367-400 Mrows/s (bid; 8.8-9.6 GB/s) vs Flink's ~50 Mrows/s reader floor.
+      CORRECTED LAW (W-sweep 2026-07-15): NES native->native is SOURCE-BOUND - flat in
+      workers (W1 337.7 / W2 339.6 / W4 338.6 / W16 365.6 Mrows/s; one worker keeps up,
+      the rest starve on passthrough rows - user call). So the ~8x residual is NOT
+      parallelism: it is NES's single source-thread pipeline (~8.1 GB/s, ~75% of the
+      11.3 GB/s dd ceiling) vs Flink's single-thread reader (1.2 GB/s) - NES per-stream
+      native ingest is ~6.7x FASTER per thread, not slower.
+    - Flink selective filters on native input hit ~1 GB/s / 41-43 Mrows/s (no parse, no json).
+    - NES PERSON ANOMALY: native arms (20-21 Mrows/s) SLOWER than csv arms (30-41) - the
+      NUL-padded 368 B/row native footprint is 1.68x the csv bytes and SystemNative varsized
+      materialization eats the parse win (the known 'native wins only byte density' law).
+    - NES native->native bid class = 367-400 Mrows/s = the engine ceiling without codecs;
+      native->json 194 (bid_star, key-volume bound) vs 397 for selective filters.
+    - q10 datetime-walled in EVERY cell on BOTH engines (NES 21-23, Flink 1.2-3.2 Mrows/s).
+  primary_metric: throughput_mrows_s
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser:
+      uint64: TracedUINT64
+      int64: TracedINT64
+      int32: FastINT32
+      int16: TracedINT16
+      uint32: TracedUINT32
+      uint16: TracedUINT16
+      f64: EiselFloatF64
+      f32: EiselFloatF32
+      bool: TracedBOOL
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+
+# ── 6-arm series anchors, one per string_length group ─────────────────────────
+# (SystemNative needs string_length even for no-varsized schemas; the flink native arms
+#  reuse the same override - the renderer reads only string_length for the .nes layout.)
+
+_series_bid: &bid_series          # bid-schema variants (dummy string_length), NES repeat 24
+  label: "arm"
+  explicit:
+    - name: nes_csv_native
+      baseline: true
+      overrides:
+        generator.repeat: 24
+        query_config.output_formatter: { type: NATIVE }
+    - name: nes_native_json
+      overrides:
+        generator.repeat: 24
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "16" }
+        query_config.input_parser: {}
+        query_config.output_formatter: { type: JSON }
+    - name: nes_native_native
+      overrides:
+        generator.repeat: 24
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "16" }
+        query_config.input_parser: {}
+        query_config.output_formatter: { type: NATIVE }
+    - name: flink_csv_native
+      system: flink
+      overrides: { mode: flink, flink_execution_mode: streaming, flink_output_format: none }
+    - name: flink_native_json
+      system: flink
+      overrides:
+        mode: flink
+        flink_execution_mode: streaming
+        flink_output_format: json_blackhole
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "16" }
+    - name: flink_native_native
+      system: flink
+      overrides:
+        mode: flink
+        flink_execution_mode: streaming
+        flink_output_format: none
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "16" }
+
+_series_person: &person_series    # person schema: 6 VARSIZED slots
+  label: "arm"
+  explicit:
+    - name: nes_csv_native
+      baseline: true
+      overrides:
+        generator.repeat: 24
+        query_config.output_formatter: { type: NATIVE }
+    - name: nes_native_json
+      overrides:
+        generator.repeat: 24
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "16,32,32,16,4,256" }
+        query_config.input_parser: {}
+        query_config.output_formatter: { type: JSON }
+    - name: nes_native_native
+      overrides:
+        generator.repeat: 24
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "16,32,32,16,4,256" }
+        query_config.input_parser: {}
+        query_config.output_formatter: { type: NATIVE }
+    - name: flink_csv_native
+      system: flink
+      overrides: { mode: flink, flink_execution_mode: streaming, flink_output_format: none }
+    - name: flink_native_json
+      system: flink
+      overrides:
+        mode: flink
+        flink_execution_mode: streaming
+        flink_output_format: json_blackhole
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "16,32,32,16,4,256" }
+    - name: flink_native_native
+      system: flink
+      overrides:
+        mode: flink
+        flink_execution_mode: streaming
+        flink_output_format: none
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "16,32,32,16,4,256" }
+
+_series_q22: &q22_series          # string-bearing bid: channel/url slots, NES repeat 4
+  label: "arm"
+  explicit:
+    - name: nes_csv_native
+      baseline: true
+      overrides:
+        generator.repeat: 4
+        query_config.output_formatter: { type: NATIVE }
+    - name: nes_native_json
+      overrides:
+        generator.repeat: 4
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "13,73" }
+        query_config.input_parser: {}
+        query_config.output_formatter: { type: JSON }
+    - name: nes_native_native
+      overrides:
+        generator.repeat: 4
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "13,73" }
+        query_config.input_parser: {}
+        query_config.output_formatter: { type: NATIVE }
+    - name: flink_csv_native
+      system: flink
+      overrides: { mode: flink, flink_execution_mode: streaming, flink_output_format: none }
+    - name: flink_native_json
+      system: flink
+      overrides:
+        mode: flink
+        flink_execution_mode: streaming
+        flink_output_format: json_blackhole
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "13,73" }
+    - name: flink_native_native
+      system: flink
+      overrides:
+        mode: flink
+        flink_execution_mode: streaming
+        flink_output_format: none
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "13,73" }
+
+_axes_x: &w16_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [16]
+
+_y: &rows_y { metric: throughput_mrows_s, label: "Throughput (Mrows/s)" }
+
+variants:
+  - { name: person_projection, query: nexmark/person_projection, description: "SELECT id FROM person",
+      axes: { x: *w16_x, series: *person_series }, y: *rows_y, visualization: { type: grouped_bar } }
+  - { name: person_star, query: nexmark/person_star, description: "SELECT * FROM person",
+      axes: { x: *w16_x, series: *person_series }, y: *rows_y, visualization: { type: grouped_bar } }
+  - { name: bid_ts_projection, query: nexmark/bid_ts_projection, description: "SELECT timestamp FROM bid",
+      axes: { x: *w16_x, series: *bid_series }, y: *rows_y, visualization: { type: grouped_bar } }
+  - { name: bid_filter_eq, query: nexmark/bid_filter_eq, description: "point filter, 758 rows out",
+      axes: { x: *w16_x, series: *bid_series }, y: *rows_y, visualization: { type: grouped_bar } }
+  - { name: bid_star, query: nexmark/bid_star, description: "Q0 SELECT * FROM bid",
+      axes: { x: *w16_x, series: *bid_series }, y: *rows_y, visualization: { type: grouped_bar } }
+  - { name: q1_price, query: nexmark/q1_price, description: "Q1 float math",
+      axes: { x: *w16_x, series: *bid_series }, y: *rows_y, visualization: { type: grouped_bar } }
+  - { name: q2_filter_proj, query: nexmark/q2_filter_proj, description: "Q2 repo shape, %123",
+      axes: { x: *w16_x, series: *bid_series }, y: *rows_y, visualization: { type: grouped_bar } }
+  - { name: q2_original, query: nexmark/q2_original, description: "Q2 paper shape, 5-way OR",
+      axes: { x: *w16_x, series: *bid_series }, y: *rows_y, visualization: { type: grouped_bar } }
+  - { name: q14_calc, query: nexmark/q14_calc, description: "computed-float range filter",
+      axes: { x: *w16_x, series: *bid_series }, y: *rows_y, visualization: { type: grouped_bar } }
+  - { name: q10_datetime, query: nexmark/q10_datetime, description: "ms-epoch -> ISO-8601 (both engines UTC)",
+      axes: { x: *w16_x, series: *bid_series }, y: *rows_y, visualization: { type: grouped_bar } }
+  - { name: q22_concat, query: nexmark/q22_concat, description: "CONCAT over string-bearing bid",
+      axes: { x: *w16_x, series: *q22_series }, y: *rows_y, visualization: { type: grouped_bar } }

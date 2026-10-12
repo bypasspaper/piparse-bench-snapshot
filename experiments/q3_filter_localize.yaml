@@ -1,0 +1,72 @@
+experiment:
+  name: q3_filter_localize
+  description: >
+    Localize which of q3's two filters stalls watermark/slice eviction: auction
+    (category==10) vs person (state in or/id/ca). Run each single-filter variant at
+    count=1M (4 KiB) where the no-filter q3 PASSES (≤250K) and the both-filters q3
+    FAILS. Whichever single filter FAILS is the one whose filtered stream lags the
+    watermark. File, single pass, W=4, slice_cache on. Companion HANDOVER §21d.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+
+  worker:
+    query_engine:
+      number_of_worker_threads: 4
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+    default_query_execution:
+      operator_buffer_size: 4096
+      execution_mode: COMPILER
+      slice_cache:
+        enable_slice_cache: true
+
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter:
+      type: SIMDCSV
+    input_parser:
+      uint64: TracedUINT64
+      int32: TracedINT32
+      int64: TracedINT64
+      f64: EiselFloatF64
+    output_formatter:
+      type: CSV
+
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: q3_auctfilter_only
+    description: "only auction WHERE category==10"
+    query: nexmark/q3_auctfilter
+    axes:
+      x:
+        label: "buffer count (x 4 KiB)"
+        parameter: worker.number_of_buffers_in_global_buffer_manager
+        values: [1000000]
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: line_chart}
+
+  - name: q3_personfilter_only
+    description: "only person WHERE state in (or,id,ca)"
+    query: nexmark/q3_personfilter
+    axes:
+      x:
+        label: "buffer count (x 4 KiB)"
+        parameter: worker.number_of_buffers_in_global_buffer_manager
+        values: [1000000]
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: line_chart}

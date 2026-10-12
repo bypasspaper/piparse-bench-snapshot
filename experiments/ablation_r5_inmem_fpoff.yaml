@@ -1,0 +1,178 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: ablation_r5_inmem_fpoff
+  description: >
+    v6 CSV->JSON ablation ladder, InMemory retake -- r5 (general inline) rung ONLY, W1, on the
+    FASTPATH-OFF binary. This reproduces the v5 two-binary methodology so the JSON output fast-path
+    2x lands at r5->r6, not buried in generic inline: r5 = general proxy/accessor inline ONLY, with
+    the output fast-path + serializer inline turned OFF at BUILD time.
+
+    !!! REQUIRES A SPECIAL BINARY -- do NOT run against the normal cmake-build-release !!!
+    Build the fastpath-OFF binary FIRST:
+      1. comment nes-plugins/OutputFormatters/JSONOutputFormatter/CMakeLists.txt:34
+         (nautilus_inline(json_output_formatter_plugin))
+      2. comment testing/configurations/InlineTagConfig.yaml:12 (- output_parse)
+      3. cmake <build>   (RECONFIGURE -- InlineTagConfig is read at CONFIGURE time; a plain
+         --build leaves a STALE generated header and the tag silently stays ON)
+      4. cmake --build <build> --target nes-single-node-worker nes-cli
+    Run this experiment against that binary, then RESTORE:
+      git checkout nes-plugins/OutputFormatters/JSONOutputFormatter/CMakeLists.txt \
+                   testing/configurations/InlineTagConfig.yaml
+      cmake <build> && cmake --build <build> --target nes-single-node-worker nes-cli
+    (the seq + r7 experiments use the FULL fastpath-ON binary.)
+
+    Config == v5 r5_inline == the suite's r5 knobs: SequentialCSV->JSON, fnattr +
+    inline_invoke_calls=true, trace_constant_bytes OFF, W1, fast parsers, source InMemory (prefill).
+    THROUGHPUT: NES_INMEM_REPEAT=1 => reported == true, no correction. data_size=medium (matches v5).
+    GOTCHAS: prefill ~<=6.4GB into a private pool; pkill -x main pre-flight, NEVER pkill -f.
+    RUN (after building the fastpath-OFF binary): cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 \
+           uv run python bench.py run experiments/ablation_r5_inmem_fpoff.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: false
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+    output_formatter: { type: JSON }
+    input_parser: {}
+    output_parser: {}
+  generator:
+    repeat: 1
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 1
+    NES_INMEM_BUFSIZE: 131072
+
+_fast_parsers: &fast_parsers
+  uint64: TracedUINT64
+  int64: TracedINT64
+  int32: FastINT32
+  int16: TracedINT16
+  uint32: TracedUINT32
+  uint16: TracedUINT16
+  bool: TracedBOOL
+  f64: EiselFloatF64
+  f32: EiselFloatF32
+_fast_out: &fast_out { f64: ZMIJF64, f32: ZMIJF32 }
+
+_ladder: &ladder
+  label: "optimization (cumulative)"
+  explicit:
+    - name: r5_inline
+      baseline: true
+      overrides:
+        query_config.source_type: InMemory
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: *fast_parsers
+        query_config.output_parser: *fast_out
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: fnattr
+        worker.query_engine.inline_invoke_calls: true
+        worker.query_engine.trace_constant_bytes: false
+        overload: false
+        generator.repeat: 1
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s)" }
+
+variants:
+  - name: nx_person_projection
+    description: "SELECT id FROM person"
+    query: nexmark/person_projection
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: nx_person_star
+    description: "SELECT * FROM person"
+    query: nexmark/person_star
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: nx_bid_ts_projection
+    description: "SELECT timestamp FROM bid"
+    query: nexmark/bid_ts_projection
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: nx_bid_filter_eq
+    description: "SELECT * WHERE auctionId = 1000"
+    query: nexmark/bid_filter_eq
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: nx_q0_bid_star
+    description: "Q0: SELECT * FROM bid"
+    query: nexmark/bid_star
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: nx_q1_price
+    description: "Q1: price * 908/1000"
+    query: nexmark/q1_price
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: nx_q2_filter_proj
+    description: "Q2 (repo shape)"
+    query: nexmark/q2_filter_proj
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: nx_q2_original
+    description: "Q2 (PAPER shape): 5-way OR"
+    query: nexmark/q2_original
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: nx_q14_calc
+    description: "q14 (reduced): computed-float range filter"
+    query: nexmark/q14_calc
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: nx_q10_datetime
+    description: "q10 (reduced): CASTFROMUNIXTS reformat"
+    query: nexmark/q10_datetime
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: nx_q22_concat
+    description: "q22 (interim CONCAT)"
+    query: nexmark/q22_concat
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }

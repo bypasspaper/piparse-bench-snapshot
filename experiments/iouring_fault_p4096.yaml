@@ -1,0 +1,40 @@
+experiment:
+  name: iouring_fault_p4096
+  description: >
+    Fault/TLB profile point (§40 cause check): baseline non-fixed cold O_DIRECT IoUringFile passthrough at
+    pool 4096 buffers (128 KiB), pinning off, single pass, n=1. Run with scripts/perf_stat_worker.py to
+    count page-faults + dTLB-load-misses. Compare pool 4096 (fast, ~5.8 GB/s) vs 32768 (slow, ~3.3): if the
+    slow case has ~Nx more page-faults (N ~ pool ratio capped by total reads), first-touch faults explain it.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: true
+  completion_timeout_s: 120
+  worker:
+    query_engine: {number_of_worker_threads: 4, number_of_io_threads: 1, invoke_mode_configuration: fnattr, pin_threads: false}
+    default_query_execution: {operator_buffer_size: 131072, execution_mode: COMPILER}
+    number_of_buffers_in_global_buffer_manager: 4096
+  query_config:
+    source_type: IoUringFile
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64}
+    output_formatter: {type: CSV}
+  generator: {repeat: 1, mode: burst, rate: 1000000}
+  worker_env: {NES_IOURING_DIRECT: 1, NES_IOURING_QD: 64, NES_IOURING_REGBUF: 0}
+variants:
+  - name: p4096
+    description: "baseline cold O_DIRECT, pool 4096, fault profile"
+    query: nexmark/bid_passthrough
+    axes:
+      x: {label: run, explicit: [{name: prof, baseline: true, overrides: {}}]}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

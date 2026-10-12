@@ -1,0 +1,19 @@
+[package]
+name = "tcp-generator"
+version = "0.1.0"
+edition = "2021"
+description = "Blocking TCP data generator for PiParse benchmarks"
+
+[[bin]]
+name = "tcp-generator"
+path = "src/main.rs"
+
+[[bin]]
+name = "async-tcp-generator"
+path = "src/async_main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }

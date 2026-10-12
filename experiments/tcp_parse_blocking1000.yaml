@@ -1,0 +1,88 @@
+experiment:
+  name: tcp_parse_blocking1000
+  description: >
+    Blocking arm at N=1000 -- the last point of the TCP source-parse scaling curve
+    (base: tcp_parse_scaling; 500-point: tcp_parse_blocking500_retry -- READ BOTH).
+    Same method (engine cores 0-13 w14/io4, generator 10 threads on 14-23, shared
+    async generator, -m 6), ONE rep.
+
+    TIMEOUT SIZING (the load-bearing part):
+      - connect_timeout_seconds: 1800. This value == SO_RCVTIMEO gates the FIRST byte,
+        and the first-submitted sources connect and then wait through (a) the ENTIRE
+        sequential submission of 1000 queries incl JIT (several minutes) because the
+        generator releases data only when ALL -n 1000 clients are connected, plus (b)
+        the first-byte contention of 1000 released-together streams. 600 s was enough
+        at 500; 1000 doubles the submission phase -> 1800 for margin.
+      - completion_timeout_s: 10800 (3 h): 1000 x 6 GB = 6 TB at an extrapolated
+        ~0.7-1.0 GB/s collapsed rate = ~100-140 min of streaming + submission + drain.
+      - RAM: 1000 private source pools (8 MB each) = 8 GB + 4 GB global -- fits.
+
+    PREDICTIONS:
+      - n_ok = 1000/1000, zero EAGAIN (the 500-retry showed no mid-stream drops; the
+        equilibrium is backpressure-paced, not a death spiral).
+      - Aggregate ~0.7-1.0 GB/s (curve 3770 peak -> 2839 -> 1733 -> 1130 -> ?; each
+        doubling past the peak cost ~35%, so ~1130 x 0.65 ~= 730, call it 0.7-1.0).
+        Per-conn ~0.7-1.0 MB/s. p50 250-500 ms, p99 0.7-1.5 s.
+      - Async @1000 (already measured, tcp_parse_scaling_ext) = 7796 -> GAP ~8-11x.
+
+    RESULTS (2026-07-07, 1 rep): 733 MB/s (dead center of the 0.7-1.0 prediction; live
+      loopback held a REMARKABLY stable ~740 +-2% for the whole ~2.2 h window), p50 300 /
+      p99 1116 / p999 1759 ms. n_ok = 1000/1000, ZERO EAGAIN, zero drops -- the
+      backpressure-paced equilibrium holds even at 1014 threads on 14 cores. Timeout
+      sizing was right (first bytes arrived after the full 1000-query submission phase).
+      Drain effect: as queries finished, survivors sped up (rx rose to ~870 MB/s).
+      FULL BLOCKING CURVE: 411 -> 3611 -> 3770(peak) -> 2839 -> 1733 -> 1130 -> 733 =
+      ~-35% per doubling past the peak, no floor in sight. GAP @1000 = 10.6x (async 7796
+      flat). Per-conn 0.73 MB/s.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  completion_timeout_s: 10800
+  worker_cpus: "0-13"
+  num_queries: 1000
+  worker:
+    query_engine:
+      number_of_worker_threads: 14
+      number_of_io_threads: 4
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+  query_config:
+    source_type: BlockingTCP
+    sink_type: Monitoring
+    input_formatter: { type: SequentialUncompiledCSV, threading_mode: sequential }
+    output_formatter: { type: CSVUncompiled }
+    source_config:
+      connect_timeout_seconds: 1800
+  generator:
+    kind: async
+    cpus: "14-23"
+    threads: 10
+    chunk_size_kb: 128
+    repeat: 6
+    rate: 1000000
+
+variants:
+  - name: blocking1000
+    description: "q1 over TCP, blocking uncompiled seq, N=1000, connect_timeout_seconds=1800"
+    query: nexmark/q1_price
+    axes:
+      x:
+        label: "Concurrent Queries"
+        parameter: num_queries
+        values: [1000]
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: bar_chart }

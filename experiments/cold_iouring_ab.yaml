@@ -1,0 +1,82 @@
+experiment:
+  name: cold_iouring_ab
+  description: >
+    THE cold-read A/B: the new io_uring deep-QD FileSource vs the current async (QD1)
+    FileSource, both COLD, same query/config (HANDOVER 2_engine_to_e2e §20).
+
+    Two source arms over identical bid_6GB passthrough (W=4 / IO=1, pool 4096 = 512 MB,
+    pin off, cold single 6.44 GB pass):
+    - File        = the async FileSource. QD1: one async_read at a time on the asio io
+      thread, which for a regular file degrades to a BLOCKING read. The cold baseline
+      (cold_file_baseline.yaml / rung-1 §3): ~2.0-2.15 GB/s, disk-latency-bound.
+    - IoUringFile = the new BlockingSource that keeps NES_IOURING_QD (default 16) reads
+      in flight from ONE thread via io_uring, reading directly into pool buffers
+      (zero-copy via the prefill hook) and emitting in file order. Deep QD hides the
+      per-read latency.
+
+    PREDICTION: File ~2.1 GB/s (QD1, unchanged). IoUringFile should lift toward the
+    single-thread io_uring ceiling measured raw in §2 (QD>=16 -> 6.7 GB/s, ~= the NVMe
+    cap 6.9). So target ~2.1 -> ~6+ GB/s, a ~3x cold win from queue depth alone (still
+    BUFFERED io_uring -- the page-cache read copy remains; O_DIRECT is the next lever).
+    If IoUringFile only matches File, QD isn't taking effect (check threading mode =
+    PARALLEL so the prefill path runs, and that completions actually pipeline).
+
+    CORRECTNESS: in-order emission is required (the CSV formatter stitches partial
+    tuples across consecutive buffers by sequence number); takePreFilledBuffer() reaps
+    strictly in file order. Validate separately with a Checksum-sink A/B vs File on a
+    small file before trusting throughput.
+
+    GOTCHAS:
+    - source_type: IoUringFile selects the new BlockingSource (add_plugin IoUringFile).
+      Needs the worker rebuilt with liburing (vcpkg dep added this session).
+    - cold_read evicts bid_6GB before each run (mincore-verified COLD line in the log);
+      requires generator.repeat: 1 (single pass). No generator process for File sources.
+    - Sandbox OFF (spawns worker, binds :8080); verify :8080 free first.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: true
+  worker:
+    query_engine:
+      number_of_worker_threads: 4
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 4096
+  query_config:
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64}
+    output_formatter: {type: CSV}
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: cold_iouring_ab
+    description: "COLD bid_6GB passthrough: async File (QD1) vs IoUringFile (QD16)"
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "source"
+        explicit:
+          - name: "File_QD1"
+            baseline: true
+            overrides: {query_config.source_type: File}
+          - name: "IoUringFile_QD16"
+            overrides: {query_config.source_type: IoUringFile}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

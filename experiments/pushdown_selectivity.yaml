@@ -1,0 +1,92 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: pushdown_selectivity
+  description: >
+    PREDICATE PUSHDOWN via lazy values. SELECT-ish over 16 fields (f0 UINT64 predicate + f1..f15 FLOAT64
+    payload) on large/multicol/mixed_n16.csv (1.59M rows). WHERE f0 < t sweeps selectivity 0..100%; the
+    projection sums the 15 payload floats to FORCE their parse for survivors while keeping output to one
+    cheap scalar (so the only selectivity-dependent cost is the deferred payload parse, not output serialize).
+    Two series differ ONLY in the input formatter (downstream filter+projection compiled in BOTH):
+      compiled_lazy  = SequentialCSV      -> lazy field values, parse f1..f15 only for survivors (pushdown)
+      uncompiled     = SequentialUncompiledCSV -> eagerly materialises all 16 fields every row (no pushdown)
+    EXPECT: uncompiled ~FLAT (parses all always); compiled_lazy SLOPES from ~parse-1 (0% sel) to ~parse-16
+    (100% sel). The compiled line's slope = predicate pushdown. InMemory prefill, W1, Monitoring sink.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: false
+  completion_timeout_s: 240
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: {type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false}
+    input_parser: {uint64: TracedUINT64, f64: EiselFloatF64}
+    output_parser: {f64: ZMIJF64}
+    output_formatter: {type: CSV}
+  generator:
+    repeat: 20
+    mode: burst
+    rate: 1000000
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 20
+    NES_INMEM_BUFSIZE: 131072
+
+_configs: &configs
+  label: "formatter (eager vs lazy)"
+  explicit:
+    - name: compiled_lazy
+      baseline: true
+      overrides:
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.input_parser: { uint64: TracedUINT64, f64: EiselFloatF64 }
+        query_config.output_parser: { f64: ZMIJF64 }
+        worker.query_engine.invoke_mode_configuration: fnattr
+    - name: uncompiled
+      overrides:
+        query_config.input_formatter: { type: SequentialUncompiledCSV, threading_mode: SEQUENTIAL }
+        query_config.input_parser: {}
+        query_config.output_parser: {}
+        worker.query_engine.invoke_mode_configuration: default
+
+variants:
+  - name: pushdown
+    description: "SELECT sum(f1..f15) WHERE f0<t; selectivity sweep x {compiled_lazy, uncompiled}"
+    queries:
+      - pushdown/sel_000
+      - pushdown/sel_005
+      - pushdown/sel_010
+      - pushdown/sel_025
+      - pushdown/sel_050
+      - pushdown/sel_075
+      - pushdown/sel_090
+      - pushdown/sel_100
+    axes:
+      x:
+        label: "selectivity sweep (query)"
+        explicit:
+          - name: sweep
+            baseline: true
+            overrides: {}
+      series: *configs
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: line_chart}

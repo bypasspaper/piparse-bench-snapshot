@@ -1,0 +1,116 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: cold_iouring_w16
+  description: >
+    W=16 re-run of the cold-read io_uring recipe that matched the async source at ~6.8 GB/s.
+    Goal (user, session 2026-07-03): confirm the BLOCKING IoUringFile source, configured at 16
+    worker threads with the STANDARD SIMDCSV formatter over the passthrough query on a COLD
+    bid_6GB file, reaches the same ~6.8 GB/s the async io_uring source hit -- resolving last
+    session's "io_uring showed no gain over blocking File on a cold file" confusion.
+
+    THE NO-GAIN TRAP (why last session saw no win): a plain IoUringFile with BUFFERED reads and
+    the DEFAULT/large pool gives NO gain over async File (~2.2-3.3 GB/s). Buffered io_uring is
+    kernel-READAHEAD-bound (deep app QD does nothing for one sequential buffered stream); and the
+    large/default pool HALVES cold throughput (HANDOVER 2_engine_to_e2e §40: 6.76 -> 3.28 at the
+    32768-buffer default, and regbuf gives no benefit there). The ~6.8 number REQUIRES the FULL
+    recipe, all fixed here:
+      - NES_IOURING_DIRECT=1  (O_DIRECT: bypass page cache + readahead -> true device QD)
+      - NES_IOURING_REGBUF=1 + worker.global_buffer_alignment=512  (registered fixed buffers, +4%)
+      - NES_IOURING_QD=64     (QD16=5.31, QD64=5.9-6.84; 64 saturates)
+      - SMALL pool (the x-axis here)
+    Blocking IoUringFile O_DIRECT+regbuf@pool2048 = 6.77 GB/s = 96% of the 7.03 GB/s NVMe device
+    cap (HANDOVER §36, §40b); the async IoUringFileAsync later matched it within 0.2% (memory:
+    iouring-sources). W>=3 already saturates the single producer thread (§31), so W=16 is NOT
+    expected to beat W=4 -- it just confirms extra workers don't hurt a source-bound passthrough
+    (§16: W16 warm File 6.69).
+
+    THE POOL AXIS (settles the open "how small" question): HANDOVER §40b swept pool at W=4 and
+    found throughput HALVES as the pool grows (6.17@1MB-ish -> 3.31 large) and regbuf helps ONLY
+    at small pools; 2048 (256 MB) was the SMALLEST previously tested (=6.77, the optimum). The
+    user's intuition: the pool footprint should be smaller than L3 (~32 MB) so recycled buffers
+    stay cache-resident for the worker parse. This experiment tests below 2048 for the first time,
+    at W16. buffer size = operator_buffer_size = 128 KiB, so:
+      256 buffers = 32 MB (~= L3, the user's guess) | 512 = 64 MB | 1024 = 128 MB
+      2048 = 256 MB (the §40b optimum) | 4096 = 512 MB (regbuf_ab baseline, 6.84 steady)
+
+    PREDICTION: 2048/1024 ~= 6.7-6.9 (near the §40b optimum, device-bound). Smaller (512, 256) may
+    hold or marginally improve (hotter recycled buffers) UNTIL in-flight demand exceeds the pool:
+    QD64 needs 64 buffers in flight + 16 workers each holding ~1-2 + sink buffers ~= 100+ live
+    buffers. So 256 buffers (barely above that floor) is the risk point -- if it starves, its
+    throughput FLOORS (source blocks on getBuffer, backpressure) rather than improves. 4096 begins
+    the §40 large-pool decline. Expected peak ~512-2048. If EVERY point sits at ~2-3 GB/s, the
+    recipe didn't engage: check the log for "regbuf fallback" warnings, that DIRECT/QD env reached
+    the worker, and that source_type really resolved to IoUringFile (not File).
+
+    GOTCHAS:
+    - cold_read: true evicts bid_6GB before every rep (mincore-verified COLD line in the log);
+      O_DIRECT ignores the cache anyway, eviction just keeps things honest. generator.repeat=1
+      (single 6.44 GB pass); NO generator process for file sources.
+    - O_DIRECT + REGBUF need 512-byte alignment of offset/length/buffer; global_buffer_alignment:512
+      + the slab base rounded to 512 satisfy it. If the alignment invariant trips OR regbuf can't
+      register the slab, the source logs a fallback to plain reads (throughput drops to buffered).
+    - A too-SMALL pool (256) can hang on buffer-pool exhaustion; completion_timeout_s=120 guards it.
+    - Sandbox OFF (spawns worker, binds :8080); verify :8080 free + no stray `main`/worker first.
+    - After any formatter/source rebuild, rebuild the worker (cmake-build-release binary must be
+      newer than the source change).
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: true
+  completion_timeout_s: 120
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    global_buffer_alignment: 512
+    number_of_buffers_in_global_buffer_manager: 2048
+  query_config:
+    source_type: IoUringFile
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64}
+    output_formatter: {type: CSV}
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+  worker_env:
+    NES_IOURING_DIRECT: 1
+    NES_IOURING_QD: 64
+    NES_IOURING_REGBUF: 1
+
+variants:
+  - name: cold_iouring_w16
+    description: "COLD bid_6GB passthrough, W16/IO1, IoUringFile O_DIRECT+REGBUF QD64 -- pool-size sweep"
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "pool (128 KiB buffers)"
+        explicit:
+          - name: "256 (32 MB)"
+            overrides: {"worker.number_of_buffers_in_global_buffer_manager": 256}
+          - name: "512 (64 MB)"
+            overrides: {"worker.number_of_buffers_in_global_buffer_manager": 512}
+          - name: "1024 (128 MB)"
+            overrides: {"worker.number_of_buffers_in_global_buffer_manager": 1024}
+          - name: "2048 (256 MB)"
+            baseline: true
+            overrides: {"worker.number_of_buffers_in_global_buffer_manager": 2048}
+          - name: "4096 (512 MB)"
+            overrides: {"worker.number_of_buffers_in_global_buffer_manager": 4096}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

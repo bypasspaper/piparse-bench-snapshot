@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+*.egg
+
+# Rust
+generator/target/
+
+# Results (large / machine-specific)
+results/piparse_bench.duckdb
+results/csv/
+results/figures/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Remote config (may contain credentials)
+remote.yaml
+
+# DuckDB write-ahead log
+results/*.duckdb.wal
+
+# Stray NES default logs (worker/cli write to cwd)
+nes-cli.log
+singleNodeWorker.log
+bench-runner.log
+# --detach run logs are per-machine scratch
+results/logs/
+
+# Session scratch (temp figures, demos, plans)
+scratchpad/
+
+# Stray run logs / detach pid files written to the repo root or scripts/ (per-machine scratch)
+*.log
+*.pid
+# Per-run raw artifacts (sink CSVs, thread-CPU series, worker logs): 100+ MB, archived separately
+results/artifacts/
+# Smoke-test scratch CSV at the repo root
+/fig2_fieldsweep_v2_smoke_cpu.csv

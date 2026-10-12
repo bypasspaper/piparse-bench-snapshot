@@ -1,0 +1,92 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: cmysb_ysb1k_varsized_ext
+  description: >
+    STEADY-STATE closure for varsized YSB (companion to cmysb_ysb_varsized, same role
+    cmysb_ysb1k_ext played for fixed-width): ysb_1k_varsized on 4x extended data with
+    FORWARD-shifted event_time (+2,000,000 ms per copy = the file's span; replay instead
+    corrupts the heap, cmysb_repeat_probe). 80M rows, 14.85GB CSV / 14.56GB native ->
+    ~1.5-1.7s windows instead of 0.38-0.46s.
+
+    WHY: on fixed-width ysb_1k the sub-second windows flattered native 1.47x -> honest
+    1.19x. The varsized single-pass gap is only 1.10x total (footprint 1.020) - if the
+    same flattery applies, the steady gap could shrink toward parity, which would mean
+    parsed execution effectively TIES native on the original string-heavy YSB shape.
+    EXPECT (predict-first): per-byte moves from 1.08 toward ~1.0 (the fixed-width study
+    moved per-byte by ~-0.24 csv-ward at 20x longer windows; here windows lengthen 4x, so
+    expect a smaller shift, maybe per-byte ~1.0-1.05 / Mr/s ~1.02-1.07). If the gap does
+    NOT shrink, the 8-10% is real varsized-copy cost, not ramp.
+
+    GOTCHAS: all of cmysb_ysb_varsized's (string_length "37,37,37,37,9,9,8", repeat=1, LF);
+    files are ~29.4GB combined - warm_read evicts everything else (re-dd other experiments'
+    files before re-running them); box has 62GB total, do NOT extend beyond 4x with both
+    arms resident.
+
+    RESULTS (2026-07-13, 6/6 ok; rep 1 of EACH arm was cold/PARTIAL-warm (both files don't
+    fit alongside the prior working set) and lands as the median-excluded min - warm reps
+    agree <1%): csv 9777 MB/s / 52.7 Mr/s / 1.519s; native 9859 MB/s / 54.2 Mr/s / 1.477s.
+    Ratios NAT/CSV: per-byte 1.008, Mr/s 1.028 (= footprint 1.020 x per-byte). PREDICTION
+    CONFIRMED, strong form: parsed execution TIES native on string-heavy YSB at steady
+    state (+2.8% total, of which 2% is density). The single-pass 1.10x in cmysb_ysb_varsized
+    was ramp flattery of the native arm, same direction as fixed-width (1.47 -> 1.19).
+    Both arms sit ~9.8-9.9 GB/s of own bytes (warm supply band, io=1) - the EQUALITY is the
+    robust finding. Varsized-copy cost of CSV parse ~= fixed-slot read cost of native.
+  primary_metric: processing_time_s
+  higher_is_better: false
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: xlarge
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 600
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser:
+      uint64: TracedUINT64
+    output_formatter: { type: CSV }
+  generator:
+    repeat: 1
+
+variants:
+  - name: ysb_1k_varsized_ext4
+    description: "varsized YSB 1k campaigns, 80M rows / 4x forward-shifted time, csv vs native"
+    query: yahoo/ysb_1k_varsized
+    axes:
+      x:
+        label: "worker threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [16]
+      series:
+        label: "input format"
+        explicit:
+          - name: csv_optimized
+            baseline: true
+            overrides: {}
+          - name: native
+            overrides:
+              data_size: xlarge_native
+              query_config.input_formatter: { type: SystemNative, string_length: "37,37,37,37,9,9,8" }
+              query_config.input_parser: {}
+    y: { metric: processing_time_s, label: "Processing time (s)" }
+    visualization: { type: grouped_bar }

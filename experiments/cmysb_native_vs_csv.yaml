@@ -1,0 +1,154 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: cmysb_native_vs_csv
+  description: >
+    ClusterMonitoring Q2 (google trace: original 1.53GB LF + lightsaber 1MB subset) and Yahoo
+    Streaming Benchmark (1k + 10k campaigns, ~0.5GB each) - parsed CSV execution vs SystemNative
+    binary input, under the nexmark_native_vs_csv_v2 controlled protocol (W16 pinned +
+    CCX-sharded admission queue, io=1, fnattr, 128KiB buffers, warm reads, reps=3 median).
+    Session 2026-07-13; extends the nexmark format matrix to the two remaining benchmark
+    suites the user asked for.
+
+    ALL FOUR queries are event-time windowed aggregations (CM: SLIDING 60s/1s SUM(cpu) GROUP BY
+    jobId with eventType==3 filter ~ 4-of-12 fields touched; YSB: TUMBLING 30s SUM(user_id)
+    GROUP BY campaign_id with event_type<1 filter ~ 4-of-11 fields touched) -> generator.repeat
+    MUST stay 1 (replay wraps event time backward). Lazy elision auto-projects the untouched
+    fields on the CSV arm, so the CSV cost = SIMD index + 4 parsed cols, not full-row parse.
+
+    METRICS (two-metric convention): GB/s of own input bytes (per-byte engine efficiency) +
+    Mrows/s (format-invariant outcome). Byte-footprint ratios csv/native: cm_original 1.260
+    (1527761977/1212188705), lightsaber 1.214, ysb 1.262/1.275 (492214231|497209125/390000000).
+
+    EXPECT (predict-first): these are nexmark-q2-shaped workloads (predicate + narrow projection
+    + cheap agg) -> the CSV arm pays index+parse per byte; from the nexmark v2 table
+    (bid_filter/q2 rows) expect NAT/CSV per-byte ~1.05-1.11x and Mr/s ratio ~ footprint x that
+    (~1.3-1.45x). The window/state term is format-invariant and, unlike q5/q8, small (YSB state:
+    1k/10k groups x few live windows; CM: per-slice hash of ~jobId cardinality) - it should NOT
+    Amdahl the gap away. WATCH: single-pass windows are SHORT (0.5-1.5GB at multi-GB/s = wall
+    spans well under 2s for YSB) -> single-pass numbers carry ramp inflation; the companion
+    steady-state probe (cmysb_repeat_probe) supplies the honest input-side ratio.
+
+    GOTCHAS: csv arm reads the _lf copies (CRLF trap on lightsaber+ysb last columns; catalog
+    points there); cm_q2_original BOOLEAN col MUST use TracedBOOL - DefaultBOOL SIGABRTs the
+    release worker (__emutls JIT crash, same class as the default-int32 story; non-passthrough
+    queries parse ALL fields so the unused bool still runs);
+    lightsaber is 1 MB / 16292 rows - fixed-cost dominated, keep for completeness but do not
+    read throughput into it; stateful pool NOT used (window-agg state is hash-table-resident,
+    checksum smoke completed on the default 16384 x 128KiB pool); pkill -x main preflight;
+    native arm needs string_length even without varsized cols (SystemNative required param).
+
+    RESULTS (2026-07-13, 24/24 ok, reps=3 median; GB/s = own input bytes; ratios NAT/CSV):
+      query          | CSV MB/s  Mr/s  wall  | NAT MB/s  Mr/s  wall  | per-byte x | Mr/s x
+      cm_original    |   482     5.9   3.17s |   364     5.6   3.33s |   0.76     |  0.95
+      cm_lightsaber  |    29     0.5   35ms  |   ~29*    0.5   30ms  |    -       |  ~1.0
+      ysb_1k         |  7146    72.6   69ms  |  8347   107.0   47ms  |   1.17     |  1.47
+      ysb_10k        |  3781    38.0  131ms  |  3029    38.8  129ms  |   0.80     |  1.02
+      (* store reports native lightsaber throughput_mbps=0.0 - compute from wall: 0.88MB/30ms;
+       fixed-cost dominated as predicted, read nothing into it.)
+    READING: (1) ysb_1k is the ONLY format-sensitive row: light state (1k groups, tumbling)
+    leaves the input side visible - native 1.47x rows/s = footprint 1.262 x per-byte 1.17,
+    matching the nexmark parse-forced rows (1.53-1.62x). (2) ysb_10k: 10x group count drags
+    BOTH arms to ~38 Mr/s = state-bound, format gap GONE (1.02x); rep spread is wide
+    (csv 3.6-4.8 GB/s) - the 130ms windows are noisy. (3) cm_original mirrors nexmark's
+    joins: sliding 60s/1s + 3.09M output rows = window/output-bound at ~5.7 Mr/s, native
+    slightly WORSE per row (0.95x, wall 3.33 vs 3.17s - native pays the same output serialize
+    but reads 0.79x the bytes, i.e. format is simply irrelevant here). (4) YSB single-pass
+    windows are 47-131 ms = ramp-inflated; the replay probe CRASHES (see cmysb_repeat_probe)
+    so the honest steady point comes from the 24x extended file (cmysb_ysb1k_ext): there
+    the ysb_1k gap SHRINKS to Mr/s 1.19x with per-byte 0.93 (csv MORE byte-efficient per
+    own byte) - the 1.47x here is short-window flattery of the native arm; trust the ext
+    numbers for ysb_1k.
+    (5) PARSING-OVERHEAD ANSWER: on these two suites the CSV parse tax only matters when
+    per-row state work is light, and even then it is (at steady state) LESS than the text
+    byte footprint - native wins ~1.19x rows/s on ysb_1k purely via density; once the
+    window/agg term dominates (10k groups, dense sliding windows) parsed and native
+    execution converge to the same rows/s.
+  primary_metric: processing_time_s
+  higher_is_better: false
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 600
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser:
+      uint64: TracedUINT64
+      int64: TracedINT64
+      int16: TracedINT16
+      uint32: TracedUINT32
+      uint16: TracedUINT16
+      f64: EiselFloatF64
+      f32: EiselFloatF32
+      bool: TracedBOOL
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+
+_series: &format_series
+  label: "input format"
+  explicit:
+    - name: csv_optimized
+      baseline: true
+      overrides: {}
+    - name: native
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "16" }
+        query_config.input_parser: {}
+
+_axes_x: &w16_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [16]
+
+_y: &time_y { metric: processing_time_s, label: "Processing time (s)" }
+
+variants:
+  - name: cm_q2_original
+    description: "CM Q2 on the 1.53GB google trace: sliding 60s/1s SUM(cpu) by jobId, eventType==3"
+    query: cluster_monitoring/q2_original
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: cm_q2_lightsaber
+    description: "CM Q2 on the 1MB lightsaber subset (fixed-cost dominated - completeness only)"
+    query: cluster_monitoring/q2_lightsaber
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: ysb_1k
+    description: "YSB tumbling 30s SUM(user_id) by campaign (1k campaigns), event_type<1"
+    query: yahoo/ysb_1k
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: ysb_10k
+    description: "YSB tumbling 30s SUM(user_id) by campaign (10k campaigns), event_type<1"
+    query: yahoo/ysb_10k
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+    visualization: { type: grouped_bar }

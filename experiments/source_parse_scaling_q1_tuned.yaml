@@ -1,0 +1,78 @@
+experiment:
+  name: source_parse_scaling_q1_tuned
+  description: >
+    TUNED async q1 curve: fill the async series at the tuned thread budget 24w/6io for the
+    N values not already covered by the thread-budget controls (N=100 -> _ctrl_io_lift
+    13634 MB/s; N=250 -> _ctrl_n250 13491 MB/s). Points here: 1/10/50/150/200/500.
+    ONE rep per point to match the controls (1-rep values reproduced 3-rep medians within
+    ~0.3-1% throughout the control series). Join with the two control experiments for the
+    full tuned curve; compare against source_parse_scaling_q1{,_ext}'s async series
+    (24w/4io) to show the io-supply understatement (~8-9% at N>=50).
+
+    PREDICTION: N=1 and N=10 match the 4io baseline (5031 / 11822) within noise -- io
+    supply only binds once aggregate demand exceeds ~12.5 GB/s, which needs N>=50. From
+    N=50 on: ~13.3-13.7 GB/s flat (the +8-9% lift), p50/p99 similar-or-slightly-better
+    than baseline at equal N. N=500 ~13.0-13.5 (baseline 12006 had a 3% dip; some of that
+    dip may be io-multiplexing and shrink at 6io).
+
+    GOTCHAS: all of source_parse_scaling_q1's apply (timestamp fix, pkill -x main, warm 1GB
+    + repeat 6, rebuild worker binary after code changes).
+
+    RESULTS (2026-07-06, 1 rep): N=1/10/50/150/200/500 = 5187 / 13940 / 13474 / 13520 /
+      13575 / 13084 MB/s; p50 0.2/0.3/0.7/1.6/2.1/4.9 ms; p99 0.3/3.2/11.6/12.8/13.3/16.5.
+      Prediction PARTLY wrong in a nice way: the 6io lift already binds at N=10 (13940 --
+      the HIGHEST point of the whole study, +18% over the 4io 11822; 10 sources on 4 io
+      threads was already supply-limited). N=1 5187 ~= baseline 5031 (+3%, single source
+      producer-bound). Plateau ~13.1-13.9 GB/s flat through N=500 (+8-9% over 4io
+      everywhere). Full tuned curve = this + _ctrl_io_lift(100: 13634) + _ctrl_n250(250:
+      13491) + _n1000(1000: 13062).
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  worker:
+    query_engine:
+      number_of_worker_threads: 24
+      number_of_io_threads: 6
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV }
+    input_parser: { uint64: TracedUINT64, int32: TracedINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  generator:
+    repeat: 6
+
+variants:
+  - name: tuned_async
+    description: "q1, async File+SIMDCSV, 24w/6io tuned budget, remaining N points"
+    query: nexmark/q1_price
+    axes:
+      x:
+        label: "Concurrent Queries (= Concurrent Sources)"
+        parameter: num_queries
+        values: [1, 10, 50, 150, 200, 500]
+    y:
+      metric: throughput_mbps
+      label: "Aggregate System Throughput (MB/s)"
+    visualization:
+      type: line_chart
+      x_scale: log

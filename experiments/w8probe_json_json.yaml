@@ -1,0 +1,97 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: w8probe_json_json
+  description: >
+    16-CELL MATRIX cell json->json (USER-CONSENTED full run, 2026-08-04). 10 frozen workload
+    queries x 3 rungs x 3 reps. Conventions locked this session: r_base = fully-interpreted
+    fair-codec baseline (SequentialUncompiled input + JSONUncompiled sink-side legacy writer,
+    byte-identical to compiled under ZMIJ); r_comp = Sequential compiled W1 full-opt; r_par =
+    parallel W23 (23 workers + 1 source thread = 24 cores, InMemory prefill, REPEAT=20 ->
+    TRUE r_par = reported x20). data_size selects 'json' (catalog entries are
+    per-family; silent first-entry fallback if wrong). Cell math: Comp=r_comp/r_base,
+    Par=r_par*20/r_comp, geomean over the 10 queries.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 2
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: json
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: default
+      inline_invoke_calls: false
+      trace_constant_bytes: false
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: BlockingFile
+    sink_type: Monitoring
+    input_formatter: { type: SequentialUncompiledSchemaJSON, threading_mode: SEQUENTIAL }
+    output_formatter: { type: JSONUncompiled }
+    input_parser: {}
+    output_parser: {}
+  generator:
+    repeat: 1
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 20
+    NES_INMEM_BUFSIZE: 131072
+
+_ladder: &ladder
+  label: "rung"
+  explicit:
+    - name: r_par_fixed
+      baseline: true
+      overrides:
+        query_config.source_type: InMemory
+        query_config.input_formatter: { type: SchemaJSON, threading_mode: PARALLEL }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser:
+          uint64: TracedUINT64
+          int64: TracedINT64
+          int32: FastINT32
+          int16: TracedINT16
+          uint32: TracedUINT32
+          uint16: TracedUINT16
+          bool: TracedBOOL
+          f64: EiselFloatF64
+          f32: EiselFloatF32
+        query_config.output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+        worker.query_engine.number_of_worker_threads: 8
+        worker.query_engine.invoke_mode_configuration: fnattr
+        worker.query_engine.inline_invoke_calls: true
+        worker.query_engine.trace_constant_bytes: true
+        worker.query_engine.ccx_aware_task_queues: false
+
+        worker.query_engine.pin_threads: false
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s; r_par TRUE = x20)" }
+
+variants:
+  - name: q2mod
+    query: nexmark/matrix/bidstr_q2mod
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }

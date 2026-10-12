@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: seq_prof_int
+  description: >
+    PROFILING harness (session 2026-07-03): sequential BlockingFile + SequentialCSV, int SELECT* NATIVE, WARM
+    long window for perf. Not a throughput datapoint -- the purpose is to attach perf to the DataSrc
+    thread and break down where the single sequential thread spends time (read/ifstream copy vs SIMDCSV
+    index vs memmove), to test the hypothesis that std::ifstream double-buffering wastes a copy and that
+    a zero-extra-copy read (pread/mmap into a cache-resident buffer) has headroom.
+    WARM (cold_read false) + NES_FILE_REPEAT=40 (generator.repeat) so the source replays bid_6GB ~40x
+    for a ~170s steady window; perf records ~12s in the middle. W1, sequential threading. Passthrough
+    (CSV out) => parse elided => this isolates READ + INDEX (the ifstream copy shows up cleanly here).
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: false
+  completion_timeout_s: 300
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 2048
+  query_config:
+    source_type: BlockingFile
+    sink_type: Monitoring
+    input_formatter: {type: SequentialCSV, threading_mode: sequential}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64}
+    output_formatter: {type: NATIVE}
+  generator:
+    repeat: 40
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: seq_prof_int
+    description: "WARM bid_6GB x40, W1 BlockingFile/SequentialCSV passthrough -- perf target"
+    query: nexmark/bid_star_int
+    axes:
+      x:
+        label: "config"
+        explicit:
+          - name: "seq_int"
+            baseline: true
+            overrides: {}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

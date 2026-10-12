@@ -1,0 +1,32 @@
+query:
+  name: nexmark_bid_projection
+  # Strict 2-of-4 projection on the bid schema (INT32 auctionId + FLOAT64 price). Purpose: a query
+  # where the COMPILED lazy path parses ONLY the 2 projected fields (lazy parse elision -- SIMDCSV
+  # indexes all delimiters but materializes just the touched columns), while the UNCOMPILED
+  # formatter ALWAYS parses all 4. The projection width therefore sets the naive-vs-optimized
+  # parse asymmetry (2x here) on top of the interpreted-vs-JIT gap. Includes the FLOAT64 column
+  # on purpose: float in (Eisel/fast_float) + float out (ZMIJ) is the expensive codec pair.
+  description: "SELECT auctionId, price (INT32 + FLOAT64, 2 of 4 fields) FROM bid"
+  sql: "SELECT auctionId, price FROM bid"
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/nexmark/bid_6GB.csv
+          size_bytes: 6442450944
+          rows: 183991721
+        medium:
+          # head -n 31300000 cut of bid_6GB.csv -- regenerate like bid_passthrough_1gb documents:
+          #   head -n 31300000 <build>/nes-systests/testdata/large/nexmark/bid_6GB.csv \
+          #     > <build>/nes-systests/testdata/large/nexmark/bid_1GB.csv
+          file: large/nexmark/bid_1GB.csv
+          size_bytes: 1089194961
+          rows: 31300000
+  sink_schema:
+    - { name: bid.auctionId, type: INT32, not_null: true }
+    - { name: bid.price, type: FLOAT64, not_null: true }

@@ -1,0 +1,120 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: prof_person_projection_ab
+  # PROFILING WINDOW (not a benchmark): BOTH arms of person_projection (SELECT id FROM person)
+  # at W16, ~60s warm multi-pass windows for nes-profile attach. WHY: in nexmark_native_vs_csv
+  # person_projection is the one query with a big PER-BYTE gap: csv 7.27 GB/s vs native 9.27
+  # (GB/s x 1.28) — and the prof_person_star_native contrast profile showed the warm supply on
+  # this file is >=10.2 GB/s (native person_projection io thread 0.90 cores @ 10.2 GB/s). So the
+  # CSV arm sits ~25-30% BELOW supply = real per-byte drag, the cleanest place to attribute the
+  # text-format cost per byte.
+  # EXPECT (predict-first, 2026-07-08):
+  #   H1 (favored) io-coupling: CSV workers actually work (SIMD index over all 881MB, 8 fields/row,
+  #     spanning-tuple stitch, 1 INT32 parse/row) while native-projection workers do near-nothing
+  #     (fixed-stride 4B reads). Busy workers drag the single IOThread's page-cache->pool copy
+  #     (person_star showed io-core-per-byte rising 1.57x under busy workers). Prediction: CSV
+  #     IOThread pegged ~1 core @ 7.27 GB/s (worse cores/byte than native 0.90 @ 10.2), workers
+  #     well UNDER 16 cores -> producer is the wall; the dig moves to WHERE the io thread's extra
+  #     time goes (getBuffer/pool contention vs raw _copy_to_iter).
+  #   H2 (less likely) worker wall: 16 workers saturated by index+parse — only believable if the
+  #     profile shows it; would point at something pathological (spanning path, VARSIZED skipping).
+  #   H3 ruled out by design: sink — both arms emit the identical tiny INT32 column.
+  # Windows: csv 881MB @ 7.27 GB/s = 0.121 s/pass x repeat 500 ~ 60s; native 1472MB @ 9.27 GB/s
+  # = 0.159 s/pass x repeat 380 ~ 60s. Arms run SEQUENTIALLY (series order: csv first, then
+  # native) — attach nes-profile twice, tracking the :8080 worker PID change between arms.
+  # Config mirrors nexmark_native_vs_csv exactly (fast stack, fnattr, 128KiB, allow_commas=false,
+  # TracedUINT64/FastINT32/EiselFloatF64, Monitoring sink, pool 16384x128KiB).
+  #
+  # RESULTS (2026-07-08, two runs: run1 = perf record+stat attached per arm; run2 = per-tid
+  # perf stat only [~free] + /proc rchar rate probe):
+  #   SHAPE (both arms, both runs): IOThread_0 PEGGED ~1.0 core (42% of samples; run2 per-tid
+  #     cycles 43.8G/44.4G per 10s = a full ~4.4 GHz core), workers ~1.3 of 16 cores and mostly
+  #     idle-spin/vdso; io-thread profile is PURE page-cache copy in BOTH arms (_copy_to_iter
+  #     ~65-74% of the thread, filemap machinery, engine tail emit/enqueue < 1.5%). io-thread
+  #     IPC 0.24 (csv) / 0.25 (native) = memory-stall-dominated copy loop.
+  #   -> BOTH arms PRODUCER-BOUND. H2 dead: CSV index+parse fits in ~1.3 of 16 cores, invisible
+  #      at W16. H1 half-right: producer is the wall, but the ARM GAP at steady state is small.
+  #   RATES: run1 (record-perturbed) csv 5324 / native 6070 MB/s (1.14x); run2 wall-span csv
+  #     5771 / native 6085 (1.054x); run2 rchar 10s windows csv 5.88 / native 6.19 GB/s (1.053x).
+  #   IO-THREAD COUNTERS (run2, per-tid, 10s): csv cycles 43.8G, cache-misses 860.6M
+  #     (0.94 miss per 64B line, 0.745 cyc/B); native cycles 44.4G, cache-misses 734.6M
+  #     (0.76 miss/line, 0.717 cyc/B). CSV copy pays ~24% more LLC misses/byte -> consistent
+  #     with the worker-scan RFO drag (csv workers SIMD-scan 100% of recycled raw-buffer bytes,
+  #     native proj touches ~1 line per 368B row), but the net steady-state cost is only ~5%.
+  #   *** HEADLINE REVISION: the 1.28x per-byte gap (7.27 vs 9.27 GB/s) from nexmark_native_vs_csv
+  #     (repeat=4, ~0.5s windows) does NOT reproduce at long windows (1.05x). BOTH arms read
+  #     FASTER at repeat=4 (csv +26%, native +52% vs steady) -> short-window inflation (DVFS
+  #     boost burst ~1.2x explains csv; native's extra +25% unexplained) + run-to-run io-thread
+  #     placement variance (pin_threads=false; yesterday's prof contrast run measured native proj
+  #     supply at 10.2 GB/s with io 0.90 cores on a LONG window - today 6.1-6.2 pegged 1.0, a
+  #     1.8x cyc/B swing on the same binary/file = placement/thermal/arm-order confounds).
+  #   CAVEATS: n=1 per run; native always ran SECOND (thermal/order not controlled); background
+  #     load not controlled. NEXT: repeat-sweep [4,40,400] x reps>=3 with arm-order alternation
+  #     (+ optionally pin_threads) to separate window-artifact from placement variance before
+  #     trusting any per-byte ratio on this query.
+  # SUPERSEDED IN PART by prof_person_projection_pin_ccx (same day): pinning 1io+5w on CCX0
+  #   flipped the ordering (csv 10.4 vs native 7.8 GB/s) and dd triangulation found the true
+  #   confound — per-FILE bimodal warm page-cache read rate (person_840MB.nes + auction_lf.csv
+  #   are "slow-class" ~9 GB/s vs ~13 for the rest; fixable by rewriting the file). The ~5%
+  #   steady-state gap measured HERE = slow-class .nes vs fast-class .csv net of the unpinned
+  #   RFO drag. See that yaml's RESULTS for the full story.
+  description: "60s warm windows: person_projection csv vs native at W16 for perf attach (not a benchmark)"
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  completion_timeout_s: 300
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser: { uint64: TracedUINT64, int32: FastINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  generator:
+    repeat: 500
+
+_series: &format_series
+  label: "input format"
+  explicit:
+    - name: csv_optimized
+      baseline: true
+      overrides: {}
+    - name: native
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "16,32,32,16,4,256" }
+        query_config.input_parser: {}
+        generator.repeat: 380
+
+variants:
+  - name: person_projection_window
+    query: nexmark/person_projection
+    axes:
+      x:
+        label: "worker threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [16]
+      series: *format_series
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: grouped_bar }

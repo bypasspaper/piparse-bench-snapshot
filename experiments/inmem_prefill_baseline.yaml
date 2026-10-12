@@ -1,0 +1,113 @@
+experiment:
+  name: inmem_prefill_baseline
+  description: >
+    InMemory PREFILL baseline — the engine's source+formatter ceiling, worker-thread
+    scaling, decoupled from disk and from the producer memcpy. This is the "prefill"
+    rung from 1_isolated_to_engine, ported onto pbench (mode: bench-runner).
+
+    MECHANISM: query formatter/inmem_prefill (SELECT key FROM mem5 -> Void) on a
+    TYPE InMemory source under env NES_INMEM_PREFILL=1: the 5 GB CSV is read into a
+    private pool of ready buffers IN THE CTOR (outside the timed window), then handed
+    straight to emit() with no pool-acquire / no producer memcpy. The timed window is
+    therefore pure engine: scan-dispatch + JIT pipeline (SIMDCSV index + TracedUINT64
+    parse of the projected `key` column) + Void sink. See the query file header for the
+    full rationale (incl. why Void not Checksum, and the correctness gate).
+
+    ─────────────────────────────────────────────────────────────────────────────────
+    ⚠️ TWO LOAD-BEARING GOTCHAS (this is WHY it wasn't a pbench experiment before):
+    ─────────────────────────────────────────────────────────────────────────────────
+    1. ENV VARS. NES_INMEM_PREFILL / NES_INMEM_REPEAT are read by InMemoryFileSource,
+       not by any pbench config key. They are forwarded via the `env:` block below,
+       which the bench-runner runner merges into the subprocess environment (env= on
+       the subprocess). WITHOUT NES_INMEM_PREFILL=1 the InMemory source falls back to
+       the per-buffer memcpy producer (~8.5 GB/s plateau) — a different, lower number.
+
+    2. THROUGHPUT CORRECTION. nes-bench-runner computes bytesPerSecond from the INPUT
+       FILE SIZE (5.368 GB) and is BLIND to NES_INMEM_REPEAT (which loops the prefilled
+       buffers N passes inside the source). The raw reported rate is thus 1/N of the
+       truth — e.g. @24w the raw engine-window line reads ~648 MB/s, which LOOKS like a
+       cliff but is 80x under. The bench-runner runner multiplies throughput_mbps by
+       NES_INMEM_REPEAT to recover the real rate = REPEAT x 5.368 GB / engine-window-s.
+       (If you ever read the raw bench-runner line by hand, apply the x N yourself.)
+
+    WHY NES_INMEM_REPEAT=80: a single pass at high W is ~0.16 s = pure pipeline ramp
+    (queue fill + JIT/cache/TLB/branch-predictor warming) -> the per-pass number
+    COLLAPSES with worker count. That "collapse" is a measurement artifact, debunked in
+    1_isolated_to_engine (engine-scaling-resolved). N>=80 gives a steady-state (>1s)
+    window. 80 passes @24w ~ 8.3 s; @1w ~ 120 s (slow but fine).
+
+    EXPECTED (steady-state, this Threadripper PRO 5965WX, cmake-build-release native,
+    reproduced 2026-06-27 directly via nes-bench-runner):
+      W=1  ~3.6   W=8  ~25    W=16 ~44    W=24 ~51   GB/s
+    These are ~85-96% of the isolated formatter-scaling ceiling (NOT collapsing). The
+    raw (uncorrected) systest line for the same runs reads ~1/80th of these.
+
+    HARNESS NOTES:
+      - mode: bench-runner (invokes nes-bench-runner, parses BenchRunnerResults.json's
+        engineBytesPerSecond/engineWindowSeconds). NOT systest: the `systest -b` path
+        runs InMemory through the embedded backend and yields a NULL benchmark result
+        (the formatter never runs — DIAG_SIMDINDEX calls=0). bench-runner actually
+        drains the engine and reports the true min-running->max-stop window.
+      - Sink = Void via a NAMED sink: the renderer emits `CREATE SINK mem5_sink(...)
+        TYPE Void;` + `... INTO mem5_sink;`. bench-runner's binder REJECTS an empty
+        inline sink (`INTO Void` / `INTO Void()` both fail to bind); a named Void sink
+        binds. (A non-empty inline sink like Checksum(...) binds fine — only the empty
+        case needs the named form; the renderer special-cases mode==bench-runner +
+        empty config.) Throughput excludes output formatting on purpose (Void) — this
+        measures the source+scan ceiling, not the sink.
+      - --data is passed explicitly as <build>/nes-systests/testdata (ENABLE_LARGE_TESTS
+        baked the large files there), so large/formatter/bench_5xUINT64_5g.csv resolves.
+      - operator_buffer_size does NOT set the prefill input buffer size; NES_INMEM_BUFSIZE
+        does (left at 131072 to match). The global pool count is largely inert here —
+        prefill bypasses the pool (source-owned buffers -> emit).
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 2
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: bench-runner
+  build: native
+  data_size: large
+  topology: single-node
+
+  # Forwarded into the nes-bench-runner subprocess by the bench-runner runner (env=).
+  env:
+    NES_INMEM_PREFILL: "1"
+    NES_INMEM_REPEAT: "80"
+    NES_INMEM_BUFSIZE: "131072"
+
+  worker:
+    query_engine:
+      number_of_io_threads: 1
+      pin_threads: false
+      invoke_mode_configuration: fnattr
+    default_query_execution:
+      operator_buffer_size: 131072          # 128 KiB
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 65536   # inert for prefill (pool bypassed)
+
+  query_config:
+    source_type: InMemory
+    sink_type: Void
+    input_formatter:
+      type: SIMDCSV
+    input_parser:
+      uint64: TracedUINT64
+
+variants:
+  - name: worker_scaling
+    description: "Prefill source+formatter ceiling vs worker threads (steady-state, REPEAT=80)"
+    query: formatter/inmem_prefill
+    axes:
+      x:
+        label: "Worker Threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [1, 2, 4, 8, 16, 24]
+    y:
+      metric: throughput_mbps
+      label: "Throughput (MB/s, REPEAT-corrected)"
+    visualization:
+      type: line_chart

@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: prof_person_star_native
+  # PROFILING WINDOW (not a benchmark): native person_star at W16 with a ~60s warm multi-pass
+  # window (NES_FILE_REPEAT=300 x 0.19s/pass) for nes-profile attach. WHY: in nexmark_native_vs_csv
+  # the native arm LOSES person_star 1.86x vs the elided CSV arm (0.194s vs 0.105s/pass; 20.6M vs
+  # 38.3M rows/s) — question: is the loss (a) pure byte bloat (368B fixed slots vs ~220B CSV rows;
+  # supply-bound at the warm read band) or (b) fixed-slot->VARSIZED materialization compute
+  # (strnlen-to-\x00 + child-buffer copy per string, 6 strings/row)? person_projection native ran
+  # 10.2 GB/s on the SAME file -> the supply band is >=10 GB/s here, so person_star's 7.6 GB/s is
+  # ~25% below supply => real compute drag; the profile attributes it.
+  # EXPECT: DataSrc read-copy (__memmove/_copy_to_iter) ~flat vs person_projection; WorkerThreads
+  # dominated by the varsized materialization frames (readSpanningRecord / string copy / child
+  # buffer alloc) + CSV output serialization of strings.
+  #
+  # RESULTS (2026-07-08, perf 10s @ W16 + contrast profile of person_projection native):
+  #   person_star:   process 3.13 cores; IOThread_0 = 33.5% of samples (~1.05 cores, PEGGED;
+  #     _copy_to_iter 24.4%) ; 16 workers ~2 cores TOTAL (~0.13 each). DSO: kernel 52.6%,
+  #     JIT 20.5%, worker-bin 10.6%, vdso 8.4% (clock), libc 6.6%. IPC 1.49, cache-miss 14.3%.
+  #   person_proj:   process 2.60 cores; IOThread_0 = 34.8% (~0.90 cores; _copy_to_iter 23.2%);
+  #     IPC 0.92.
+  # VERDICT — the EXPECT was WRONG: workers are NOT the bottleneck. Native person_star is
+  # PRODUCER/READ-bound: a single IOThread does the page-cache->pool _copy_to_iter for the 1.67x
+  # bloated .nes. Decomposition of the 1.86x loss vs elided CSV: (1) byte bloat 1.67x (dominant,
+  # 256B extra slot ~60% padding); (2) io-core-per-byte rises 1.57x under busy workers (1.05
+  # cores@7.57 GB/s star vs 0.90@10.2 proj — pool/queue coupling, not copy work); (3) worker
+  # compute (varsized materialization + CSV string serialize) fits in ~2 of 16 cores. LEVERS:
+  # length-prefixed varsized native encoding (file -> ~0.9 GB, likely flips person_star to a
+  # native WIN); the known pread/mmap zero-copy read lever (single-io-thread copy is the shared
+  # warm-read ceiling for every single-source run).
+  description: "60s warm window: native person_star W16 for perf attach (not a benchmark)"
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: native
+  topology: single-node
+  completion_timeout_s: 300
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SystemNative, string_length: "16,32,32,16,4,256" }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  generator:
+    repeat: 300
+variants:
+  - name: person_star_native_window
+    query: nexmark/person_star
+    axes:
+      x:
+        label: "worker threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [16]
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: bar_chart }

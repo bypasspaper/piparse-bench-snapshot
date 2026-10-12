@@ -1,0 +1,197 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: nes_vs_flink_csv_json
+  description: >
+    NES vs FLINK HEAD-TO-HEAD, csv -> json, on the STATELESS all_queries_benchmark variants
+    (2026-07-14, user request). Both engines read the SAME csv files and serialize full JSON
+    output into a void sink: NES = worker-cli fast stack (all_queries protocol: W16 pinned +
+    CCX queues, io=1, fnattr, 128KiB, SIMDCSV fast parsers) with output_formatter JSON into
+    Monitoring; Flink = mode flink (PyFlink 2.1.3, streaming, max-efficiency knobs) with
+    flink_output_format json_blackhole = Flink's real JsonRowDataSerializationSchema into the
+    custom void sink (flink-ext/pbench-flink-ext.jar - REBUILD with flink-ext/build.sh after
+    a pyflink bump; the renderer errors if missing).
+    SCOPE: stateless variants ONLY (handover CSV_TO_JSON §13-14 plan) - state-bound queries
+    are format-irrelevant (proven csv-vs-native 2026-07-13) and their Flink ports need
+    watermark/window-semantics correctness work that is its own project.
+    FAIRNESS NOTES:
+    - Compare on throughput_mbps (same csv bytes both arms; NES generator.repeat multiplies
+      bytes AND rows consistently; the Flink series pins repeat:1 - flink reads the file once).
+    - Flink is single-thread parse-bound on one csv stream (~110 MB/s; flink_vs_nes_q1 law:
+      architectural, do NOT shard the file); NES parallel-parses the same stream at W16.
+      Also: csv parsing runs on Flink's fetcher thread and OVERLAPS the task-thread JSON
+      serialization (~480-540 ns/row/thread law), so selective filters ride the parse bound.
+    - JSON keys differ slightly (NES: qualified sink identifiers e.g. bid$auctionId; Flink:
+      catalog sink_schema names e.g. bid.auctionId) - same magnitude, note when quoting
+      output-volume-bound gaps.
+    - q10_datetime: NES CASTFROMUNIXTS == Flink DATE_FORMAT(TO_TIMESTAMP_LTZ(ts,3),
+      ISO-8601, 24 chars) with table.local-time-zone=UTC forced by the driver.
+    CORRECTNESS (validated 2026-07-14 before first run): Flink filter counts == independent
+    awk ground truth on bid_6GB.csv (bid_filter_eq 758 == catalog, q2_filter_proj 1511777 ==
+    catalog, q2_original 55, q14_calc 52106704 = 28% selectivity so json volume matters);
+    person 4000000 / q22 31300000 == catalog; q10 dt sample '2025-05-06T19:47:27.787Z' = 24
+    chars, matches NES CASTFROMUNIXTS byte-for-byte.
+    EXPECTED RUNTIME: ~55-70 min total (Flink q10 is the long pole, ~3 min/rep).
+    completion_timeout_s 900 bounds any single stuck rep on both runners. PRE-FLIGHT:
+    pkill -x main; jar built; LF datasets guard after any build-dir wipe. LAUNCH WITH
+    `pbench run --detach` (own-session re-exec, logfile, immediate return) - supervised
+    background tasks got killed ~20 min in twice before the flag existed.
+    EXPECTED (2026-07-14 first full run, MB/s csv-input, 3-rep medians, NES / Flink / ratio):
+    person_projection 8891/298/30x, person_star 6136/207/30x, bid_ts_projection 7919/134/59x,
+    bid_filter_eq 8176/106/77x, bid_star 5766/65/89x, q1_price 5234/62/85x,
+    q2_filter_proj 8247/123/67x, q2_original 8267/125/66x, q14_calc 6776/119/57x,
+    q10_datetime 755/37/20x, q22_concat 6426/95/67x. GEOMEAN 54x (range 20-89x).
+    SHAPE: Flink = min(parse bound ~105-135 on bid rows, json wall ~540 ns/row when fully
+    materializing -> 62-65, java DATE_FORMAT wall -> 37); person rows are per-ROW bound
+    (~1.4 Mrows/s -> higher MB/s on 219 B rows). NES = 5.2-8.9 GB/s except q10 755
+    (CASTFROMUNIXTS per-row invoke is NES's own datetime wall -> ratio compresses to 20x).
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    # all_queries fast-stack superset; unused type keys inert; bool MUST be TracedBOOL.
+    input_parser:
+      uint64: TracedUINT64
+      int64: TracedINT64
+      int32: FastINT32
+      int16: TracedINT16
+      uint32: TracedUINT32
+      uint16: TracedUINT16
+      f64: EiselFloatF64
+      f32: EiselFloatF32
+      bool: TracedBOOL
+    output_formatter: { type: JSON }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+
+# NES gets steady-state via replay on stateless scans (all_queries protocol); the Flink
+# entry pins repeat 1 (flink reads the file once - bytes/rows accounting must match).
+_series_engines_r24: &engines_r24
+  label: "engine"
+  explicit:
+    - name: NebulaStream
+      baseline: true
+      overrides: { generator.repeat: 24 }
+    - name: Flink
+      system: flink
+      overrides:
+        mode: flink
+        flink_execution_mode: streaming
+        flink_output_format: json_blackhole
+        generator.repeat: 1
+
+_series_engines_r4: &engines_r4
+  label: "engine"
+  explicit:
+    - name: NebulaStream
+      baseline: true
+      overrides: { generator.repeat: 4 }
+    - name: Flink
+      system: flink
+      overrides:
+        mode: flink
+        flink_execution_mode: streaming
+        flink_output_format: json_blackhole
+        generator.repeat: 1
+
+_axes_x: &w16_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [16]
+
+_y: &mbps_y { metric: throughput_mbps, label: "Throughput (MB/s, csv input bytes)" }
+
+variants:
+  - name: person_projection
+    description: "SELECT id FROM person - 1 fixed col of a varsized schema"
+    query: nexmark/person_projection
+    axes: { x: *w16_x, series: *engines_r24 }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: person_star
+    description: "SELECT * FROM person - full varsized materialization, string-escape-heavy json"
+    query: nexmark/person_star
+    axes: { x: *w16_x, series: *engines_r24 }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: bid_ts_projection
+    description: "SELECT timestamp FROM bid - 1-of-4 strict projection"
+    query: nexmark/bid_ts_projection
+    axes: { x: *w16_x, series: *engines_r24 }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: bid_filter_eq
+    description: "SELECT * WHERE auctionId = 1000 - point filter (758 rows out)"
+    query: nexmark/bid_filter_eq
+    axes: { x: *w16_x, series: *engines_r24 }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: bid_star
+    description: "Q0: SELECT * FROM bid - full json materialization of 184M rows"
+    query: nexmark/bid_star
+    axes: { x: *w16_x, series: *engines_r24 }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: q1_price
+    description: "Q1: price * 908/1000 - float codec + json"
+    query: nexmark/q1_price
+    axes: { x: *w16_x, series: *engines_r24 }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: q2_filter_proj
+    description: "Q2 (repo shape): auctionId,price WHERE %123 (1.51M rows out)"
+    query: nexmark/q2_filter_proj
+    axes: { x: *w16_x, series: *engines_r24 }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: q2_original
+    description: "Q2 (paper shape): 5-way OR point selection"
+    query: nexmark/q2_original
+    axes: { x: *w16_x, series: *engines_r24 }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: q14_calc
+    description: "q14: computed-float range filter"
+    query: nexmark/q14_calc
+    axes: { x: *w16_x, series: *engines_r24 }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: q10_datetime
+    description: "q10: ms-epoch -> ISO-8601 string reformat (both engines, UTC)"
+    query: nexmark/q10_datetime
+    axes: { x: *w16_x, series: *engines_r24 }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: q22_concat
+    description: "q22: CONCAT(channel,url) over string-bearing bid (repeat 4 - 3.6GB file)"
+    query: nexmark/q22_concat
+    axes: { x: *w16_x, series: *engines_r4 }
+    y: *mbps_y
+    visualization: { type: grouped_bar }

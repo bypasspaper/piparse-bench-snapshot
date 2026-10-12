@@ -1,0 +1,98 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: csv_json_gate_ab
+  description: >
+    A/B of the representation-compatibility gate on the csv->json VARSIZED path, IN ONE BINARY (HEAD,
+    gate present) by toggling INPUT_FORMATTER.ASSUME_CLEAN_STRINGS.
+      scan_baseline = SIMDCSV(csv) -> JSON, assume_clean_strings=FALSE => the per-row jsonSpanNeedsEscape
+                      scan + escape path (the pre-gate behaviour for a lazy varsized -> JSON string).
+      passthrough   = SIMDCSV(csv) -> JSON, assume_clean_strings=TRUE  => CSV strings asserted CLEAN, so
+                      the JSON output formatter raw-forwards them verbatim (skips the scan) = the win.
+    Same binary, same data (bid_strings_3GB.csv, 3.60GB, 31.3M rows, escape-free), only the input-formatter
+    config differs -> isolates the gate exactly. bid passthrough (channel+url VARSIZED). r6 fullopt, W1,
+    single-node/FUSED (where the raw-forward fast path applies), 128KiB buffers, governor performance,
+    n=5 median. Both arms read the SAME 3.60GB CSV, so throughput MB/s is directly comparable.
+    RUN: cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+      experiments/csv_json_gate_ab.yaml --build-dir ~/work/nebulastream-public/cmake-build-release \
+      --worker-port 9099
+    RESULT (2026-07-30, tip feb8de577a, cmake-build-release): WASH. passthrough_q scan 1443.6 vs passthrough
+      1463.8 MB/s = +1.4%; star_q 1403.1 vs 1400.2 = -0.2% (n=5, within noise). PROFILE (csv_json_scan_prof.yaml
+      + nes-profile port 9099): jsonSpanNeedsEscape is <0.5% (NOT in top-20) -- the workload is INPUT-bound
+      (SimdCsv::indexBandInto 16.6% + computeBlocksAvx2 3.2% ~= 20% CSV index, __memmove_avx 14.2% copies,
+      _copy_to_iter 11.5% read; IPC 2.17). The escape scan the gate removes was never the bottleneck, so
+      skipping it does not move throughput. The prior Phase-4 prototype's "+63%" (887->1479) was a confounded
+      baseline. The gate is correct + adds the csv->json capability but is throughput-neutral here.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 5
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: true
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: BlockingFile
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    output_formatter: { type: JSON }
+    input_parser: { uint64: TracedUINT64, int64: TracedINT64, int32: FastINT32, int16: TracedINT16, uint32: TracedUINT32, uint16: TracedUINT16, bool: TracedBOOL, f64: EiselFloatF64, f32: EiselFloatF32 }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s on 3.60GB CSV input)" }
+
+_gate_series: &gate_series
+  label: "gate"
+  explicit:
+    - name: scan_baseline
+      baseline: true
+      overrides:
+        data_size: csv
+        query_config.input_formatter: { type: SIMDCSV, allow_commas_in_strings: false, assume_clean_strings: false }
+        query_config.output_formatter: { type: JSON }
+    - name: passthrough
+      overrides:
+        data_size: csv
+        query_config.input_formatter: { type: SIMDCSV, allow_commas_in_strings: false, assume_clean_strings: true }
+        query_config.output_formatter: { type: JSON }
+
+variants:
+  - name: passthrough_q
+    description: "csv->json bid passthrough (channel+url VARSIZED): scan vs assume-clean passthrough"
+    query: nexmark/bid_json_passthrough
+    axes: { x: *noop_x, series: *gate_series }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: star_q
+    description: "csv->json bid SELECT * (6 fields, 2 varsized): scan vs assume-clean passthrough"
+    query: nexmark/bid_json_star
+    axes: { x: *noop_x, series: *gate_series }
+    y: *tput_y
+    visualization: { type: grouped_bar }

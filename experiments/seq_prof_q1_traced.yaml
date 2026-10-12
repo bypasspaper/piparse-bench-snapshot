@@ -1,0 +1,84 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: seq_prof_q1_traced
+  description: >
+    PROFILING harness (session 2026-07-04): sequential IoUringFile + SequentialCSV on Nexmark-Q1 (FLOAT),
+    for a call-tree profile of the single sequential thread. NOT a throughput datapoint -- purpose is to
+    attach perf (`--call-graph dwarf`, LBR is empty on AMD) to the DataSrc thread and read off whether the
+    FLOAT (de)serialize dominates. Q1 chosen because EiselFloatF64 (input) and ZMIJF64 (output) are NOT
+    JIT-traced -> they appear as REAL SYMBOLS in the caller tree (the int fields JIT-inline into opaque
+    blocks). Monitoring sink + CSV output = the "double parse" (parse price in, re-serialize price out).
+
+    This is the SAME sequential arm as q1_seq_vs_parallel_iouring (IoUringFile O_DIRECT + regbuf + QD64,
+    zero-copy in-place accumulator, W1) so the read cost is attributed correctly (io_uring O_DIRECT DMA,
+    NOT a pread/ifstream copy -- profiling BlockingFile instead would inflate the read fraction).
+
+    WINDOW: warm (cold_read false) + generator.repeat=8 (NES_FILE_REPEAT). IF IoUringFile honors the
+    seek-back-on-EOF replay, that is ~8x bid_6GB ~= 75 s @ 675 MB/s -- a long steady window. IF it does
+    NOT loop (O_DIRECT source may not seek back), the run is a single ~9.5 s pass -> still enough for a
+    ~7 s record; attach FAST. completion_timeout generous.
+
+    GOTCHAS: default_max_inflight_buffers=128 (>=2*QD) or open() deadlocks; global_buffer_alignment=512
+    for O_DIRECT+regbuf; `pkill -x main` pre-flight, :8080 free. Sequential formatter needs a
+    dedicated-thread blocking source (IoUringFile qualifies).
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: false
+  completion_timeout_s: 300
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    global_buffer_alignment: 512
+    number_of_buffers_in_global_buffer_manager: 2048
+    default_max_inflight_buffers: 128
+  query_config:
+    source_type: IoUringFile
+    sink_type: Monitoring
+    input_formatter: {type: SequentialCSV, threading_mode: sequential}
+    input_parser:
+      uint64: TracedUINT64
+      int32: TracedINT32
+      int64: TracedINT64
+      f64: TracedFloatF64
+    output_formatter: {type: CSV}
+    output_parser:
+      f64: ZMIJF64
+  generator:
+    repeat: 8
+    mode: burst
+    rate: 1000000
+  worker_env:
+    NES_IOURING_DIRECT: 1
+    NES_IOURING_QD: 64
+    NES_IOURING_REGBUF: 1
+
+variants:
+  - name: seq_prof_q1_traced
+    description: "WARM bid_6GB xN, W1 IoUringFile/SequentialCSV Q1 float -- perf target (call tree)"
+    query: nexmark/q1_price
+    axes:
+      x:
+        label: "config"
+        explicit:
+          - name: "seq_q1_traced"
+            baseline: true
+            overrides: {}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

@@ -1,0 +1,52 @@
+query:
+  name: debs_complex_union
+  description: "DEBS: UNION with addition of new field in inner queries"
+
+  sql: |
+    SELECT
+    source,
+    producerId,
+    groupId,
+    producedPower,
+    timestamp as ts
+    FROM (
+    SELECT *, UINT64(1) AS source
+    FROM windTurbines
+    UNION
+    SELECT *, UINT64(2) AS source
+    FROM solarPanels
+    )
+
+  sources:
+    - name: windTurbines
+      timestamp_field: 3
+      schema:
+        - { name: producerId, type: INT32, not_null: true }
+        - { name: groupId, type: INT32, not_null: true }
+        - { name: producedPower, type: FLOAT64, not_null: true }
+        - { name: timestamp, type: UINT64, not_null: true }
+      data:
+        large:
+          file: large/debs/WIND_TURBINES_TOPIC_5M.csv
+          size_bytes: 5078961
+
+    - name: solarPanels
+      schema:
+        - { name: producerId, type: INT32, not_null: true }
+        - { name: groupId, type: INT32, not_null: true }
+        - { name: producedPower, type: FLOAT64, not_null: true }
+        - { name: timestamp, type: UINT64, not_null: true }
+      data:
+        large:
+          file: large/debs/SOLAR_PANELS_TOPIC_1G.csv
+          size_bytes: 1073741824
+
+  sink_schema:
+    - { name: source, type: UINT64, not_null: true }
+    - { name: producerId, type: INT32, not_null: true }
+    - { name: groupId, type: INT32, not_null: true }
+    - { name: producedPower, type: FLOAT64, not_null: true }
+    - { name: ts, type: UINT64, not_null: true }
+
+  validation:
+    large: { tuples: 42900001, checksum: 79036140333 }

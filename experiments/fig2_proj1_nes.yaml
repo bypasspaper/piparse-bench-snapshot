@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: fig2_proj1_nes
+  description: >
+    Fig2 PROJECTION field sweep (2026-09-26): SELECT c0 FROM t over N=1..10 FLOAT64 columns (multicol/proj1_nN,
+    ONE output field, ~200 MB per dataset), csv->json, InMemory prefill W1, two NES rungs x 10 reps.
+    Hypothesis (author, from uncompiled_vs_compiled_fieldsweep 2026-08-12): with one output field the BYPASS (lazy)
+    arm degrades much more slowly in rows/s with N than in the full-projection sweep (fig2_fieldsweep_v2: lazy 2.7
+    ns/field = index + copy + JSON key per field), because only the delimiter INDEX grows with N (~1 ns/field); the
+    NAIVE arm still parses all N fields (no pushdown) -> ~84 ns/field. Flink companion: fig2_proj1_flink.yaml.
+    Rungs: naive = SequentialUncompiledOldCSV + JSONUncompiled + NES_{INPUT,OUTPUT}_CODEC=original + EMPTY parser
+    overrides, repeat 5; compiled_lazy = SequentialCSV defaults (lazy pushdown + passthrough), repeat 300 (projection
+    lazy is faster than full-projection lazy; 300 passes keep the sink window >= ~5 s). generator.repeat MUST equal
+    worker_env.NES_INMEM_REPEAT. Same binary as fig2_fieldsweep_v2 (cmake-build-release 2026-09-03). Per-run
+    artifacts (threadcpu.csv, sink csv) persist under results/artifacts/fig2_proj1_nes/<run_id>/.
+    Pre-flight: pkill -9 -x main; verify :9099 free (ghost-worker bug, see fig1_fig2_teaser_2026-09-25.md).
+    RUN: cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run experiments/fig2_proj1_nes.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mrows_s
+  higher_is_better: true
+  repetitions: 10
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: false
+  completion_timeout_s: 600
+  overload: false
+  worker:
+    query_engine: {number_of_worker_threads: 1, number_of_io_threads: 1, invoke_mode_configuration: fnattr, pin_threads: false, admission_queue_size: 1024}
+    default_query_execution: {operator_buffer_size: 131072, execution_mode: COMPILER}
+    number_of_buffers_in_global_buffer_manager: 16384
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: {type: SequentialCSV, threading_mode: sequential}
+    input_parser: {f64: EiselFloatF64}
+    output_formatter: {type: JSON}
+    output_parser: {f64: ZMIJF64}
+  generator: {repeat: 300, mode: burst, rate: 1000000}
+  worker_env: {NES_INMEM_PREFILL: '1', NES_INMEM_REPEAT: '300', NES_INMEM_BUFSIZE: '131072'}
+_q: &q [multicol/proj1_n1, multicol/proj1_n2, multicol/proj1_n3, multicol/proj1_n4, multicol/proj1_n5, multicol/proj1_n6, multicol/proj1_n7, multicol/proj1_n8, multicol/proj1_n9, multicol/proj1_n10]
+_x: &x {label: "source fields N", explicit: [{name: sweep, baseline: true, overrides: {}}]}
+_rungs: &rungs
+  label: "NES rung"
+  explicit:
+    - name: naive
+      baseline: true
+      overrides:
+        query_config.input_formatter: {type: SequentialUncompiledOldCSV, threading_mode: sequential}
+        query_config.output_formatter: {type: JSONUncompiled}
+        query_config.input_parser: {}
+        query_config.output_parser: {}
+        worker_env.NES_INPUT_CODEC: original
+        worker_env.NES_OUTPUT_CODEC: original
+        generator.repeat: 5
+        worker_env.NES_INMEM_REPEAT: '5'
+    - name: compiled_lazy
+      overrides: {}
+variants:
+  - name: proj1
+    description: "SELECT c0 over N=1..10 columns, naive vs compiled lazy"
+    queries: *q
+    axes: {x: *x, series: *rungs}
+    y: {metric: throughput_mrows_s, label: "records/s"}
+    visualization: {type: grouped_bar}

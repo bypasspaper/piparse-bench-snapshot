@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+query:
+  name: gridsweep_float_n2_w16
+  description: >
+    2-D grid point: input schema 2 field(s), each value exactly 16 digit(s) (~16 B/value); the query
+    PROJECTS + parses ONLY field c0 (c0*FLOAT64(1) defeats lazy elision on that one field; the other 1 are
+    indexed but neither parsed nor output). So INDEXING scales with N (all 2 delimiters written to the
+    band) while parse+serialize stays constant at 1 FLOAT64 field. Throughput = full 2-field row bytes /
+    time. Data large/multicol/n2_w16.csv (209715332 B). Delimiter density 1/(16+1); index degrades below ~8 B/value.
+  sql: "SELECT c0 * FLOAT64(1) AS c0 FROM t"
+  sources:
+    - name: t
+      schema:
+        - { name: c0, type: FLOAT64, not_null: true }
+        - { name: c1, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/multicol/n2_w16.csv
+          size_bytes: 209715332
+  sink_schema:
+    - { name: c0, type: FLOAT64, not_null: true }

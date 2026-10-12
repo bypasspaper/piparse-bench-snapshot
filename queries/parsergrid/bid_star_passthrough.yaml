@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+query:
+  name: bid_star_passthrough
+  description: >
+    PASSTHROUGH side of the parse-vs-forward A/B on the realistic nexmark bid row (SELECT *). csv->json,
+    SELECT all 4 fields UNCHANGED -> their raw input text is forwarded input->output (no parse, no
+    re-serialize). Compare vs parsergrid/bid_star_materialize (same 4 fields materialised). Data bid_250M.csv.
+    Fields aliased (AS) so the sink schema (plain names) matches the qualified passthrough names.
+  sql: "SELECT timestamp AS timestamp, auctionId AS auctionId, bidder AS bidder, price AS price FROM bid"
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/multicol/bid_250M.csv
+          size_bytes: 252114512
+  sink_schema:
+    - { name: timestamp, type: UINT64, not_null: true }
+    - { name: auctionId, type: INT32, not_null: true }
+    - { name: bidder, type: INT32, not_null: true }
+    - { name: price, type: FLOAT64, not_null: true }

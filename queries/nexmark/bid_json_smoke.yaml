@@ -1,0 +1,27 @@
+query:
+  name: nexmark_bid_json_smoke
+  description: >
+    SMOKE: bid passthrough over a 200K-row NDJSON version of bid_strings (bid_smoke.json) to validate the
+    SequentialJSON File source + pbench json-input path end-to-end before generating the full datasets.
+  sql: |
+    SELECT auctionId, bidder, price, channel, url FROM bid
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+        - { name: channel, type: VARSIZED, not_null: true }
+        - { name: url, type: VARSIZED, not_null: true }
+      data:
+        large:
+          file: large/nexmark/bid_smoke.json
+          size_bytes: 34774860
+          rows: 200000
+  sink_schema:
+    - { name: bid.auctionId, type: INT32, not_null: true }
+    - { name: bid.bidder, type: INT32, not_null: true }
+    - { name: bid.price, type: FLOAT64, not_null: true }
+    - { name: bid.channel, type: VARSIZED, not_null: true }
+    - { name: bid.url, type: VARSIZED, not_null: true }

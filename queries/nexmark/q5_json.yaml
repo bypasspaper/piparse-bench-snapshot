@@ -1,0 +1,41 @@
+query:
+  name: nexmark_q5_json
+  description: >
+    Nexmark Q5 (sliding-window aggregation + self-join on bid) over NDJSON input. Stateful, event-time
+    windows on the timestamp field (bid_strings spans ~3402 s -> meaningful windows). Reads only 4 of the
+    6 JSON fields (timestamp, auctionId, bidder, price); CHANNEL/URL keys are ignored. JSON->{JSON,CSV}.
+    NOTE: no validation checksum here -- this runs on bid_strings (31.3M rows), not the bid_6GB the
+    recorded q5 checksums were taken on; we measure throughput, not correctness reference.
+  sql: |
+    SELECT start, end, auctionId, num, max_tmp
+    FROM (SELECT auctionId, COUNT(auctionId) AS num, start, end
+    FROM bid
+    GROUP BY auctionId
+    WINDOW SLIDING(timestamp, SIZE 10 SEC, ADVANCE BY 2 SEC))
+    INNER JOIN (SELECT MAX(num_ids) AS max_tmp, start, end
+    FROM
+    (SELECT auctionId, COUNT(auctionId) AS num_ids, start
+    FROM bid
+    GROUP BY auctionId
+    WINDOW SLIDING(timestamp, SIZE 10 SEC, ADVANCE BY 2 SEC))
+    WINDOW TUMBLING(start, SIZE 2 SEC))
+    ON num == max_tmp
+    WINDOW TUMBLING(start, SIZE 2 SEC)
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/nexmark/bid_strings_3GB.json
+          size_bytes: 5567181395
+          rows: 31300000
+  sink_schema:
+    - { name: bidbid.start, type: UINT64, not_null: true }
+    - { name: bidbid.end, type: UINT64, not_null: true }
+    - { name: bid.auctionId, type: INT32, not_null: true }
+    - { name: bid.num, type: UINT64, not_null: true }
+    - { name: bid.max_tmp, type: UINT64, not_null: true }

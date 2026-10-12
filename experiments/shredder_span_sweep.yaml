@@ -1,0 +1,109 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: shredder_span_sweep
+  description: >
+    SPANNING-TUPLE-SIZE sweep (e2e), LOCK_FREE vs LOCKING SequenceShredder, on the fully-optimized system
+    (both source-emit batching commits + raised in-flight bound = the 1.34x anchor config). One variant per
+    ROW size (4/16/40/80/160/320/640 KB); buffer size is the X axis (4 KiB / 8 KiB) so span count = rowKB/buf.
+    SELECT id (shredder-isolated: the string spans buffers so the shredder reassembles, but only the 8-byte id
+    is emitted -> no output copy). Single source, W24, K=32, deep prefill queue. CLEANER than the first pass:
+    repetitions 3->6 and NES_INMEM_REPEAT 8->16 (window ~1.8-2 s, kills the high-thread ramp noise, esp. the
+    span-10 point). The 80KB/4KiB point IS the known e2e 1.34x. Reads: LF/LK ratio + p50/p99 latency per
+    (row size, buffer); does LOCKING drop further than LF at the extra-large 640 KB spans? check
+    processing_time_s > 1.5 and avgDepthOnFastAcquire >> 1 / fast% ~100 (worker-bound) in worker.log.
+    RUN: cd ~/work/piparse-bench && pkill -9 -x main; PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/shredder_span_sweep.yaml --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+    (capture FULL stdout -- do NOT pipe through tail/grep -m.)
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 6
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  worker:
+    query_engine:
+      number_of_worker_threads: 24
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      pin_threads: false
+      ccx_aware_task_queues: false
+      admission_queue_size: 32768
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 8192
+    dump_compilation_result: NONE
+    default_max_inflight_buffers: 8192
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false }
+    output_formatter: { type: CSV }
+    input_parser: {}
+    output_parser: {}
+  generator:
+    repeat: 16
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 16
+    NES_SOURCE_EMIT_BATCH: 32
+    NES_LOG_LEVEL: WARNING
+    NES_TASKQUEUE_STATS: 1
+_span_series: &span_series
+  label: "shredder"
+  explicit:
+    - name: lock_free
+      baseline: true
+      overrides:
+        query_config.input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false, sequence_shredder_mode: LOCK_FREE }
+    - name: locking
+      overrides:
+        query_config.input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false, sequence_shredder_mode: LOCKING }
+_buf_x: &buf_x
+  label: "input buffer size (bytes)"
+  parameter: worker_env.NES_INMEM_BUFSIZE
+  values: ["4096", "8192"]
+variants:
+  - name: row_004k
+    query: formatter/bigstr_id_pass_4k
+    axes: { x: *buf_x, series: *span_series }
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: line_chart }
+  - name: row_016k
+    query: formatter/bigstr_id_pass_16k
+    axes: { x: *buf_x, series: *span_series }
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: line_chart }
+  - name: row_040k
+    query: formatter/bigstr_id_pass_40k
+    axes: { x: *buf_x, series: *span_series }
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: line_chart }
+  - name: row_080k
+    query: formatter/bigstr_id_pass_80k
+    axes: { x: *buf_x, series: *span_series }
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: line_chart }
+  - name: row_160k
+    query: formatter/bigstr_id_pass_160k
+    axes: { x: *buf_x, series: *span_series }
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: line_chart }
+  - name: row_320k
+    query: formatter/bigstr_id_pass_320k
+    axes: { x: *buf_x, series: *span_series }
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: line_chart }
+  - name: row_640k
+    query: formatter/bigstr_id_pass_640k
+    axes: { x: *buf_x, series: *span_series }
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: line_chart }

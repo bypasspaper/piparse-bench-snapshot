@@ -1,0 +1,40 @@
+# q2-mod FULL-SCALE ANCHOR: SELECT auctionId, price WHERE auctionId % 123 = 0 over
+# bid_strings_3GB.csv (SequentialCSV, engine-default parsers, Checksum sink w/ legacy CSV
+# materialization). MEASURED 2026-08-04: count 257350 (~0.82% selectivity), checksum 246669329.
+# Use as the q2-mod correctness gate for the 480-run matrix (any input format must reproduce it).
+# Also the proof that %-filter + INT32 parse over the full file is engine-clean (the pbench
+# 'fast integer parse' failures were a data_size->json misresolution, NOT an engine bug).
+query: SELECT auctionId, price FROM bid WHERE auctionId % INT32(123) = INT32(0) INTO bidChecksum
+logical:
+  - name: bid
+    schema:
+      - { name: timestamp, type: UINT64 }
+      - { name: auctionId, type: INT32 }
+      - { name: bidder, type: INT32 }
+      - { name: price, type: FLOAT64 }
+      - { name: channel, type: VARSIZED }
+      - { name: url, type: VARSIZED }
+physical:
+  - logical: bid
+    type: BlockingFile
+    host: "localhost:8080"
+    parser_config:
+      type: SequentialCSV
+      threading_mode: SEQUENTIAL
+    source_config:
+      file_path: __TESTDATA__/large/nexmark/bid_strings_3GB.csv
+sinks:
+  - name: bidChecksum
+    type: Checksum
+    host: "localhost:8080"
+    schema:
+      - { name: bid$auctionId, type: INT32 }
+      - { name: bid$price, type: FLOAT64 }
+    config:
+      file_path: __OUTPUT__
+      legacy_output_format: CSV
+    ## the nes-cli Sink decoder requires the key even when empty
+    parser_config: {}
+workers:
+  - host: "localhost:8080"
+    max_operators: 10000

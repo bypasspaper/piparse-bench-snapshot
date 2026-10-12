@@ -1,0 +1,89 @@
+experiment:
+  name: flink_vs_nes_q1
+  # ============================================================================================
+  # HEAD-TO-HEAD: NebulaStream vs Apache Flink on Nexmark Q1 (stateless FLOAT projection).
+  # First cross-engine comparison in pbench. Both engines read the SAME 4-column bid_6GB.csv
+  # (183,991,721 rows) and compute price*908/1000.
+  #
+  #   NebulaStream — worker-cli, File source, Monitoring sink, the fully-optimized fast-CSV stack
+  #     (SIMDCSV + TracedUINT64/TracedINT32/EiselFloatF64 input parsers, ZMIJF64 output). Runs on
+  #     whatever NES branch is currently built (no `branch:` -> BranchContext is a no-op); developed
+  #     against benchmark-piparse-lazyparse-fast-csv.
+  #   Flink — mode: flink (PyFlink Table API, see runners/flink.py). filesystem CSV source ->
+  #     projection -> blackhole sink, STREAMING, run at MAX EFFICIENCY (object-reuse, operator
+  #     chaining, checkpointing off, latency-metrics off — see render_flink).
+  #
+  # FAIRNESS (parse-focused): Flink's blackhole discards output; NES's Monitoring measures without
+  # writing output tuples but DOES run the CSV output-formatter (price re-serialized). So NES does
+  # slightly MORE work than Flink here — the comparison is conservative for NES. Headline metric =
+  # throughput_mrows_s (format-invariant, cleanest cross-engine); MB/s reported alongside.
+  # Correctness is tuple-count parity (filterless projection -> out == in == wc -l), NOT NES's
+  # engine-specific checksum (unreproducible in Flink). Verify with the driver's `--count` mode.
+  #
+  # THE RESULT (2026-07-08): on a SINGLE stream, NES parallel-parses (sequential read -> shared
+  # task queue -> M worker threads parse in parallel), scaling to ~6 GB/s at 8 threads. Flink
+  # couples read+parse inside one non-splittable split -> ONE thread reads AND parses -> FLAT at
+  # ~110 MB/s regardless of parallelism (1->8), execution mode (streaming/batch), or memory/buffer
+  # config (verified with every efficiency knob on). This ~54x gap is NOT under-tuning and NOT
+  # fixable by config — it is the architectural difference (parallel parsing of one stream) that
+  # this benchmark exists to show. DO NOT "fix" it by sharding the file or opening N connections:
+  # that manufactures parallelism by turning one stream into many, which measures a different,
+  # easier workload. Keep it a single stream.
+  #
+  # Both series run in ONE `pbench run` (shared run_group) so the `aggregated` view keeps both bars.
+  # ============================================================================================
+  description: "Head-to-head Q1 throughput: NebulaStream (fast-CSV) vs Apache Flink (PyFlink)"
+  primary_metric: throughput_mrows_s
+  higher_is_better: true
+  repetitions: 5
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  worker:
+    query_engine:
+      number_of_worker_threads: 8
+      number_of_io_threads: 1
+      pin_threads: false
+      invoke_mode_configuration: fnattr
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, f64: EiselFloatF64}
+    output_formatter: {type: CSV}
+    output_parser: {f64: ZMIJF64}
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: q1_throughput
+    description: "q1 price projection: NebulaStream vs Flink, 8 threads / parallelism 8"
+    query: nexmark/q1_price
+    axes:
+      x:
+        label: "query"
+        explicit:
+          - {name: q1_price, overrides: {}}
+      series:
+        label: "engine"
+        explicit:
+          - {name: NebulaStream, baseline: true, overrides: {}}
+          - name: Flink
+            system: flink
+            overrides:
+              mode: flink
+              flink_execution_mode: streaming
+    y: {metric: throughput_mrows_s, label: "Throughput (Mrows/s)"}
+    visualization: {type: grouped_bar, y_label: "Throughput (Mrows/s)"}

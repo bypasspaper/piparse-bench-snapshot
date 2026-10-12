@@ -1,0 +1,84 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: sg1_investigation
+  description: >
+    sg1 inversion investigation (2026-07-14): in the stateful csv->json head-to-head, NES
+    sg1 (keyless AVG, hop 1h/1s, x120 tiling) ran 11.2 MB/s at W16 - 2.5x SLOWER than
+    single-thread Flink (27.9). Suspected: the known W16 trigger-path lock contention
+    (folly::Synchronized slice/window maps, cf. lrb_q1 futex-convoy finding). This sweep
+    measures the worker-count curve at io=1 (protocol otherwise identical to the
+    head-to-head: csv in, JSON output formatter, Monitoring sink, fast stack, repeat=1).
+    MEASURED 2026-07-14 (MB/s, 3-rep medians):
+    - PRE-FIX: W1 17.2, W2 13.3, W4 12.4, W5 10.3, W8 11.7, W16 9.9 - MONOTONIC
+      anti-scaling from W1; even 1io+5w (10.3) does not rescue it; W1 < Flink.
+    - DIAGNOSIS (perf, W16: IPC 0.68, 20K cs/s, 5/17 threads busy; symbols: triggerSlices
+      18.6%, kernel spinlock 15.2%, folly SharedMutex 5.6%; W1: triggerSlices 55.8% SELF):
+      AggregationOperatorHandler::triggerSlices took rollingAverageNumberOfKeys.wlock()
+      (hashmap-sizing statistic!) once per populated hashmap PER SLICE PER WINDOW =
+      ~36M exclusive locks per run at W1 (9x input rows), a SharedMutex convoy at W>=2.
+    - POST-FIX (nes 95b575b93b - one stat sample per window): W1 29.7 (+73%, BEATS
+      single-thread Flink 27.9), W2 20.4, W4 18.3, W5 18.2, W8 16.8, W16 21.4 (+116%).
+      Residual anti-scaling = DefaultTimeBasedSliceStore folly::Synchronized maps (the
+      known lrb futex-convoy) + O(slices x workers) trigger walk; HJOperatorHandler has
+      the IDENTICAL per-hashmap wlock pattern (join-side follow-up).
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: xlarge
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser:
+      uint64: TracedUINT64
+      int64: TracedINT64
+      int32: FastINT32
+      int16: TracedINT16
+      uint32: TracedUINT32
+      uint16: TracedUINT16
+      f64: EiselFloatF64
+      f32: EiselFloatF32
+      bool: TracedBOOL
+    output_formatter: { type: JSON }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+
+variants:
+  - name: w_sweep
+    description: "sg1 NES: worker-thread sweep at io=1 (head-to-head protocol otherwise)"
+    query: smartgrid/sg1_global_avg
+    axes:
+      x:
+        label: "worker threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [1, 2, 4, 5, 8, 16]
+      series:
+        label: "engine"
+        explicit:
+          - { name: NebulaStream, baseline: true, overrides: {} }
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: line_chart }

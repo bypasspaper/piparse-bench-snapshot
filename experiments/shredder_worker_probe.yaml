@@ -1,0 +1,81 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: shredder_worker_probe
+  description: >
+    x-axis = number of worker threads (the scalability view). TWO fixed spans compared: 12 KB row = ~3
+    buffers @4 KiB (moderate) and 80 KB row = ~20 buffers @4 KiB (heavy spanning). 4 KiB buffer, DEEP queue
+    (in-flight 8192, K=32). LOCK_FREE vs LOCKING. The LF/LK gap grows with worker count as the shredder mutex
+    saturates; expect the 20-span curve to diverge FASTER/WIDER than the 3-span (more cross-buffer coordination
+    per tuple). Firm-up quality: reps=6, full worker range incl W20. Reads: throughput MB/s + p50/p99 latency
+    vs workers, per (span, mode).
+    RUN: cd ~/work/piparse-bench && pkill -9 -x main; PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/shredder_worker_probe.yaml --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 6
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  worker:
+    query_engine:
+      number_of_worker_threads: 24
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      pin_threads: false
+      ccx_aware_task_queues: false
+      admission_queue_size: 32768
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 8192
+    dump_compilation_result: NONE
+    default_max_inflight_buffers: 8192
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false }
+    output_formatter: { type: CSV }
+    input_parser: {}
+    output_parser: {}
+  generator:
+    repeat: 8
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 8
+    NES_INMEM_BUFSIZE: 4096
+    NES_SOURCE_EMIT_BATCH: 32
+    NES_LOG_LEVEL: WARNING
+    NES_TASKQUEUE_STATS: 1
+_wk_x: &wk_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: ["1", "2", "4", "8", "12", "16", "20", "24"]
+_span_series: &span_series
+  label: "shredder"
+  explicit:
+    - name: lock_free
+      baseline: true
+      overrides:
+        query_config.input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false, sequence_shredder_mode: LOCK_FREE }
+    - name: locking
+      overrides:
+        query_config.input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false, sequence_shredder_mode: LOCKING }
+variants:
+  - name: workers_12k_span3
+    query: formatter/bigstr_id_pass_12k
+    axes: { x: *wk_x, series: *span_series }
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: line_chart }
+  - name: workers_80k_span20
+    query: formatter/bigstr_id_pass_80k
+    axes: { x: *wk_x, series: *span_series }
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: line_chart }

@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+query:
+  name: parsergrid_bid_f64
+  description: >
+    REALISTIC counterpart to the parser grid: nexmark bid (4 fields, ~33 B/row), csv->json, materialising
+    ONLY price (price * 1.0) so exactly ONE FLOAT64 is parsed+serialized per row -- the float codec is a
+    small slice of per-row work (index 4 fields + 3 int passthroughs). Same parser grid as parsergrid_f64;
+    the 19x isolated spread should collapse toward the true e2e magnitude. Data bid_250M.csv (7.5M rows).
+  sql: "SELECT timestamp AS timestamp, auctionId AS auctionId, bidder AS bidder, price * FLOAT64(1) AS price FROM bid"
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/multicol/bid_250M.csv
+          size_bytes: 252114512
+  sink_schema:
+    - { name: timestamp, type: UINT64, not_null: true }
+    - { name: auctionId, type: INT32, not_null: true }
+    - { name: bidder, type: INT32, not_null: true }
+    - { name: price, type: FLOAT64, not_null: true }

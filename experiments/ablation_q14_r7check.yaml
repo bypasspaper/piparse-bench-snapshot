@@ -1,0 +1,83 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: ablation_q14_r7check
+  description: >
+    One-rung control: q14 r7 (parallel W16, overload, full opt) with ccx_aware_task_queues=TRUE,
+    to check whether the ~4% gap vs the v2 handover's 7083 MB/s (which used ccx-aware queues) is
+    explained by that knob. Compare median here against the ccx-OFF r7 from run_group
+    20260717T175752 (reps 6692/6783/6971, median 6783). 5 reps for a tighter median.
+    Everything else identical to ablation_q14_fast r7. Medium data, repeat 40, port 9099.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 5
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  # overload:true lives in the rung override, NOT here: pbench validation (validation.py) merges
+  # only defaults+variant overrides, and a stale rule (parameters.yaml: overload:true requires
+  # branch benchmark-piparse-lazyparse) rejects it in defaults on our -fast-csv branch. The working
+  # ablation_q14_fast/q2o_fast experiments dodge it the same way.
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: true
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false }
+    output_formatter: { type: CSV }
+    input_parser:
+      uint64: TracedUINT64
+      int64: TracedINT64
+      int32: FastINT32
+      int16: TracedINT16
+      uint32: TracedUINT32
+      uint16: TracedUINT16
+      bool: TracedBOOL
+      f64: EiselFloatF64
+      f32: EiselFloatF32
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 40
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+
+_ladder: &ladder
+  label: "config"
+  explicit:
+    - name: r7_ccx_on
+      baseline: true
+      overrides:
+        worker.query_engine.ccx_aware_task_queues: true
+        overload: true
+
+variants:
+  - name: nx_q14_calc
+    description: "q14 r7 full-opt, ccx-aware queues ON"
+    query: nexmark/q14_calc
+    axes: { x: *noop_x, series: *ladder }
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: grouped_bar }

@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: gridsweep_int_pass_iouring
+  description: >
+    NVMe-ceiling test: passthrough SELECT c0 (index 32 + copy, no parse) on the ~12GB n32_w20 file, SEQUENTIAL
+    formatter, W1. InMemory-prefill compute ceiling for this shape = ~8.7 GB/s (index-bound). NVMe ~6.9 GB/s.
+    IoUringFile arm = O_DIRECT + registered fixed buffers (zero-copy DMA, no read-copy on the source thread);
+    BlockingFile arm = pread copy (source thread pays the copy inline). Single COLD pass per rep (IoUringFile
+    ignores NES_FILE_REPEAT). If IoUring ~6.9 GB/s -> NVMe-bound (compute keeps up); if lower -> compute/copy
+    bound. GOTCHAS: global_buffer_alignment=512 (REGBUF O_DIRECT 512-align, else falls back non-fixed);
+    default_max_inflight_buffers=128 (>=2*QD or open() deadlocks); pkill -x main pre-flight; :8080 free.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: true
+  completion_timeout_s: 180
+  worker:
+    query_engine: {number_of_worker_threads: 1, number_of_io_threads: 1, invoke_mode_configuration: fnattr, pin_threads: false, admission_queue_size: 1024}
+    default_query_execution: {operator_buffer_size: 131072, execution_mode: COMPILER}
+    number_of_buffers_in_global_buffer_manager: 4096
+    global_buffer_alignment: 512
+    default_max_inflight_buffers: 128
+  query_config:
+    source_type: IoUringFile
+    sink_type: Monitoring
+    input_formatter: {type: SequentialCSV, threading_mode: sequential}
+    input_parser: {uint64: TracedUINT64}
+    output_formatter: {type: CSV}
+  generator: {repeat: 1, mode: burst, rate: 1000000}
+variants:
+  - name: gridsweep_int_pass_iouring
+    description: "N32/W20 passthrough cold read: IoUringFile(O_DIRECT+REGBUF) vs BlockingFile(pread)"
+    query: gridsweep/int_pass_n32_w20_big
+    axes:
+      x:
+        label: "source"
+        explicit:
+          - name: "IoUringFile_ODIRECT_regbuf"
+            baseline: true
+            overrides:
+              query_config.source_type: IoUringFile
+              worker_env.NES_IOURING_DIRECT: "1"
+              worker_env.NES_IOURING_REGBUF: "1"
+              worker_env.NES_IOURING_QD: "16"
+          - name: "BlockingFile_pread"
+            overrides:
+              query_config.source_type: BlockingFile
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

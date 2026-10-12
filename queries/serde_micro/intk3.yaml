@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: Apache-2.0
+# serde-micro INT: SELECT * on K=3 int64 columns. CSV + SystemNative binary twin.
+query:
+  name: serde_micro_intk3
+  description: "serde micro: SELECT * on 3 int64 cols (passthrough projection)"
+  sql: |
+    SELECT * FROM src
+  sources:
+    - name: src
+      schema:
+        - { name: c0, type: INT64, not_null: true }
+        - { name: c1, type: INT64, not_null: true }
+        - { name: c2, type: INT64, not_null: true }
+      data:
+        csv:
+          file: large/serde_micro/intk3.csv
+          size_bytes: 59332338
+          rows: 2000000
+        native:
+          file: large/serde_micro/intk3.nes
+          size_bytes: 48000000
+          rows: 2000000
+  sink_schema:
+    - { name: src.c0, type: INT64, not_null: true }
+    - { name: src.c1, type: INT64, not_null: true }
+    - { name: src.c2, type: INT64, not_null: true }

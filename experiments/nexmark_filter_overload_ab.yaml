@@ -1,0 +1,113 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: nexmark_filter_overload_ab
+  description: >
+    FOLLOW-UP to nexmark_native_vs_csv: can LAZY overloaded comparisons close the ~2x native-vs-csv
+    gap on the selective filters WITHOUT parsing? bid_filter_eq (auctionId = 1000, 758 survivors)
+    exists in Nexmark_with_varsized.test precisely as the LAZY_INT_OVERLOADS demo; q2_filter_proj
+    (auctionId % 123, projected 2 cols) is the mod-filter analogue (modulo needs the VALUE, so lazy
+    eq-overload should NOT help there — negative control unless the overload machinery still parses
+    lazily per-survivor).
+
+    ARMS: csv_optimized (baseline, parses auctionId per row) / csv_lazy_overload (overload: true ->
+    lazy_int/float/uint_overloads in parser_config; the eq compares raw bytes) / native (context).
+    W in {1, 16}: W16 is SUPPLY-COMPRESSED (the parent run showed all bid scans pinned at the
+    ~5.6-6.6 GB/s warm single-source band), W1 exposes the honest per-row parse cost.
+
+    EXPECT (predict-first): at W16 overload recovers little (csv filter_eq 6185 MB/s is already
+    near the ~6.5 supply band -> maybe +5%); at W1 the filter is compute-bound so overload should
+    remove the INT32 parse per row — but the SIMD index still runs (field framing is needed even
+    for lazy values), so the win is bounded by parse share ~ (parse)/(index+parse+framing). If W1
+    overload ~= W1 baseline, the filter was index/framing-bound all along and lazy comparison is
+    not the lever. q2 overload expected ~= baseline (modulo defeats the eq overload).
+
+    GOTCHAS: same stack/data as nexmark_native_vs_csv (SIMDCSV, allow_commas=false, fast parsers,
+    128 KiB buffers, pool 16384, NES_FILE_REPEAT=4). W1 csv passes are slow (~30-60 s/rep) — the
+    bulk of the runtime. Native arm carries the known ~0.006% duplication bug (negligible here).
+
+    RESULTS (2026-07-08, reps=3 median MB/s, 36/36 ok):
+      bid_filter_eq  W1:  csv 2587.5 | overload 2707.7 (+4.6%) | native 5106.8
+      bid_filter_eq  W16: csv 5511.7 | overload 6257.5 (+13.5%*) | native 6728.0
+      q2_filter_proj W1:  csv 2662.4 | overload 2668.9 (+0.2%)  | native 5177.0
+      q2_filter_proj W16: csv 5913.2 | overload 6337.9 (+7.2%*) | native 8067.7
+    VERDICT: lazy eq-overload is NOT the lever. At W1 (the honest, uncompressed signal) it buys
+    +4.6% on the eq filter and exactly nothing on the mod filter (negative control confirmed) —
+    the CSV filter cost is dominated by the SIMD delimiter INDEX + framing + read, not the single
+    INT32 value parse. (*) The W16 gains are supply-band/contention effects, not parse savings
+    (baseline W16 reps scattered 5478-6366; W1 shows the truth).
+    NEW FLOOR NUMBERS (W1, per-row): csv 14.0 ns/row vs native 4.7 ns/row on the 4-col bid schema
+    -> the entire CSV tax on a projective filter is ~9.3 ns/row of index+framing. Native-vs-csv
+    time-speedup at W1 = 2.88x (eq) / 2.84x (mod), compressed to ~2x at W16 by the supply band.
+    NEXT LEVER (if pursued): push the filter below full row framing (compare raw bytes inside the
+    band scan / prune rows before index materialization), not cheaper value parsing.
+  primary_metric: processing_time_s
+  higher_is_better: false
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  completion_timeout_s: 600
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser: { uint64: TracedUINT64, int32: FastINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  generator:
+    repeat: 4
+
+_series: &overload_series
+  label: "parse strategy"
+  explicit:
+    - name: csv_optimized
+      baseline: true
+      overrides: {}
+    - name: csv_lazy_overload
+      overrides:
+        overload: true
+    - name: native
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "16,32,32,16,4,256" }
+        query_config.input_parser: {}
+
+_axes_x: &w_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [1, 16]
+
+_y: &time_y { metric: processing_time_s, label: "Processing time (s)" }
+
+variants:
+  - name: bid_filter_eq
+    description: "eq point filter — the lazy-overload showcase"
+    query: nexmark/bid_filter_eq
+    axes: { x: *w_x, series: *overload_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  - name: q2_filter_proj
+    description: "mod filter — negative control (modulo needs the parsed value)"
+    query: nexmark/q2_filter_proj
+    axes: { x: *w_x, series: *overload_series }
+    y: *time_y
+    visualization: { type: grouped_bar }

@@ -1,0 +1,68 @@
+query:
+  name: nexmark_q5_window_join
+  description: "Nexmark Q5: sliding window aggregation on bid with join-like semantics"
+
+  sql: |
+    SELECT start, end, auctionId, num, max_tmp
+    FROM (SELECT auctionId, COUNT(auctionId) AS num, start, end
+    FROM bid
+    GROUP BY auctionId
+    WINDOW SLIDING(timestamp, SIZE 10 SEC, ADVANCE BY 2 SEC))
+    INNER JOIN (SELECT MAX(num_ids) AS max_tmp, start, end
+    FROM
+    (SELECT auctionId, COUNT(auctionId) AS num_ids, start
+    FROM bid
+    GROUP BY auctionId
+    WINDOW SLIDING(timestamp, SIZE 10 SEC, ADVANCE BY 2 SEC))
+    WINDOW TUMBLING(start, SIZE 2 SEC))
+    ON num == max_tmp
+    WINDOW TUMBLING(start, SIZE 2 SEC)
+
+  flink_sql: |
+    SELECT CAST(TIMESTAMPDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', CAST(c.window_start AS TIMESTAMP(3))) AS BIGINT) * 1000 AS `start`, CAST(TIMESTAMPDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', CAST(c.window_end AS TIMESTAMP(3))) AS BIGINT) * 1000 AS `end`, c.auctionId, c.num, m.max_tmp
+    FROM (SELECT window_start, window_end, auctionId, COUNT(auctionId) AS num
+    FROM TABLE(HOP(TABLE bid, DESCRIPTOR(`__rt`), INTERVAL '2' SECOND, INTERVAL '10' SECOND))
+    GROUP BY window_start, window_end, auctionId) c
+    INNER JOIN (SELECT window_start, window_end, MAX(num_ids) AS max_tmp
+    FROM (SELECT window_start, window_end, auctionId, COUNT(auctionId) AS num_ids
+    FROM TABLE(HOP(TABLE bid, DESCRIPTOR(`__rt`), INTERVAL '2' SECOND, INTERVAL '10' SECOND))
+    GROUP BY window_start, window_end, auctionId) inner_counts
+    GROUP BY window_start, window_end) m
+    ON c.window_start = m.window_start AND c.window_end = m.window_end AND c.num = m.max_tmp
+
+  sources:
+    - name: bid
+      flink_rowtime: { column: timestamp, delay: "0.001 SECOND" }
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/nexmark/bid_6GB.csv
+          size_bytes: 6442450944
+          rows: 183991721
+        small:
+          file: large/nexmark/bid_653M.csv
+          size_bytes: 666738765
+          rows: 18106394
+        native:
+          # 183,991,721 rows x 24 B (uint64,int32,int32,float64 packed LE); generated from
+          # bid_6GB.csv via nes-systests/testdata/small/csv_to_binary.py
+          file: large/nexmark/bid_6GB.nes
+          size_bytes: 4415801304
+          rows: 183991721
+
+  sink_schema:
+    - { name: bidbid.start, type: UINT64, not_null: true }
+    - { name: bidbid.end, type: UINT64, not_null: true }
+    - { name: bid.auctionId, type: INT32, not_null: true }
+    - { name: bid.num, type: UINT64, not_null: true }
+    - { name: bid.max_tmp, type: UINT64, not_null: true }
+
+  validation:
+    large: { tuples: 10589, checksum: 23372488 }
+    small: { tuples: 243784, checksum: 390918029 }
+    # native == large: numeric roundtrip; aggregate output independent of input format
+    native: { tuples: 10589, checksum: 23372488 }

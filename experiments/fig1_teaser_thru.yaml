@@ -1,0 +1,82 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: fig1_teaser_thru
+  description: >
+    Fig1 TEASER clean throughput (2026-09-28, no profiler, 3 reps) for the bar annotations: q0 SELECT *, Q2-ORIGINAL
+    (5-way OR point selection = NEXMark Q2 as published; overload ON on the optimised arm -> raw-digit compares, no parse)
+    and YSB (single pass, large), each naive (OldCSV + JSONUncompiled + original codecs) vs optimised (SequentialCSV lazy,
+    fnattr, fast codecs, JSON, overload: true; inline_invoke_calls/trace_constant_bytes default true).
+    InMemory prefill W1. q0/q2og on medium (bid_1GB): naive repeat 1, optimised repeat 60; YSB repeat 1 both.
+  primary_metric: throughput_mrows_s
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  cold_read: false
+  completion_timeout_s: 900
+  overload: true
+  worker:
+    query_engine: {number_of_worker_threads: 1, number_of_io_threads: 1, invoke_mode_configuration: fnattr, pin_threads: false, admission_queue_size: 1024}
+    default_query_execution: {operator_buffer_size: 131072, execution_mode: COMPILER}
+    number_of_buffers_in_global_buffer_manager: 16384
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: {type: SequentialCSV, threading_mode: sequential}
+    input_parser: {uint64: TracedUINT64, int64: TracedINT64, int32: FastINT32, int16: TracedINT16, uint32: TracedUINT32, uint16: TracedUINT16, bool: TracedBOOL, f64: EiselFloatF64, f32: EiselFloatF32}
+    output_formatter: {type: JSON}
+    output_parser: {f64: ZMIJF64, f32: ZMIJF32}
+  generator: {repeat: 60, mode: burst, rate: 1000000}
+  worker_env: {NES_INMEM_PREFILL: '1', NES_INMEM_REPEAT: '60', NES_INMEM_BUFSIZE: '131072'}
+_naive_ovr: &naive_ovr
+  query_config.input_formatter: {type: SequentialUncompiledOldCSV, threading_mode: sequential}
+  query_config.output_formatter: {type: JSONUncompiled}
+  query_config.input_parser: {}
+  query_config.output_parser: {}
+  worker_env.NES_INPUT_CODEC: original
+  worker_env.NES_OUTPUT_CODEC: original
+  overload: false
+_x: &x {label: config, explicit: [{name: run, baseline: true, overrides: {}}]}
+_y: &y {metric: throughput_mrows_s, label: "records/s"}
+_arms_replay: &arms_replay
+  label: arm
+  explicit:
+    - name: naive
+      baseline: true
+      overrides: {<<: *naive_ovr, generator.repeat: 1, worker_env.NES_INMEM_REPEAT: '1'}
+    - name: optimised
+      overrides: {}
+_arms_single: &arms_single
+  label: arm
+  explicit:
+    - name: naive
+      baseline: true
+      overrides: {<<: *naive_ovr, generator.repeat: 1, worker_env.NES_INMEM_REPEAT: '1'}
+    - name: optimised
+      overrides: {generator.repeat: 1, worker_env.NES_INMEM_REPEAT: '1'}
+variants:
+  - name: q0
+    description: "q0 SELECT * FROM bid (medium)"
+    query: nexmark/bid_star
+    axes: {x: *x, series: *arms_replay}
+    y: *y
+    visualization: {type: grouped_bar}
+  - name: q2og
+    description: "NEXMark Q2 original: 5-way OR point selection (medium)"
+    query: nexmark/q2_original
+    axes: {x: *x, series: *arms_replay}
+    y: *y
+    visualization: {type: grouped_bar}
+  - name: ysb
+    description: "YSB windowed count (large, single pass)"
+    query: yahoo/ysb_1k_varsized
+    overrides: {data_size: large}
+    axes: {x: *x, series: *arms_single}
+    y: *y
+    visualization: {type: grouped_bar}

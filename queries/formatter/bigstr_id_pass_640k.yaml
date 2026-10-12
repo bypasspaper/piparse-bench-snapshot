@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+# (id UINT64, s VARSIZED ~640KB) rows. SELECT id: span ~156 buffers @4KiB / ~78 @8KiB. Tiny id output
+# (no varsized copy) — one point on the spanning-tuple-size x-axis (the extra-large end).
+query:
+  name: bigstr_id_pass_640k
+  description: "SELECT id FROM (id, 640KB string): span ~156 buffers @4KiB, tiny id output (no varsized copy)."
+  sql: "SELECT id FROM src"
+  sources:
+    - name: src
+      schema:
+        - { name: id, type: UINT64, not_null: true }
+        - { name: s, type: VARSIZED, not_null: true }
+      data:
+        csv:
+          file: large/formatter/bigstr_id_640k_500m.csv
+          size_bytes: 524803990
+          rows: 820
+  sink_schema:
+    - { name: src.id, type: UINT64, not_null: true }

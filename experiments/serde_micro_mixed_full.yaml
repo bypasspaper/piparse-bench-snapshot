@@ -1,0 +1,375 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: serde_micro_mixed_full
+  description: >
+    Serde-overhead micro, MIXED-TYPE panels: i2f (int64 in -> TOFLOAT64 -> float64 JSON out) and
+    f2i (float64 in -> TOINT64 -> int64 JSON out). Companion to serde_micro_full (float) +
+    serde_micro_int_full (int): shows the FLOAT half alone (serialize in i2f, parse in f2i) bounds
+    the mixed pipeline from below. Same r3 footing (compiled default-invoke, no fnattr/inline/tcb,
+    InMemory W1); 4 arms x 20 K x 2 directions x 3 reps = 480 runs. NO naive arm (its story is told).
+    GOTCHAS: (1) needs the uncommitted TOFLOAT64/TOINT64 function plugins in the release binary --
+    if the worker rejects the query with FunctionNotImplemented, the binary is stale (build-dir
+    gotcha: ALWAYS NES_BUILD_DIR=cmake-build-release). (2) no_serde here is NOT a pure memcpy
+    passthrough: the cast forces a Map that rewrites every row -- that arm IS the cast-cost control;
+    compare it against the pure panels' no_serde to price the cast+Map overhead. (3) value
+    distributions shift on the serialize side vs the pure panels (ints cast to double are
+    integral-valued -> short ZMIJ output; floats [0,1e5) 6-decimals truncate to <=6-digit ints) --
+    footnote, don't compare serialize ns/field across panels at face value. (4) y=rows/s: decompose
+    divides throughput_mbps by per-arm INPUT bytes/row (native K*8, CSV size/2M) x REPEAT (20).
+    RUN: cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/serde_micro_mixed_full.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: default
+      inline_invoke_calls: false
+      trace_constant_bytes: false
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution: { operator_buffer_size: 131072, execution_mode: COMPILER }
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+    output_formatter: { type: JSON }
+    input_parser: {}
+    output_parser: {}
+  generator: { repeat: 1 }
+  worker_env: { NES_INMEM_PREFILL: 1, NES_INMEM_REPEAT: 20, NES_INMEM_BUFSIZE: 131072 }
+
+_iin: &iin { int64: FastINT64 }
+_fin: &fin { f64: EiselFloatF64 }
+_fout: &fout { f64: ZMIJF64 }
+
+# i2f: int parse side, float serialize side
+_arms_i2f: &arms_i2f
+  label: "serde arm"
+  explicit:
+    - name: no_serde
+      baseline: true
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "1" }
+        query_config.output_formatter: { type: NATIVE }
+        query_config.input_parser: {}
+        query_config.output_parser: {}
+    - name: only_deser
+      overrides:
+        data_size: csv
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false, eager_parse: true }
+        query_config.output_formatter: { type: NATIVE }
+        query_config.input_parser: *iin
+        query_config.output_parser: {}
+    - name: only_ser
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "1" }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: {}
+        query_config.output_parser: *fout
+    - name: serde
+      overrides:
+        data_size: csv
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false, eager_parse: true }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: *iin
+        query_config.output_parser: *fout
+
+# f2i: float parse side, int serialize side (default to_chars int output)
+_arms_f2i: &arms_f2i
+  label: "serde arm"
+  explicit:
+    - name: no_serde
+      baseline: true
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "1" }
+        query_config.output_formatter: { type: NATIVE }
+        query_config.input_parser: {}
+        query_config.output_parser: {}
+    - name: only_deser
+      overrides:
+        data_size: csv
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false, eager_parse: true }
+        query_config.output_formatter: { type: NATIVE }
+        query_config.input_parser: *fin
+        query_config.output_parser: {}
+    - name: only_ser
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "1" }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: {}
+        query_config.output_parser: {}
+    - name: serde
+      overrides:
+        data_size: csv
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false, eager_parse: true }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: *fin
+        query_config.output_parser: {}
+
+_noop_x: &noop_x { label: "config", parameter: topology, values: [single-node] }
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s)" }
+
+variants:
+  - name: i2f_k1
+    description: "K=1 int64 in -> FLOAT64 out (cheap parse, expensive float serialize)"
+    query: serde_micro/i2fk1
+    axes: { x: *noop_x, series: *arms_i2f }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: i2f_k2
+    description: "K=2 int64 in -> FLOAT64 out (cheap parse, expensive float serialize)"
+    query: serde_micro/i2fk2
+    axes: { x: *noop_x, series: *arms_i2f }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: i2f_k3
+    description: "K=3 int64 in -> FLOAT64 out (cheap parse, expensive float serialize)"
+    query: serde_micro/i2fk3
+    axes: { x: *noop_x, series: *arms_i2f }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: i2f_k4
+    description: "K=4 int64 in -> FLOAT64 out (cheap parse, expensive float serialize)"
+    query: serde_micro/i2fk4
+    axes: { x: *noop_x, series: *arms_i2f }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: i2f_k5
+    description: "K=5 int64 in -> FLOAT64 out (cheap parse, expensive float serialize)"
+    query: serde_micro/i2fk5
+    axes: { x: *noop_x, series: *arms_i2f }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: i2f_k6
+    description: "K=6 int64 in -> FLOAT64 out (cheap parse, expensive float serialize)"
+    query: serde_micro/i2fk6
+    axes: { x: *noop_x, series: *arms_i2f }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: i2f_k7
+    description: "K=7 int64 in -> FLOAT64 out (cheap parse, expensive float serialize)"
+    query: serde_micro/i2fk7
+    axes: { x: *noop_x, series: *arms_i2f }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: i2f_k8
+    description: "K=8 int64 in -> FLOAT64 out (cheap parse, expensive float serialize)"
+    query: serde_micro/i2fk8
+    axes: { x: *noop_x, series: *arms_i2f }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: i2f_k9
+    description: "K=9 int64 in -> FLOAT64 out (cheap parse, expensive float serialize)"
+    query: serde_micro/i2fk9
+    axes: { x: *noop_x, series: *arms_i2f }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: i2f_k10
+    description: "K=10 int64 in -> FLOAT64 out (cheap parse, expensive float serialize)"
+    query: serde_micro/i2fk10
+    axes: { x: *noop_x, series: *arms_i2f }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: i2f_k11
+    description: "K=11 int64 in -> FLOAT64 out (cheap parse, expensive float serialize)"
+    query: serde_micro/i2fk11
+    axes: { x: *noop_x, series: *arms_i2f }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: i2f_k12
+    description: "K=12 int64 in -> FLOAT64 out (cheap parse, expensive float serialize)"
+    query: serde_micro/i2fk12
+    axes: { x: *noop_x, series: *arms_i2f }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: i2f_k13
+    description: "K=13 int64 in -> FLOAT64 out (cheap parse, expensive float serialize)"
+    query: serde_micro/i2fk13
+    axes: { x: *noop_x, series: *arms_i2f }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: i2f_k14
+    description: "K=14 int64 in -> FLOAT64 out (cheap parse, expensive float serialize)"
+    query: serde_micro/i2fk14
+    axes: { x: *noop_x, series: *arms_i2f }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: i2f_k15
+    description: "K=15 int64 in -> FLOAT64 out (cheap parse, expensive float serialize)"
+    query: serde_micro/i2fk15
+    axes: { x: *noop_x, series: *arms_i2f }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: i2f_k16
+    description: "K=16 int64 in -> FLOAT64 out (cheap parse, expensive float serialize)"
+    query: serde_micro/i2fk16
+    axes: { x: *noop_x, series: *arms_i2f }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: i2f_k17
+    description: "K=17 int64 in -> FLOAT64 out (cheap parse, expensive float serialize)"
+    query: serde_micro/i2fk17
+    axes: { x: *noop_x, series: *arms_i2f }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: i2f_k18
+    description: "K=18 int64 in -> FLOAT64 out (cheap parse, expensive float serialize)"
+    query: serde_micro/i2fk18
+    axes: { x: *noop_x, series: *arms_i2f }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: i2f_k19
+    description: "K=19 int64 in -> FLOAT64 out (cheap parse, expensive float serialize)"
+    query: serde_micro/i2fk19
+    axes: { x: *noop_x, series: *arms_i2f }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: i2f_k20
+    description: "K=20 int64 in -> FLOAT64 out (cheap parse, expensive float serialize)"
+    query: serde_micro/i2fk20
+    axes: { x: *noop_x, series: *arms_i2f }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: f2i_k1
+    description: "K=1 float64 in -> INT64 out (expensive float parse, cheap int serialize)"
+    query: serde_micro/f2ik1
+    axes: { x: *noop_x, series: *arms_f2i }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: f2i_k2
+    description: "K=2 float64 in -> INT64 out (expensive float parse, cheap int serialize)"
+    query: serde_micro/f2ik2
+    axes: { x: *noop_x, series: *arms_f2i }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: f2i_k3
+    description: "K=3 float64 in -> INT64 out (expensive float parse, cheap int serialize)"
+    query: serde_micro/f2ik3
+    axes: { x: *noop_x, series: *arms_f2i }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: f2i_k4
+    description: "K=4 float64 in -> INT64 out (expensive float parse, cheap int serialize)"
+    query: serde_micro/f2ik4
+    axes: { x: *noop_x, series: *arms_f2i }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: f2i_k5
+    description: "K=5 float64 in -> INT64 out (expensive float parse, cheap int serialize)"
+    query: serde_micro/f2ik5
+    axes: { x: *noop_x, series: *arms_f2i }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: f2i_k6
+    description: "K=6 float64 in -> INT64 out (expensive float parse, cheap int serialize)"
+    query: serde_micro/f2ik6
+    axes: { x: *noop_x, series: *arms_f2i }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: f2i_k7
+    description: "K=7 float64 in -> INT64 out (expensive float parse, cheap int serialize)"
+    query: serde_micro/f2ik7
+    axes: { x: *noop_x, series: *arms_f2i }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: f2i_k8
+    description: "K=8 float64 in -> INT64 out (expensive float parse, cheap int serialize)"
+    query: serde_micro/f2ik8
+    axes: { x: *noop_x, series: *arms_f2i }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: f2i_k9
+    description: "K=9 float64 in -> INT64 out (expensive float parse, cheap int serialize)"
+    query: serde_micro/f2ik9
+    axes: { x: *noop_x, series: *arms_f2i }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: f2i_k10
+    description: "K=10 float64 in -> INT64 out (expensive float parse, cheap int serialize)"
+    query: serde_micro/f2ik10
+    axes: { x: *noop_x, series: *arms_f2i }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: f2i_k11
+    description: "K=11 float64 in -> INT64 out (expensive float parse, cheap int serialize)"
+    query: serde_micro/f2ik11
+    axes: { x: *noop_x, series: *arms_f2i }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: f2i_k12
+    description: "K=12 float64 in -> INT64 out (expensive float parse, cheap int serialize)"
+    query: serde_micro/f2ik12
+    axes: { x: *noop_x, series: *arms_f2i }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: f2i_k13
+    description: "K=13 float64 in -> INT64 out (expensive float parse, cheap int serialize)"
+    query: serde_micro/f2ik13
+    axes: { x: *noop_x, series: *arms_f2i }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: f2i_k14
+    description: "K=14 float64 in -> INT64 out (expensive float parse, cheap int serialize)"
+    query: serde_micro/f2ik14
+    axes: { x: *noop_x, series: *arms_f2i }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: f2i_k15
+    description: "K=15 float64 in -> INT64 out (expensive float parse, cheap int serialize)"
+    query: serde_micro/f2ik15
+    axes: { x: *noop_x, series: *arms_f2i }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: f2i_k16
+    description: "K=16 float64 in -> INT64 out (expensive float parse, cheap int serialize)"
+    query: serde_micro/f2ik16
+    axes: { x: *noop_x, series: *arms_f2i }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: f2i_k17
+    description: "K=17 float64 in -> INT64 out (expensive float parse, cheap int serialize)"
+    query: serde_micro/f2ik17
+    axes: { x: *noop_x, series: *arms_f2i }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: f2i_k18
+    description: "K=18 float64 in -> INT64 out (expensive float parse, cheap int serialize)"
+    query: serde_micro/f2ik18
+    axes: { x: *noop_x, series: *arms_f2i }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: f2i_k19
+    description: "K=19 float64 in -> INT64 out (expensive float parse, cheap int serialize)"
+    query: serde_micro/f2ik19
+    axes: { x: *noop_x, series: *arms_f2i }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: f2i_k20
+    description: "K=20 float64 in -> INT64 out (expensive float parse, cheap int serialize)"
+    query: serde_micro/f2ik20
+    axes: { x: *noop_x, series: *arms_f2i }
+    y: *tput_y
+    visualization: { type: grouped_bar }

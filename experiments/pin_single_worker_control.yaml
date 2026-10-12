@@ -1,0 +1,77 @@
+experiment:
+  name: pin_single_worker_control
+  description: >
+    CONTROL for the pinning-improves-latency hypothesis. Isolates SINGLE-WORKER pin_threads
+    on/off (migration-free pinning) from the shared-nothing per-CCX design that actually
+    delivered the §21r throughput win. Same config as the io8_w16 point of io_worker_split_sweep
+    (async File, 24 total threads, the throughput-optimal / worst-tail cell), 50/100 sources,
+    only pin_threads flips.
+
+    WHY THIS IS ONLY A CONTROL (not the real test): the engine pins io->cores [0,io),
+    workers->[io,io+w) from core 0. At io=8/w=16 that spans cores 0-23 = ALL 4 CCX, and there is
+    ONE global MPMC task queue, so a source's buffer (produced on some CCX) is drained by ANY
+    worker on ANY CCX -> cross-CCX handoff (DRAM round-trip) REMAINS even when pinned. Pinning here
+    only removes migration jitter; it does NOT make handoffs L3-local. The §21r per-CCX locality
+    (amp 3.7->1.54, +50-88%) needs SHARED-NOTHING separate worker processes (one queue each,
+    taskset-confined to a CCX) -- that is the follow-up experiment, not this one.
+
+    HYPOTHESIS: pin_threads=true gives at most a MODEST tail improvement (less scheduler jitter);
+    the ~11ms p99 plateau largely SURVIVES because it is cross-CCX-handoff / global-queue queueing,
+    not migration. If pinning DOES collapse the tail here, the mechanism is migration (simpler fix)
+    and the shared-nothing design may be unnecessary -- either outcome is decisive.
+
+    GOTCHAS: pin_threads=true pins 24 threads to cores 0-23 (no SMT oversubscription on this
+    24c/48t box, but spans all 4 CCX). Latency in us (sink fix); trust p50/p99/p999, not max.
+    warm CPU-bound File (no I/O parking).
+  primary_metric: p99_latency_us
+  higher_is_better: false
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 300
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 8
+      invoke_mode_configuration: fnattr
+      pin_threads: false          # overridden by series
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64}
+    output_formatter: {type: CSV}
+  generator:
+    repeat: 1
+
+variants:
+  - name: pin_onoff
+    description: "single-worker io=8/w=16, pin_threads off vs on, 50/100 sources"
+    query: nexmark/bid_passthrough_1gb
+    axes:
+      x:
+        label: "Concurrent Queries (= Sources)"
+        parameter: num_queries
+        values: [50, 100]
+      series:
+        label: "pin_threads"
+        parameter: worker.query_engine.pin_threads
+        values: [false, true]
+        baseline: false
+    y:
+      metric: p99_latency_us
+      label: "p99 latency (us)"
+    visualization:
+      type: line_chart

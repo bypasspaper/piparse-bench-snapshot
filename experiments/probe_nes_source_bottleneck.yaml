@@ -1,0 +1,103 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: probe_nes_source_bottleneck
+  description: >
+    Diagnose what caps NES at ~6 GB/s in the head-to-head (File source, warm page cache), W23
+    healthy, csv->json. Sweep source_type x number_of_io_threads on q0 (heavy 6-field JSON out)
+    and q_project (1-field out). Reads:
+      - if throughput RISES with io_threads or a different source_type -> the single-reader read
+        path is the cap (the head-to-head under-reports NES);
+      - if q_project >> q0 at the same source config -> q0 is (partly) OUTPUT-bound, not read-bound;
+      - baseline File/io1 should reproduce the head-to-head (~6.2 GB/s q0, ~7.9 q_project).
+    Read-relieved ceiling for the SAME query (from the ablation matrix, InMemorySource, W23):
+    csv->json q0 = 16.4 GB/s in. NES-only (no Flink/Spark). warm_read guarantees page cache.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  worker:
+    query_engine:
+      number_of_worker_threads: 23
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  # Only the MmapFile source reads these; File/BlockingFile ignore them. Prefault the whole mapping in open()
+  # (outside the measured window) so the zero-copy path is not charged on-demand minor page faults per window.
+  worker_env:
+    NES_MMAP_POPULATE: "1"
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser:
+      uint64: TracedUINT64
+      int64: TracedINT64
+      int32: FastINT32
+      int16: TracedINT16
+      uint32: TracedUINT32
+      uint16: TracedUINT16
+      f64: EiselFloatF64
+      f32: EiselFloatF32
+      bool: TracedBOOL
+    output_formatter: { type: JSON }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 4
+
+_series_src: &srcsweep
+  label: "source config"
+  explicit:
+    - name: File_io1
+      baseline: true
+      overrides: { query_config.source_type: File, worker.query_engine.number_of_io_threads: 1 }
+    - name: File_io2
+      overrides: { query_config.source_type: File, worker.query_engine.number_of_io_threads: 2 }
+    - name: File_io4
+      overrides: { query_config.source_type: File, worker.query_engine.number_of_io_threads: 4 }
+    - name: BlockingFile_io1
+      overrides: { query_config.source_type: BlockingFile, worker.query_engine.number_of_io_threads: 1 }
+    - name: BlockingFile_io4
+      overrides: { query_config.source_type: BlockingFile, worker.query_engine.number_of_io_threads: 4 }
+    # MmapFile = TRUE zero-copy: each 128 KiB buffer directly ALIASES an mmap window (no page-cache->buffer
+    # copy at all), vs File/BlockingFile which read(2) one copy into the buffer (the ~11 GB/s read wall).
+    # NES_MMAP_POPULATE prefaults the mapping outside the timed window (the mmap analog of a warm pool).
+    - name: MmapFile_zerocopy_io1
+      overrides: { query_config.source_type: MmapFile, worker.query_engine.number_of_io_threads: 1 }
+
+_axes_x: &w23_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [23]
+
+_y: &mbps_y { metric: throughput_mbps, label: "Throughput (MB/s, csv input bytes)" }
+
+variants:
+  - name: q0
+    description: "q0 SELECT * -> full 6-field JSON out (heavy output)"
+    query: nexmark/matrix/bidstr_q0
+    axes: { x: *w23_x, series: *srcsweep }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: q_project
+    description: "q_project SELECT price -> 1-field out (light output)"
+    query: nexmark/matrix/bidstr_qproject
+    axes: { x: *w23_x, series: *srcsweep }
+    y: *mbps_y
+    visualization: { type: grouped_bar }

@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+# serde-micro MIXED i2f: TOFLOAT64 cast on K=1 INT64 columns -> FLOAT64 output.
+# Reuses the pure-panel intk1 datasets; needs the TOFLOAT64 function plugin in the binary.
+query:
+  name: serde_micro_i2fk1
+  description: "serde micro mixed: int64 in -> FLOAT64 out (cheap parse, expensive float serialize), K=1"
+  sql: |
+    SELECT TOFLOAT64(c0) AS c0 FROM src
+  sources:
+    - name: src
+      schema:
+        - { name: c0, type: INT64, not_null: true }
+      data:
+        csv:
+          file: large/serde_micro/intk1.csv
+          size_bytes: 19777830
+          rows: 2000000
+        native:
+          file: large/serde_micro/intk1.nes
+          size_bytes: 16000000
+          rows: 2000000
+  sink_schema:
+    - { name: c0, type: FLOAT64, not_null: true }

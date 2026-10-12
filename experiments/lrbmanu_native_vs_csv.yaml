@@ -1,0 +1,168 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: lrbmanu_native_vs_csv
+  description: >
+    LINEAR ROAD + MANUFACTURING parsed-vs-native (session 2026-07-13, completes the suite
+    matrix alongside nexmark/CM/YSB/SmartGrid). LRB Q1 = grouped AVG(speed) sliding
+    5min/1s over a NESTED PROJECTION (position/5280) with a HAVING filter (both new plan
+    elements for the matrix); LRB Q2 = grouped COUNT sliding 30s/1s by (vehicle, highway,
+    direction, posDiv) - 1499 vehicles x ~20 posDiv = high group cardinality;
+    Manufacturing = KEYLESS 5-aggregate (AVG/SUM/MIN/COUNT/SUM) sliding 1min/1s.
+    Smoke variants (Checksum, seed/large files) gate the measured variants in one run;
+    recorded systest counts exist for all three (70916 / 491460 / 221338).
+
+    DATA: LRB seed is 557KB / 16384 rows over 519s (the "560K" in the name is KILOBYTES -
+    the old catalog size 587202560 read it as MB and inflated every past MB/s number
+    1024x); measured LRB runs use the x200 forward-shifted tiling (3.28M rows, 28.9h
+    span, 111MB csv / 79MB nes, footprint 1.417). Manufacturing is REAL scale: 1.43GB /
+    22.39M rows over 14.8 days - no tiling, single pass IS steady state; footprint 1.598
+    (14-col narrow-int text is digit-dense).
+
+    EXPECT (predict-first, from the session law): all three state/window-bound -> rows/s
+    ratio ~parity, per-byte ~= 1/footprint-independent; manufacturing is the most
+    input-heavy (1.43GB against a window count of ~221K x 60 slices x keyless = light
+    state) - it may be the one suite query where the footprint (1.6x) shows up in rows/s
+    like ysb_1k did; LRB Q1 (5min/1s, 300 slices/window) leans trigger-bound like sg2.
+    dd-CLASS RULE applies to any per-byte reading finer than 10% (files not dd-measured
+    in this run - rows/s-vs-footprint is the robust comparison).
+
+    GOTCHAS: LRB catalogs point at the _lf copy (CRLF trap on position INT32); int32
+    needs FastINT32-or-Traced (fast stack below); manufacturing int fields have LEADING
+    ZEROS ("0071") - digit parsers fine; AVG outputs FLOAT64 (sink schemas already so);
+    generator repeat MUST stay 1 everywhere (all stateful; replay corrupts event-time
+    windows); f32 AVG checksums may be combine-order nondeterministic (CM lesson) -
+    counts are the gate; HAVING is applied post-agg (LRB Q1 output 70916 of ~3900
+    windows x ~18 groups).
+
+    RESULTS (2026-07-13, 36/36 ok, reps=3 median):
+    SMOKE: all three counts match recorded EXACTLY (70916 / 491460 / 221338), all
+    byte-identical across arms AND reps; lrb_q2 checksum 991265094 = exact catalog match
+    (all-int output); lrb_q1 188848188 and mfg 815963074 differ from systest recordings
+    by the usual cross-harness sink constant (deterministic here, arm-equal). HAVING +
+    nested-projection + keyless multi-agg all build and run in both formats.
+    MEASURED:            CSV wall  Mr/s  | NAT wall  Mr/s  | Mr/s x (NAT/CSV)
+      lrb_q1 (5min/1s)  | 13.3s    0.246 | 19.2s    0.171  |  0.69  (!)
+      lrb_q2 (30s/1s)   |  2.79s   1.174 |  2.79s   1.176  |  1.00
+      mfg    (1min/1s)  |  5.42s   4.13  |  5.65s   3.97   |  0.96
+    READING: (1) all three state-bound, footprints (1.417/1.598) invisible - the session
+    law holds. (2) lrb_q1 is the STRONGEST instance yet of the trigger-contention effect
+    (sg1/sg3 mechanism, sg1_granularity_ab): 300 slices/window x ~40 groups grouped
+    sliding = the heaviest trigger path in the matrix, and the native arm's cheap
+    ingestion makes it 31% SLOWER - csv's parse cost as accidental pacing again. Expect
+    this row to flip toward parity if/when the slice-trigger locking is fixed; it is an
+    ENGINE scalability marker, not a format cost. (3) lrb_q2 walls are IDENTICAL to the
+    hundredth of a second - the cleanest state-bound parity in the whole matrix.
+    (4) mfg at 0.96 = the familiar mild native deficit on trigger-heavy keyless windows
+    (cm_original pattern).
+  primary_metric: processing_time_s
+  higher_is_better: false
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser:
+      uint64: TracedUINT64
+      int32: FastINT32
+      int16: TracedINT16
+      f32: EiselFloatF32
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+
+_series_large: &large_series
+  label: "input format"
+  explicit:
+    - name: csv_optimized
+      baseline: true
+      overrides: {}
+    - name: native
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "16" }
+        query_config.input_parser: {}
+
+_series_xlarge: &xlarge_series
+  label: "input format"
+  explicit:
+    - name: csv_optimized
+      baseline: true
+      overrides: {}
+    - name: native
+      overrides:
+        data_size: xlarge_native
+        query_config.input_formatter: { type: SystemNative, string_length: "16" }
+        query_config.input_parser: {}
+
+_axes_x: &w16_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [16]
+
+_y: &time_y { metric: processing_time_s, label: "Processing time (s)" }
+
+variants:
+  - name: smoke_lrb_q1
+    description: "GATE (seed): recorded count 70916; HAVING + nested projection plan builds"
+    query: lrb/q1_avg_speed
+    overrides: { query_config.sink_type: Checksum }
+    axes: { x: *w16_x, series: *large_series }
+    y: *time_y
+  - name: smoke_lrb_q2
+    description: "GATE (seed): recorded count 491460"
+    query: lrb/q2_vehicle_count
+    overrides: { query_config.sink_type: Checksum }
+    axes: { x: *w16_x, series: *large_series }
+    y: *time_y
+  - name: smoke_mfg
+    description: "GATE (large): recorded count 221338"
+    query: manufacturing/window_multi_agg
+    overrides: { query_config.sink_type: Checksum }
+    axes: { x: *w16_x, series: *large_series }
+    y: *time_y
+
+  - name: lrb_q1
+    description: "LRB Q1 AVG(speed) 5min/1s + HAVING, x200 tiling, csv vs native"
+    query: lrb/q1_avg_speed
+    overrides: { data_size: xlarge }
+    axes: { x: *w16_x, series: *xlarge_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: lrb_q2
+    description: "LRB Q2 COUNT per vehicle 30s/1s, x200 tiling, csv vs native"
+    query: lrb/q2_vehicle_count
+    overrides: { data_size: xlarge }
+    axes: { x: *w16_x, series: *xlarge_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: mfg_multi_agg
+    description: "Manufacturing keyless 5-agg 1min/1s, real 1.43GB/14.8d stream, csv vs native"
+    query: manufacturing/window_multi_agg
+    axes: { x: *w16_x, series: *large_series }
+    y: *time_y
+    visualization: { type: grouped_bar }

@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: Apache-2.0
+query:
+  name: multicol_parse_k4
+  description: >
+    16-FLOAT64-column row (integer-valued, ~104 B/row). Parse+serialize the FIRST 4 column(s) via
+    cI*FLOAT64(1) (the minimal op that defeats lazy passthrough elision, forcing Eisel parse + ZMIJ
+    serialize on those 4); the remaining 12 columns are pure passthrough -> lazily elided +
+    coalesced (byte-copied, NOT parsed). Engine analogue of the isolated field_scaling "parse 4 of 16
+    fields" point: measures how MB/s (full-row-bytes ingested) evolves as more of a fixed 16-field row is
+    codec'd. k=1 is the "1 parsed + 15 free" case that should land in multi-GB/s (free-bytes model),
+    reconciling the isolated PURE parse+write 4348 MB/s vs the matched single-column engine 222 MB/s.
+    Data: large/multicol/f16.csv (2.0M rows). Compare to isolated INDEX+parse (SIMD index, near-free).
+  sql: "SELECT c0 * FLOAT64(1) AS c0, c1 * FLOAT64(1) AS c1, c2 * FLOAT64(1) AS c2, c3 * FLOAT64(1) AS c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15 FROM t"
+  sources:
+    - name: t
+      schema:
+        - { name: c0, type: FLOAT64, not_null: true }
+        - { name: c1, type: FLOAT64, not_null: true }
+        - { name: c2, type: FLOAT64, not_null: true }
+        - { name: c3, type: FLOAT64, not_null: true }
+        - { name: c4, type: FLOAT64, not_null: true }
+        - { name: c5, type: FLOAT64, not_null: true }
+        - { name: c6, type: FLOAT64, not_null: true }
+        - { name: c7, type: FLOAT64, not_null: true }
+        - { name: c8, type: FLOAT64, not_null: true }
+        - { name: c9, type: FLOAT64, not_null: true }
+        - { name: c10, type: FLOAT64, not_null: true }
+        - { name: c11, type: FLOAT64, not_null: true }
+        - { name: c12, type: FLOAT64, not_null: true }
+        - { name: c13, type: FLOAT64, not_null: true }
+        - { name: c14, type: FLOAT64, not_null: true }
+        - { name: c15, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/multicol/f16.csv
+          size_bytes: 209715304
+  sink_schema:
+    - { name: c0, type: FLOAT64, not_null: true }
+    - { name: c1, type: FLOAT64, not_null: true }
+    - { name: c2, type: FLOAT64, not_null: true }
+    - { name: c3, type: FLOAT64, not_null: true }
+    - { name: t.c4, type: FLOAT64, not_null: true }
+    - { name: t.c5, type: FLOAT64, not_null: true }
+    - { name: t.c6, type: FLOAT64, not_null: true }
+    - { name: t.c7, type: FLOAT64, not_null: true }
+    - { name: t.c8, type: FLOAT64, not_null: true }
+    - { name: t.c9, type: FLOAT64, not_null: true }
+    - { name: t.c10, type: FLOAT64, not_null: true }
+    - { name: t.c11, type: FLOAT64, not_null: true }
+    - { name: t.c12, type: FLOAT64, not_null: true }
+    - { name: t.c13, type: FLOAT64, not_null: true }
+    - { name: t.c14, type: FLOAT64, not_null: true }
+    - { name: t.c15, type: FLOAT64, not_null: true }

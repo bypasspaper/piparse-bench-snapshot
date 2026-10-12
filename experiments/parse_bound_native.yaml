@@ -1,0 +1,81 @@
+experiment:
+  name: parse_bound_native
+  description: >
+    ⚠️ FLAWED/MISLEADING — superseded by q1_float_rebaseline.yaml. NATIVE output
+    SKIPS CSV text serialization, so "NATIVE faster than CSV" for q1 just means it
+    avoided the (then-misconfigured, no-ZMIJ) float output formatting — NOT a real
+    NATIVE win. fnattr is input-parse inlining and is off-target for output-bound q1.
+    For the correct q1 float round-trip use q1_float_rebaseline.yaml (EiselFloatF64 in
+    + ZMIJF64 out, output_format=CSV). Kept only for the history trail.
+
+    Give invoke-mode fnattr a fair shot on a genuinely parse-HEAVY query: q1 with
+    output_format=NATIVE forces full materialization -> all 4 fields parsed (the §7
+    "76% integer parse" regime), incl. the traced int parsers that fnattr's
+    parse_not_null/fn-attr tagging targets. q1-CSV showed fnattr ≈ default (only the
+    1 float parsed). Compare default vs fnattr at W=4,8 (compute-bound, below the
+    ~6 GB/s File io cap) to decide whether fnattr EVER helps in the engine. File,
+    pool 4096 (512 MB), repeat 4, median n=2. Companion §17/§20.4.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 2
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+
+  worker:
+    query_engine:
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 4096
+
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter:
+      type: SIMDCSV
+    input_parser:
+      uint64: TracedUINT64
+      int32: TracedINT32
+      int64: TracedINT64
+      f64: EiselFloatF64
+    output_formatter:
+      type: NATIVE                          # forces full 4-field parse + serialization
+
+  generator:
+    repeat: 4
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: q1_native
+    description: "q1 NATIVE (full parse): invoke-mode at W=4,8"
+    query: nexmark/q1_price
+    axes:
+      x:
+        label: "Worker Threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [4, 8]
+      series:
+        label: "invoke mode"
+        explicit:
+          - name: fnattr
+            baseline: true
+            overrides:
+              worker.query_engine.invoke_mode_configuration: fnattr
+          - name: default
+            overrides:
+              worker.query_engine.invoke_mode_configuration: default
+    y:
+      metric: throughput_mbps
+      label: "Throughput (MB/s)"
+    visualization:
+      type: line_chart

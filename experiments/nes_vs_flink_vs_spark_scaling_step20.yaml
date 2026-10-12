@@ -1,0 +1,122 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: nes_vs_flink_vs_spark_scaling_step20
+  description: >
+    FINE-GRAINED many-source scaling sweep, step-20 grid N=1,20,40,..,1000 (51 points) on the FULL
+    bid_strings_3GB.csv, 3 engines (NES / Flink / Spark), 10-query stateless PAPER_WORKLOAD
+    heterogeneous mix, csv -> json. Yields BOTH the throughput-vs-N and the smooth p99-latency-vs-N
+    curves (NES bounded, Flink knee+collapse past ~cores, Spark 1-batch/stream whole-stream latency).
+    Full file => latencies are the genuine full-workload numbers (no file-shrink caveat); Spark's
+    per-batch = whole-stream latency (it can't sub-divide a single file -> 1 micro-batch/stream).
+    EXTENSIBLE TO 100 POINTS FOR FREE: this step-20 grid is a SUBSET of the step-10 grid; a later
+    "fill" run of N=10,30,..,990 (the odd tens) merges with this to make the 101-point step-10 curve
+    (the plot script merges experiments/run_groups by N; each N is stored keyed, so results are never
+    re-run or lost). Config = the validated full-sweep config (nes_vs_flink_vs_spark_scaling.yaml):
+      - NES  = many-source production config (CCX cells + fragment shredder LOCK_FREE_FRAGMENTS + pin
+               + 16w/8io + 192x128KiB pools, File sources, SIMDCSV -> JSON into Monitoring).
+      - Flink= mode flink, flink_output_format latency_json (N StatementSet pipelines, 1 slot each,
+               real JSON encoder + per-readBatch nanoTime stamp).
+      - Spark= mode spark, spark_output_format json_void_latency, 24 cores + scheduler.mode=FAIR +
+               single-file single-reader (1 batch/stream; FAIR ~moot with atomic streams).
+    RUNTIME ~30h (Flink+Spark ~15h each at their ~1.7 GB/s ceilings reading N x 3.6 GB; NES ~1h);
+    153 runs share one run_group. pbench stores each run incrementally, so a partial/interrupted run
+    keeps its completed points (figure builds from whatever finished).
+    PRE-FLIGHT: pkill -x main; flink-ext jar built; pyspark; warm bid_strings_3GB.csv; --worker-port
+    9099. RUN WITH `pbench run --detach` + PBENCH_FLINK_TIMEOUT=3600 PBENCH_SPARK_TIMEOUT=3600
+    PBENCH_KEEP_LOGS=1.
+  primary_metric: p99_latency_us
+  higher_is_better: false
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 3000
+  query_mix:
+    - nexmark/matrix/bidstr_q0
+    - nexmark/matrix/bidstr_qproject
+    - nexmark/matrix/bidstr_qroute
+    - nexmark/matrix/bidstr_q1
+    - nexmark/matrix/bidstr_q2og
+    - nexmark/matrix/bidstr_q2mod
+    - nexmark/matrix/bidstr_q10
+    - nexmark/matrix/bidstr_q14
+    - nexmark/matrix/bidstr_q22
+    - nexmark/matrix/bidstr_qex
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 8
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+    ccx_shared_source_pools: true
+    ccx_source_pool_buffers: 192
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false, sequence_shredder_mode: LOCK_FREE_FRAGMENTS }
+    input_parser:
+      uint64: TracedUINT64
+      int64: TracedINT64
+      int32: FastINT32
+      int16: TracedINT16
+      uint32: TracedUINT32
+      uint16: TracedUINT16
+      f64: EiselFloatF64
+      f32: EiselFloatF32
+      bool: TracedBOOL
+    output_formatter: { type: JSON }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+
+_series_engines: &engines
+  label: "engine"
+  explicit:
+    - name: NebulaStream
+      baseline: true
+    - name: Flink
+      system: flink
+      overrides:
+        mode: flink
+        flink_execution_mode: streaming
+        flink_output_format: latency_json
+    - name: Spark
+      system: spark
+      overrides:
+        mode: spark
+        spark_output_format: json_void_latency
+        spark_single_reader: true
+        spark_parallelism: 24
+
+_axis_n: &n_x
+  label: "concurrent sources/queries"
+  parameter: num_queries
+  # step-20 grid (subset of the step-10 grid): 1, then 20,40,..,1000 = 51 points.
+  values: [1, 20, 40, 60, 80, 100, 120, 140, 160, 180, 200, 220, 240, 260, 280, 300,
+           320, 340, 360, 380, 400, 420, 440, 460, 480, 500, 520, 540, 560, 580, 600,
+           620, 640, 660, 680, 700, 720, 740, 760, 780, 800, 820, 840, 860, 880, 900,
+           920, 940, 960, 980, 1000]
+
+_y: &lat_y { metric: p99_latency_us, label: "p99 per-batch ingest->sink latency (us)" }
+
+variants:
+  - name: mix
+    description: "Heterogeneous 10-query mix, csv->json, fine step-20 scaling (throughput + latency)"
+    query: nexmark/matrix/bidstr_q0
+    axes: { x: *n_x, series: *engines }
+    y: *lat_y
+    visualization: { type: line_chart }

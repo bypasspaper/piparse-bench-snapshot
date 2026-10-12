@@ -1,0 +1,45 @@
+query:
+  name: nexmark_q10_datetime
+  description: "Nexmark q10 (reduced): project bid + timestamp reformatted to ISO-8601 text via CASTFROMUNIXTS (the engine's DATE_FORMAT)"
+
+  # flink q10 = DATE_FORMAT(dateTime) x2 into a partitioned FS sink. Kept core: numeric
+  # ms-epoch text -> parse -> ISO-8601 VARSIZED re-serialize. This REFORMATTING breaks
+  # lazy passthrough elision in the csv arm on the timestamp column (plain projection of
+  # the unchanged text would be elidable = the q0_bid_star story), so both arms pay a
+  # real numeric->string conversion - a shape the matrix lacked.
+  sql: |
+    SELECT auctionId, bidder, price, CASTFROMUNIXTS(timestamp) AS dt FROM bid
+
+  # Flink analog of CASTFROMUNIXTS (ms-epoch -> ISO-8601 UTC, 24 chars incl literal T/Z).
+  # Requires table.local-time-zone=UTC (the pbench driver forces it) - DATE_FORMAT renders
+  # TIMESTAMP_LTZ in the session time zone.
+  flink_sql: |
+    SELECT auctionId, bidder, price,
+    DATE_FORMAT(TO_TIMESTAMP_LTZ(`timestamp`, 3), 'yyyy-MM-dd''T''HH:mm:ss.SSS''Z''') AS dt FROM bid
+
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/nexmark/bid_6GB.csv
+          size_bytes: 6442450944
+          rows: 183991721
+        medium:
+          file: large/nexmark/bid_1GB.csv
+          size_bytes: 1089194961
+          rows: 31300000
+        native:
+          file: large/nexmark/bid_6GB.nes
+          size_bytes: 4415801304
+          rows: 183991721
+
+  sink_schema:
+    - { name: bid.auctionId, type: INT32, not_null: true }
+    - { name: bid.bidder, type: INT32, not_null: true }
+    - { name: bid.price, type: FLOAT64, not_null: true }
+    - { name: dt, type: VARSIZED, not_null: true }

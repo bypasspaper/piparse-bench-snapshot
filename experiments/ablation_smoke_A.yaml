@@ -1,0 +1,149 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: ablation_smoke_A
+  description: >
+    SMOKE GATE for the ablation ladder — PASS A (rungs 0-4, inline-OFF binary). Run this
+    BEFORE the real batches (ablation_stateless_A/_B.yaml). reps=1, repeat=1.
+
+    WHAT IT GATES:
+    1. EVERY RUNG RUNS AT ALL — especially r0/r1 (BlockingFile + Sequential/parallel
+       UNCOMPILED, the dependency constraint: sequential formatters REQUIRE a blocking
+       source) and r3 (the compiled JIT path + fast codec plugins).
+    2. CORRECTNESS: sink_type Checksum (NOT Monitoring) so every run emits count,checksum.
+       ALL 5 RUNGS MUST PRODUCE THE IDENTICAL count AND checksum for a given query. A rung
+       that changes the checksum is MIS-WIRED — the ladder must only change HOW the same
+       bytes are produced, never WHAT is produced.
+       Expected count for bid (large, repeat=1): 183,991,721 rows.
+       This also VALIDATES the load-bearing claim behind cat3: the uncompiled arm's
+       hardcoded codecs (fast_float == Eisel-Lemire == EiselFloatF64; its output rewritten
+       to to_chars+zmij == byte-identical to compiled ZMIJ) are the SAME algorithms as the
+       compiled arm's plugins. If r0-r2 checksums match r3-r4, that claim holds in fact and
+       cat3 is a clean MECHANISM bar. If they DIFFER on q1_price (the float query), the
+       "same codec" premise is wrong and the ladder needs revisiting.
+
+    DATA: data_size large ONLY. Do NOT use `small` for bid: the catalog's small entry is
+    bid_653M.csv which has FIVE fields while bid_star declares a FOUR-field schema
+    (bid_6GB.csv: `1746560847787,1000,1001,73134520`; bid_653M.csv: `1220,0,0,47,53.0`)
+    -> silent flat-band field misalignment. (bid_6GB's price column is integer-valued but
+    declared FLOAT64, so it still exercises the float codec end-to-end.)
+
+    ENV: performance governor required (sudo cpupower frequency-set -g performance; resets
+    on every reboot). Page cache is cold after a reboot — the first run pays the disk read.
+    RUN: pbench run experiments/ablation_smoke_A.yaml --build-dir <repo>/cmake-build-release
+  primary_metric: processing_time_s
+  higher_is_better: false
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: default
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Checksum        # correctness gate — NOT Monitoring
+    input_formatter: { type: SIMDCSV }
+    output_formatter: { type: CSV }
+    input_parser: {}
+    output_parser: {}
+  generator:
+    repeat: 1
+
+_ladder_A: &ladder_A
+  label: "optimization (cumulative)"
+  explicit:
+    - name: r0_baseline
+      baseline: true
+      overrides:
+        query_config.source_type: BlockingFile
+        query_config.input_formatter: { type: SequentialUncompiledCSV, threading_mode: SEQUENTIAL }
+        query_config.output_formatter: { type: CSVUncompiled }
+        query_config.input_parser: {}
+        query_config.output_parser: {}
+        worker.query_engine.invoke_mode_configuration: default
+        overload: false
+    - name: r1_parallel
+      overrides:
+        query_config.source_type: BlockingFile
+        query_config.input_formatter: { type: UncompiledCSV }
+        query_config.output_formatter: { type: CSVUncompiled }
+        query_config.input_parser: {}
+        query_config.output_parser: {}
+        worker.query_engine.invoke_mode_configuration: default
+        overload: false
+    - name: r2_async
+      overrides:
+        query_config.source_type: File
+        query_config.input_formatter: { type: UncompiledCSV }
+        query_config.output_formatter: { type: CSVUncompiled }
+        query_config.input_parser: {}
+        query_config.output_parser: {}
+        worker.query_engine.invoke_mode_configuration: default
+        overload: false
+    - name: r3_compiled
+      overrides:
+        query_config.source_type: File
+        query_config.input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: CSV }
+        query_config.input_parser: &fast_parsers
+          uint64: TracedUINT64
+          int64: TracedINT64
+          int32: FastINT32
+          int16: TracedINT16
+          uint32: TracedUINT32
+          uint16: TracedUINT16
+          bool: TracedBOOL
+          f64: EiselFloatF64
+          f32: EiselFloatF32
+        query_config.output_parser: &fast_out { f64: ZMIJF64, f32: ZMIJF32 }
+        worker.query_engine.invoke_mode_configuration: default
+        overload: false
+    - name: r4_fnattr
+      overrides:
+        query_config.source_type: File
+        query_config.input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: CSV }
+        query_config.input_parser: *fast_parsers
+        query_config.output_parser: *fast_out
+        worker.query_engine.invoke_mode_configuration: fnattr
+        overload: false
+
+_axes_x: &w16_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [16]
+
+_y: &time_y { metric: processing_time_s, label: "Processing time (s)" }
+
+variants:
+  - name: smoke_bid_star
+    description: "Q0 passthrough — cheapest per row; exercises source/threading/mechanism"
+    query: nexmark/bid_star
+    axes: { x: *w16_x, series: *ladder_A }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: smoke_q1_price
+    description: "Q1 float codec — the query that would expose a codec mismatch across the compiled boundary"
+    query: nexmark/q1_price
+    axes: { x: *w16_x, series: *ladder_A }
+    y: *time_y
+    visualization: { type: grouped_bar }

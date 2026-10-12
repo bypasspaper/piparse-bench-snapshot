@@ -1,0 +1,75 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: bid_batch_bufsweep
+  description: >
+    Source-emit BATCHING across BUFFER SIZE on a DIFFERENT (numeric) workload. bid_pass_scaling = SELECT 4
+    int fields (~35 B/row, many rows per buffer, NO spanning) so buffer size cleanly = buffer COUNT = emitter
+    task rate, without the bigstr spanning confound. Single-source InMem prefill, W24, LOCK_FREE. x = input
+    buffer size {2,4,8,16,32,128 K}; series = NES_SOURCE_EMIT_BATCH {1, 32}. HYPOTHESIS: batching's lift is
+    largest at SMALL buffers (emitter-bound, huge buffer count) and FADES to ~0 at large buffers (already
+    worker-bound). Cross-check NES_TASKQUEUE_STATS avgDepthOnFastAcquire per run. Confirms whether the 4K
+    +24% generalizes past varsized spanning + maps WHERE batching matters.
+    RUN: cd ~/work/piparse-bench && pkill -x main; PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/bid_batch_bufsweep.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 2
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  worker:
+    query_engine:
+      number_of_worker_threads: 24
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      pin_threads: false
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false, sequence_shredder_mode: LOCK_FREE }
+    output_formatter: { type: CSV }
+    input_parser: {}
+    output_parser: {}
+  generator:
+    repeat: 20
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 20
+    NES_LOG_LEVEL: WARNING
+    NES_TASKQUEUE_STATS: 1
+variants:
+  - name: bidbatch
+    query: nexmark/bid_pass_scaling
+    axes:
+      x:
+        label: "input buffer size (bytes)"
+        parameter: worker_env.NES_INMEM_BUFSIZE
+        values: ["2048", "4096", "8192", "16384", "32768", "131072"]
+      series:
+        label: "source emit batch"
+        explicit:
+          - name: batch1
+            baseline: true
+            overrides:
+              worker_env.NES_SOURCE_EMIT_BATCH: "1"
+          - name: batch32
+            overrides:
+              worker_env.NES_SOURCE_EMIT_BATCH: "32"
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: line_chart }

@@ -1,0 +1,141 @@
+experiment:
+  name: seq_uncompiled_vs_compiled_iouring
+  description: >
+    PART 1 of the "interpreted parsing in the source thread" session (2026-07-06): sequential
+    UNCOMPILED input formatter vs sequential COMPILED input formatter, both fused into the SAME
+    non-async io_uring blocking source (IoUringFile: O_DIRECT + registered fixed buffers =
+    zero-copy DMA into the pinned pool -> the source thread spends ~no cycles on the read, all
+    cycles go to index+parse). Question: is the interpreted path "somewhat close" to the JIT
+    path when both run read+index+parse serially on ONE source thread?
+
+    WORKLOAD: nexmark/bid_star_parseall on bid_6GB (4 cols: UINT64, INT32, INT32, FLOAT64).
+    The `* TYPE(1)` per field forces the COMPILED path to materialize (parse) every value --
+    passthrough elision would otherwise skip parsing on a pure SELECT *. The uncompiled
+    formatter ALWAYS parses all fields, so *1 makes the two arms do identical work (and it is
+    a no-op for the uncompiled arm's own parsing). Monitoring sink = throughput + latency
+    meter. Output = matched CSV pairs: compiled arm uses the JIT CSV output (ZMIJF64), the
+    uncompiled arm uses CSVUncompiled (legacy direct-buffer to_chars+zmij) -- the two are
+    BYTE-IDENTICAL codecs, so the output side is fair, just JIT-fused vs interpreted like the
+    input side. Downstream (the *1 pipeline + output format + sink) runs on WORKER threads in
+    both arms; the sequential formatter itself runs pinned on the source thread.
+
+    ARMS (only the formatter + its matched parser config differ; source identical):
+      compiled_seq   = IoUringFile + SequentialCSV (JIT; Traced/Fast/Eisel in, JIT ZMIJ out)
+      uncompiled_seq = IoUringFile + SequentialUncompiledCSV (interpreted; hardcoded
+                       fast_float in, CSVUncompiled/legacy-ZMIJ out -- parser overrides are
+                       NOT ALLOWED on the uncompiled formatter, its codecs are hardcoded)
+
+    PRIOR BASELINES (this branch):
+      - formatter_seq_iouring (bid_1GB ALL-INT, NATIVE out, W1): iouring+SequentialCSV 1065,
+        BlockingFile+SequentialCSV 1068, async File+SIMDCSV 1128 MB/s. So a compiled seq
+        source thread indexes+parses 4 INT fields at ~1.07 GB/s; zero-copy vs read() copy was
+        a WASH at that rate (parse-bound, not copy-bound).
+      - fullstack_uncompiled_seq (bid_6GB parseall incl FLOAT64, CSVUncompiled out, Checksum,
+        BlockingFile): 466 / 442 / 448 MB/s at W1/4/16 -- FLAT, single format thread is the
+        ceiling. fullstack_compiled (PARALLEL SIMDCSV, everything incl output on workers):
+        382 / 1486 / 5348.
+
+    PREDICTION (write before running):
+      - uncompiled_seq ~= 450-520 MB/s, flat W1->W4 (source-thread interpreted index+parse+
+        materialize is the ceiling; io_uring zero-copy may add a few % over BlockingFile's 466
+        by removing the read copy, but the uncompiled profile showed read was only ~5%).
+      - compiled_seq: source thread does JIT index+parse incl Eisel float; int-only rate was
+        ~1065, the FLOAT64 col adds heavy parse work -> guess ~650-850 MB/s parse ceiling.
+        At W1 the downstream JIT ZMIJ output on 1 worker may co-limit (~24% of the fused W1
+        profile was output) -> W1 ~500-650; at W4 output parallelizes away -> compiled_seq
+        rises toward its parse ceiling while uncompiled stays flat.
+      - So: "somewhat close" at W1 (within ~1.2-1.4x), gap opens to ~1.5-1.9x at W4.
+
+    GOTCHAS (load-bearing):
+      - Sequential formatters REQUIRE a blocking source + threading_mode sequential; without
+        the pin the parallel routine feeds the single-threaded formatter -> carry race at W>1.
+      - IoUringFile IGNORES NES_FILE_REPEAT -> single-pass window; that is why data_size is
+        LARGE (6 GB at ~500 MB/s = ~12 s window). Do not switch to 1GB without raising repeat
+        expectations (it would be a 1-2 s thin window).
+      - REGBUF needs worker.global_buffer_alignment=512 (O_DIRECT alignment), else it silently
+        falls back to non-fixed reads (check worker.log for the fallback warning).
+      - NES_IOURING_QD=16 << private source pool (default_max_inflight_buffers=64): keep
+        QD <= pool/2 or the open() priming deadlocks (0 buffers, parse calls=0).
+      - Parser-registry split: compiled fast parsers (TracedUINT64 etc.) ERROR on the
+        uncompiled formatter -> parser config lives in the per-arm series overrides, NOT in
+        defaults.
+      - O_DIRECT = cold device reads each rep (~6.9 GB/s NVMe >> parse rate, not a limiter);
+        no warm_read needed/meaningful.
+      - Build must be the FULL FAST STACK: fnattr + 128 KiB + native + InlineTagConfig with
+        lazy_overload/output_parse/input_parse enabled (verified enabled 2026-07-06).
+      - worker-cli mode runs nes-single-node-worker, NOT systest -> rebuild BOTH binaries
+        after code changes. `pkill -x main` pre-flight (worker comm is "main").
+      - FIXED DURING FIRST RUN (2026-07-06): the uncompiled formatter task never propagated
+        sourceCreationTimestamp onto its formatted buffers (compiled does it via Scan->ctx->
+        Emit) -> MonitoringSink saw 0/stale pooled-buffer stamps -> garbage latencies + wall
+        span starting at epoch 0 -> throughput ~0. Fix: stamp formattedBuffer from rawBuffer
+        in setUncompiledMetadataOfFormattedBuffer + the inline no-delimiter emit site
+        (UncompiledInputFormatterTask.hpp). Any uncompiled run with a latency-metering sink
+        BEFORE this fix is invalid.
+
+    RESULTS (2026-07-06, post-fix, reps=3):
+      W1: compiled_seq 504 vs uncompiled_seq 500 MB/s (-1%). W4: 507 vs 476 (-6%, small
+      dispatch overhead like fullstack_uncompiled_seq's W1>W4). VERDICT: "somewhat close"
+      CONFIRMED -- both arms are source-thread-bound at ~500 MB/s; identical numeric codecs
+      dominate the cycle budget, JIT-vs-interpreted framing is worth only ~1-6%. The FLOAT64
+      col halves the int-only sequential rate (formatter_seq_iouring: 1065 int-only). Latency
+      p50 ~4.2-4.6 ms both; uncompiled p99 6.3-6.4 ms vs compiled 4.6 ms (+~37% tail).
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  completion_timeout_s: 300
+  worker:
+    query_engine:
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    global_buffer_alignment: 512      # REQUIRED for REGBUF: O_DIRECT payloads must be 512-aligned
+  worker_env:
+    NES_IOURING_DIRECT: 1
+    NES_IOURING_REGBUF: 1
+    NES_IOURING_QD: 16
+  query_config:
+    source_type: IoUringFile
+    sink_type: Monitoring
+  generator:
+    repeat: 1                          # IoUringFile ignores NES_FILE_REPEAT anyway (single pass)
+
+variants:
+  - name: seq_formatter_ab
+    description: "bid_star_parseall (*1, 4 cols incl FLOAT64) -> matched CSV out -> Monitoring; IoUringFile; seq compiled vs seq uncompiled"
+    query: nexmark/bid_star_parseall
+    axes:
+      x:
+        label: "Worker Threads (downstream only; formatter is on the source thread)"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [1, 4]
+      series:
+        label: "Sequential input formatter"
+        explicit:
+          - name: compiled_seq
+            baseline: true
+            overrides:
+              query_config.input_formatter: { type: SequentialCSV, threading_mode: sequential }
+              query_config.input_parser: { uint64: TracedUINT64, int32: FastINT32, f64: EiselFloatF64 }
+              query_config.output_formatter: { type: CSV }
+              query_config.output_parser: { f64: ZMIJF64 }
+          - name: uncompiled_seq
+            overrides:
+              query_config.input_formatter: { type: SequentialUncompiledCSV, threading_mode: sequential }
+              query_config.output_formatter: { type: CSVUncompiled }
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: bar_chart }

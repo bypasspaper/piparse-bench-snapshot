@@ -1,0 +1,89 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: ablation_r1_smoke_bidstr
+  description: >
+    SMOKE: r1 (SequentialUncompiledOldCSV -> JSONUncompiled, W1, interpreted) on ONE varsized
+    paper-workload query (bidstr_q0, SELECT * over bid_strings_3GB.csv). Sole purpose: prove the
+    NEW combo (InMemory + OldCSV scalar indexer + varsized schema) runs & produces a sane
+    throughput before the full r1-r6b bidstr ladder. The matrix's r_base used SequentialUncompiledCSV
+    (r2) on these exact bidstr queries, and r1 shares the parse path (differs only in the indexer),
+    so this should work -- but OldCSV has never run on the varsized dataset. 1 rep, fast.
+    RUN: cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/ablation_r1_smoke_bidstr.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: default
+      inline_invoke_calls: false
+      trace_constant_bytes: false
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: { type: SequentialUncompiledOldCSV, threading_mode: SEQUENTIAL }
+    output_formatter: { type: JSONUncompiled }
+    input_parser: {}
+    output_parser: {}
+  generator:
+    repeat: 1
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 1
+    NES_INMEM_BUFSIZE: 131072
+
+_ladder: &ladder
+  label: "optimization (cumulative)"
+  explicit:
+    - name: r1_olduncompiled
+      baseline: true
+      overrides:
+        query_config.source_type: InMemory
+        query_config.input_formatter: { type: SequentialUncompiledOldCSV, threading_mode: SEQUENTIAL }
+        query_config.output_formatter: { type: JSONUncompiled }
+        query_config.input_parser: {}
+        query_config.output_parser: {}
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: default
+        worker.query_engine.inline_invoke_calls: false
+        worker.query_engine.trace_constant_bytes: false
+        overload: false
+        generator.repeat: 1
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s)" }
+
+variants:
+  - name: q0
+    description: "Q0: SELECT * FROM bid (varsized passthrough)"
+    query: nexmark/matrix/bidstr_q0
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }

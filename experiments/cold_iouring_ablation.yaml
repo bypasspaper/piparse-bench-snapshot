@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: cold_iouring_ablation
+  description: >
+    Config-axis ablation to localize the SHARED io_uring deadlock (session 2026-07-03). Both the
+    blocking (IoUringFile) and async (IoUringFileAsync) io_uring file sources HANG on the current
+    Jul-2 binary with the full O_DIRECT+REGBUF+align512+QD64 recipe: 0 buffers emitted, DIAG parse
+    calls=0, 120s timeout, at W4/pool2048 AND W16. The two .cpp are near-identical and BOTH fail =>
+    the bug is in a SHARED element (not blocking-specific). This walks the config axis from the
+    simplest source upward; where it FIRST breaks localizes the regression.
+
+    Arms (n=1 each; a working arm returns in seconds, a hang costs 120s -- watch and kill early once
+    an arm breaks):
+    - A "File_buffered"        = plain async File source, buffered, NO io_uring, NO align512. Tests
+      whether the pipeline+SIMDCSV+MonitoringSink work AT ALL on this binary. If A HANGS => broad
+      sink/pipeline regression (suspect: MonitoringSink rewrite 8f24589), NOT io_uring -> stop, bisect
+      there. Expected ~2 GB/s cold (QD1 buffered).
+    - B "IoUringAsync_buffered" = IoUringFileAsync, buffered (DIRECT=0, REGBUF=0). Tests the io_uring
+      source path WITHOUT O_DIRECT/regbuf. If A works but B HANGS => the io_uring source itself.
+      Expected ~2.2 GB/s (buffered io_uring is readahead-bound, no cold win -- HANDOVER §27).
+    - C "IoUringAsync_O_DIRECT" = IoUringFileAsync, O_DIRECT only (DIRECT=1, REGBUF=0, no align512).
+      If B works but C HANGS => O_DIRECT path. If C works => the bug is regbuf+align512 (suspect:
+      buffer-manager slab/alignment change 7f48583774). Expected ~5-6 GB/s if it works (§29).
+
+    PREDICTION: A works (~2), B works (~2.2), C is the likely first break OR works (~5-6) leaving
+    regbuf+align512 as the culprit. Any earlier break reprioritizes the suspects above.
+
+    GOTCHAS:
+    - No global_buffer_alignment here (none of A/B/C use regbuf, so 512-alignment is irrelevant); this
+      keeps the arms vanilla and isolates the config axis. The regbuf+align512 arm is already known to
+      hang (cold_iouring_async_confirm) -- not repeated.
+    - cold_read evicts bid_6GB before each rep; generator.repeat=1, single 6.44 GB pass; NO generator.
+    - A hang prints "MonitoringSink produced no output within 120s" with DIAG calls=0 in worker.log.
+    - Sandbox OFF (binds :8080); verify :8080 free + no stray worker/main first.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: true
+  completion_timeout_s: 120
+  worker:
+    query_engine:
+      number_of_worker_threads: 4
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 2048
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64}
+    output_formatter: {type: CSV}
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+  worker_env:
+    NES_IOURING_DIRECT: 0
+    NES_IOURING_QD: 64
+    NES_IOURING_REGBUF: 0
+
+variants:
+  - name: cold_iouring_ablation
+    description: "COLD bid_6GB passthrough, W4/pool2048 -- config-axis ablation to localize the io_uring hang"
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "config"
+        explicit:
+          - name: "A_File_buffered"
+            baseline: true
+            overrides: {query_config.source_type: File}
+          - name: "B_IoUringAsync_buffered"
+            overrides:
+              query_config.source_type: IoUringFileAsync
+              worker_env.NES_IOURING_DIRECT: 0
+          - name: "C_IoUringAsync_O_DIRECT"
+            overrides:
+              query_config.source_type: IoUringFileAsync
+              worker_env.NES_IOURING_DIRECT: 1
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

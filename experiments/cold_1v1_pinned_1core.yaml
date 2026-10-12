@@ -1,0 +1,131 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: cold_1v1_pinned_1core
+  description: >
+    FAIR 1-core rerun of cold_1v1_parallel_vs_sequential (session 2026-07-03), using a THROWAWAY engine
+    patch so the parallel arm's io + worker threads share ONE core -- removing the "parallel gets 2 cores"
+    advantage the first run had. Compare against the unpinned run's medians:
+      passthrough: parallel 3086 / sequential 1455   |   int: parallel 1158 / sequential 1189 (MB/s).
+
+    THROWAWAY PATCH (QueryEngine.cpp, revert before merge): workerThreadCPUOffset = pinCpuOffset (dropped
+    the usual `+ numberOfIOThreads`), so worker 0 pins to the SAME core as io thread 0. Normally the engine
+    forbids io+worker sharing a core; this deliberately overrides that for a 1-core-vs-1-core measurement.
+
+    WHY IoUringFileAsync (not the blocking IoUringFile of the prior run): the BLOCKING source thread
+    (DataSrc-N) is NOT pinned by the engine -- only the ASYNC io-thread pool (pins to offset+i) and the
+    workers are. So the offset overlap only co-locates a worker with an ASYNC io thread. IoUringFileAsync
+    runs its reads on that pinned io thread -> with the patch, io read + worker index both land on CPU
+    <offset>. The blocking IoUringFile would leave the read on an unpinned float (hack = no-op). Async now
+    works post the QD-vs-pool clamp fix (default_max_inflight_buffers=128 gives forced QD64 its headroom).
+
+    ARMS (per workload):
+    - parallel_1io_1w_pinned = IoUringFileAsync (O_DIRECT+regbuf+QD64) + SIMDCSV, pin_threads=true,
+      NES_PIN_CPU_OFFSET=2 -> io thread 0 AND worker 0 both pinned to CPU 2 = ONE core, 2 threads.
+    - sequential_1thr = BlockingFile + SequentialCSV (threading_mode: sequential), pin_threads=false.
+      One source thread reads+parses inline (naturally 1 core; its DataSrc thread isn't pinnable anyway).
+
+    WORKLOADS: passthrough (bid_passthrough, CSV out -> parse elided, read+index) and int (bid_star_int,
+    NATIVE out -> forces 4x int parse). Cold bid_6GB, n=3 median.
+
+    PREDICTION: confining parallel to 1 core should DROP its throughput vs the 2-core run.
+    - passthrough: parallel falls from 3086 toward sequential (~1455). If it lands ~= sequential, the prior
+      2.1x was purely the extra core; if still clearly above, io_uring's cheap deep-QD read shares a core
+      well and the architecture still wins at equal cores.
+    - int: parallel (1158 @ 2 cores) should fall BELOW sequential (1189 @ 1 core), since both are parse-
+      bound and parallel now splits one core between io-reap and parse. If so, sequential inline is the
+      more efficient design at equal cores for parse-bound work.
+
+    GOTCHAS:
+    - Requires the worker rebuilt WITH the throwaway QueryEngine patch. Revert + rebuild after.
+    - pin_threads only on the parallel arm; sequential left unpinned (its idle worker would otherwise spin
+      on the same core and could steal cycles from the floating DataSrc read+parse thread).
+    - NES_PIN_CPU_OFFSET=2 avoids cpu0/1 softirq housekeeping. Both io0 and worker0 resolve to CPU 2.
+    - cold_read evicts bid_6GB before each rep; generator.repeat=1; NO generator (file sources).
+    - Sandbox OFF (binds :8080); verify :8080 free + no stray worker/main first.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: true
+  completion_timeout_s: 120
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    global_buffer_alignment: 512
+    number_of_buffers_in_global_buffer_manager: 2048
+    default_max_inflight_buffers: 128
+  query_config:
+    source_type: IoUringFileAsync
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64}
+    output_formatter: {type: CSV}
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+  worker_env:
+    NES_IOURING_DIRECT: 1
+    NES_IOURING_QD: 64
+    NES_IOURING_REGBUF: 1
+
+variants:
+  - name: passthrough
+    description: "COLD bid_6GB, 1core-pinned IoUringFileAsync/SIMDCSV vs 1-thr BlockingFile/SequentialCSV -- read+index"
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "architecture"
+        explicit:
+          - name: "parallel_1io_1w_pinned"
+            baseline: true
+            overrides:
+              query_config.source_type: IoUringFileAsync
+              query_config.input_formatter.type: SIMDCSV
+              worker.query_engine.pin_threads: true
+              worker_env.NES_PIN_CPU_OFFSET: 2
+          - name: "sequential_1thr"
+            overrides:
+              query_config.source_type: BlockingFile
+              query_config.input_formatter.type: SequentialCSV
+              query_config.input_formatter.threading_mode: sequential
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}
+
+  - name: int_parse
+    description: "COLD bid_6GB, 1core-pinned IoUringFileAsync/SIMDCSV vs 1-thr BlockingFile/SequentialCSV -- NATIVE forces int parse"
+    query: nexmark/bid_star_int
+    axes:
+      x:
+        label: "architecture"
+        explicit:
+          - name: "parallel_1io_1w_pinned"
+            baseline: true
+            overrides:
+              query_config.source_type: IoUringFileAsync
+              query_config.input_formatter.type: SIMDCSV
+              query_config.output_formatter.type: NATIVE
+              worker.query_engine.pin_threads: true
+              worker_env.NES_PIN_CPU_OFFSET: 2
+          - name: "sequential_1thr"
+            overrides:
+              query_config.source_type: BlockingFile
+              query_config.input_formatter.type: SequentialCSV
+              query_config.input_formatter.threading_mode: sequential
+              query_config.output_formatter.type: NATIVE
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

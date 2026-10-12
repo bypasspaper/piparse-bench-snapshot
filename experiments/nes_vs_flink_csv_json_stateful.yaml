@@ -1,0 +1,208 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: nes_vs_flink_csv_json_stateful
+  description: >
+    NES vs FLINK HEAD-TO-HEAD, csv -> json, STATEFUL all_queries variants (2026-07-14; the
+    companion to nes_vs_flink_csv_json which covers the stateless set). Same fairness model:
+    both engines read the SAME csv files, full JSON serialization into a void sink (NES:
+    W16 fast stack + JSON output formatter into Monitoring; Flink: streaming p=16 +
+    json_blackhole void sink, single csv stream = single split).
+    FLINK PORTS: event-time via computed rowtime `__rt` = TO_TIMESTAMP_LTZ(col, 3) + 1ms
+    watermark (catalog flink_rowtime; NES TimeMeasure treats raw values as MILLISECONDS) and
+    TVF windows (TUMBLE/HOP); window bounds converted back to epoch-ms BIGINT in the SELECT.
+    All datasets are strictly ordered by event time (verified: 0 backjumps) so nothing is
+    late; the 1ms delay is REQUIRED - with 0 delay a row whose ts equals its ENDING window's
+    maxTimestamp (ts = k*size - 1ms) after an equal-ts predecessor gets that window
+    assignment dropped (cm lost exactly 3 groups, q8v 143 - found via DuckDB ground truth).
+    CORRECTNESS (2026-07-14, data_size large, streaming output counts == expected):
+    q5 10589, q8 10999751, q8v 182197843, cm 3094778 (== DuckDB ground truth), ysb_1k
+    167167, ysb_10k 1517953, ysb_1k_varsized 68000, ysb_10k_varsized 670000, lrb_q1 70916,
+    lrb_q2 491460, mfg 221338, sg2 98176 (== DuckDB), sg1 3683 + sg3 279928 (DuckDB ground
+    truth - no catalog validation entries exist).
+    SEMANTIC NOTES: q5/sg3 emit the NES join-window bounds (2s/1s buckets) while the Flink
+    ports emit the HOP window bounds - starts identical, ends differ, row COUNTS identical
+    (the parity gate). Flink q5 plans as WINDOW join (state cleaned by watermark) - a
+    regular-join fallback would explode state; check EXPLAIN if the planner ever changes.
+    PROTOCOL (from all_queries_benchmark): repeat=1 ALWAYS (replay into event-time windows
+    corrupts the NES heap); nexmark joins need the buffer-COUNT-bound stateful pool (4KiB x
+    2M); xlarge tilings for ysb_1k/ysb_1k_varsized/lrb/sg (steady windows), large for the
+    rest. TracedBOOL is REQUIRED (cm BOOLEAN column; DefaultBOOL SIGABRTs release workers).
+    EXPECTED SHAPE: state-bound queries are format-irrelevant (csv-vs-native law) - this
+    measures NES-vs-Flink ENGINE cost under identical csv->json workloads, where Flink is
+    additionally single-thread parse-bound (~105-135 MB/s on bid-class rows).
+    LAUNCH WITH `pbench run --detach`; completion_timeout_s 900 bounds stuck reps.
+    EXPECTED (2026-07-14 first full run, MB/s csv-input 3-rep medians, NES / Flink / ratio):
+    q5 475/104/4.6x, q8 291/208/1.4x, q8v 138/74/1.9x, cm 319/77/4.1x,
+    ysb_1k 8252/169/49x, ysb_10k 4871/135/36x, ysb_1k_var 10674/276/39x,
+    ysb_10k_var 9950/249/40x, lrb_q1 8.9/2.9/3.1x, lrb_q2 43/4.0/11x, mfg 264/47/5.7x,
+    sg1 11.2/27.9/**0.4x FLINK WINS** (NES keyless 1h/1s trigger path is lock-bound at W16 -
+    the known sg1/sg3 finding), sg2 210/20/10x, sg3 6.1/0.6/10x. GEOMEAN 7.2x (0.4-49x) vs
+    54x stateless: state-bound work compresses the gap - YSB stays 36-49x (cheap tumbling
+    state = still input-bound), joins/sliding aggs 1.4-11x (both engines wall on state/
+    trigger machinery), sg1 inverts.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser:
+      uint64: TracedUINT64
+      int64: TracedINT64
+      int32: FastINT32
+      int16: TracedINT16
+      uint32: TracedUINT32
+      uint16: TracedUINT16
+      f64: EiselFloatF64
+      f32: EiselFloatF32
+      bool: TracedBOOL
+    output_formatter: { type: JSON }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+
+_series_engines: &engines
+  label: "engine"
+  explicit:
+    - name: NebulaStream
+      baseline: true
+      overrides: {}
+    - name: Flink
+      system: flink
+      overrides:
+        mode: flink
+        flink_execution_mode: streaming
+        flink_output_format: json_blackhole
+
+_axes_x: &w16_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [16]
+
+_y: &mbps_y { metric: throughput_mbps, label: "Throughput (MB/s, csv input bytes)" }
+
+# Nexmark joins: buffer-COUNT-bound join state on the NES arm (Flink ignores worker.*).
+_stateful_pool: &stateful_pool
+  worker.default_query_execution.operator_buffer_size: 4096
+  worker.number_of_buffers_in_global_buffer_manager: 2000000
+
+variants:
+  - name: q5_window_join
+    description: "Nexmark Q5: hop 10s/2s counts + per-window max self-join"
+    query: nexmark/q5_window_join
+    overrides: *stateful_pool
+    axes: { x: *w16_x, series: *engines }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: q8_join
+    description: "Nexmark Q8: person JOIN auction, tumble 10s"
+    query: nexmark/q8_join
+    overrides: *stateful_pool
+    axes: { x: *w16_x, series: *engines }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: q8_variant
+    description: "Nexmark Q8v: bid JOIN auction, tumble 10s, 182M json rows out"
+    query: nexmark/q8_variant
+    overrides: *stateful_pool
+    axes: { x: *w16_x, series: *engines }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: cm_q2
+    description: "ClusterMonitoring Q2: hop 60s/1s SUM(cpu) by jobId, eventType=3"
+    query: cluster_monitoring/q2_original
+    axes: { x: *w16_x, series: *engines }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: ysb_1k
+    description: "YSB 1k campaigns, tumble 30s, 24x forward-shifted 120M-row stream"
+    query: yahoo/ysb_1k
+    overrides: { data_size: xlarge }
+    axes: { x: *w16_x, series: *engines }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: ysb_10k
+    description: "YSB 10k campaigns, tumble 30s, single-pass 0.5GB"
+    query: yahoo/ysb_10k
+    axes: { x: *w16_x, series: *engines }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: ysb_1k_varsized
+    description: "varsized YSB 1k, tumble 30s, 4x forward-shifted 80M-row stream"
+    query: yahoo/ysb_1k_varsized
+    overrides: { data_size: xlarge }
+    axes: { x: *w16_x, series: *engines }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: ysb_10k_varsized
+    description: "varsized YSB 10k, tumble 30s, single-pass 3.7GB"
+    query: yahoo/ysb_10k_varsized
+    axes: { x: *w16_x, series: *engines }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: lrb_q1
+    description: "LRB Q1: AVG(speed) hop 5min/1s + HAVING, x200 tiling"
+    query: lrb/q1_avg_speed
+    overrides: { data_size: xlarge }
+    axes: { x: *w16_x, series: *engines }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: lrb_q2
+    description: "LRB Q2: COUNT per vehicle hop 30s/1s, x200 tiling"
+    query: lrb/q2_vehicle_count
+    overrides: { data_size: xlarge }
+    axes: { x: *w16_x, series: *engines }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: mfg_multi_agg
+    description: "Manufacturing: keyless 5-agg hop 1min/1s, 14.8-day stream"
+    query: manufacturing/window_multi_agg
+    axes: { x: *w16_x, series: *engines }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: sg1_global
+    description: "SG1: keyless AVG hop 1h/1s, x120 tiling"
+    query: smartgrid/sg1_global_avg
+    overrides: { data_size: xlarge }
+    axes: { x: *w16_x, series: *engines }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: sg2_plug
+    description: "SG2: per-plug AVG hop 128s/1s, x120 tiling"
+    query: smartgrid/sg2_plug_avg
+    overrides: { data_size: xlarge }
+    axes: { x: *w16_x, series: *engines }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: sg3_outlier
+    description: "SG3: outlier join (plug avg > global avg), hop 1h/1s, x120 tiling"
+    query: smartgrid/sg3_outlier_join
+    overrides: { data_size: xlarge }
+    axes: { x: *w16_x, series: *engines }
+    y: *mbps_y
+    visualization: { type: grouped_bar }

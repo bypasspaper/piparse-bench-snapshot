@@ -1,0 +1,177 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: nes_vs_flink_native_native_stateful
+  description: >
+    NES vs FLINK, native->native on the STATEFUL all_queries variants (2026-07-15; completes
+    the stateful row of the format matrix - csv->json lives in nes_vs_flink_csv_json_stateful).
+    Both engines read the SAME .nes packed-LE files, ZERO output serialization: NES =
+    SystemNative input + sink output_format NATIVE + Monitoring NoneFormat; Flink = the fair
+    SEQUENTIAL nes-native reader (single stream) + plain blackhole. This isolates the
+    WINDOWING/JOIN machinery: no parse, no output codec on either side.
+    HEADLINE = throughput_mrows_s. Protocol otherwise = nes_vs_flink_csv_json_stateful
+    (W16, stateful pool for nexmark joins, xlarge_native tilings for ysb_1k/ysb_1k_varsized/
+    lrb/sg, repeat=1 ALWAYS - stateful). Event-time: the renderer now attaches __rt +
+    1ms watermark to .nes DDLs too (was csv-only - fixed this session).
+    CORRECTNESS (2026-07-15 pre-run, data_size native, streaming counts vs the known
+    expected values): all 14 EXACT - native input produces identical results to csv
+    (same rows, same order, values verified earlier via SUM ground truths).
+    string_length slot widths verified against .nes file sizes: bid 24 / person 368 /
+    auction 36 / cm 65 / ysb-fixed 78 / ysb-varsized 182 / lrb 24 / mfg 40 / smartgrid 22
+    B/row. NES engine includes the sg1 trigger-stat fix (nes 95b575b93b).
+    LAUNCH WITH `pbench run --detach`.
+    EXPECTED (2026-07-15 first full run, 84/84 clean, Mrows/s 3-rep medians, NES / Flink /
+    ratio): q5 18.65/3.03/6.2x, q8 2.35/2.90/**0.81x FLINK WINS** (NES q8 native SLOWER than
+    its csv arm 2.89 - person native footprint penalty + join state-bound), q8v 5.33/2.62/2.0x,
+    cm 9.09/1.11/8.2x, ysb_1k 113.6/3.61/32x, ysb_10k 52.7/2.23/24x, ysb_1kv 61.9/3.01/21x,
+    ysb_10kv 53.7/2.48/22x, lrb_q1 1.01/0.085/12x, lrb_q2 1.22/0.14/8.6x, mfg 9.01/0.75/12x,
+    sg1 0.93/1.00/**0.93x wash** (post trigger-stat-fix; was 0.40x on csv pre-fix),
+    sg2 8.73/0.78/11x, sg3 0.37/0.020/19x. GEOMEAN 8.2x (0.81-31x) - nearly identical to the
+    STATELESS native->native 8.0x: with parsing and output codecs gone on both sides, the
+    ratio settles at NES-pipeline-vs-single-thread regardless of statefulness; YSB stays
+    high (source-bound native ingestion), trigger-bound queries (sg1, q8 join) reach
+    parity/inversion.
+  primary_metric: throughput_mrows_s
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: native
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SystemNative, string_length: "16" }
+    input_parser: {}
+    output_formatter: { type: NATIVE }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+
+# ── 2-arm anchors per (string_length x data_size) group ────────────────────────
+_nn_num: &nn_num                       # numeric schemas, large-scale native
+  label: "engine"
+  explicit:
+    - { name: NebulaStream, baseline: true, overrides: {} }
+    - name: Flink
+      system: flink
+      overrides: { mode: flink, flink_execution_mode: streaming, flink_output_format: none }
+
+_nn_person: &nn_person                 # nexmark joins (person slots; bid/auction consume none)
+  label: "engine"
+  explicit:
+    - name: NebulaStream
+      baseline: true
+      overrides:
+        query_config.input_formatter: { type: SystemNative, string_length: "16,32,32,16,4,256" }
+    - name: Flink
+      system: flink
+      overrides:
+        mode: flink
+        flink_execution_mode: streaming
+        flink_output_format: none
+        query_config.input_formatter: { type: SystemNative, string_length: "16,32,32,16,4,256" }
+
+_nn_ysbv: &nn_ysbv                     # ysb varsized, large-scale native
+  label: "engine"
+  explicit:
+    - name: NebulaStream
+      baseline: true
+      overrides:
+        query_config.input_formatter: { type: SystemNative, string_length: "37,37,37,37,9,9,8" }
+    - name: Flink
+      system: flink
+      overrides:
+        mode: flink
+        flink_execution_mode: streaming
+        flink_output_format: none
+        query_config.input_formatter: { type: SystemNative, string_length: "37,37,37,37,9,9,8" }
+
+_nn_xl_num: &nn_xl_num                 # numeric schemas, xlarge_native tilings
+  label: "engine"
+  explicit:
+    - { name: NebulaStream, baseline: true, overrides: { data_size: xlarge_native } }
+    - name: Flink
+      system: flink
+      overrides:
+        mode: flink
+        flink_execution_mode: streaming
+        flink_output_format: none
+        data_size: xlarge_native
+
+_nn_xl_ysbv: &nn_xl_ysbv               # ysb varsized, xlarge_native
+  label: "engine"
+  explicit:
+    - name: NebulaStream
+      baseline: true
+      overrides:
+        data_size: xlarge_native
+        query_config.input_formatter: { type: SystemNative, string_length: "37,37,37,37,9,9,8" }
+    - name: Flink
+      system: flink
+      overrides:
+        mode: flink
+        flink_execution_mode: streaming
+        flink_output_format: none
+        data_size: xlarge_native
+        query_config.input_formatter: { type: SystemNative, string_length: "37,37,37,37,9,9,8" }
+
+_axes_x: &w16_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [16]
+
+_y: &rows_y { metric: throughput_mrows_s, label: "Throughput (Mrows/s)" }
+
+_stateful_pool: &stateful_pool
+  worker.default_query_execution.operator_buffer_size: 4096
+  worker.number_of_buffers_in_global_buffer_manager: 2000000
+
+variants:
+  - { name: q5_window_join, query: nexmark/q5_window_join, description: "hop counts + max self-join",
+      overrides: *stateful_pool, axes: { x: *w16_x, series: *nn_person }, y: *rows_y, visualization: { type: grouped_bar } }
+  - { name: q8_join, query: nexmark/q8_join, description: "person x auction tumble 10s",
+      overrides: *stateful_pool, axes: { x: *w16_x, series: *nn_person }, y: *rows_y, visualization: { type: grouped_bar } }
+  - { name: q8_variant, query: nexmark/q8_variant, description: "bid x auction, 182M rows out",
+      overrides: *stateful_pool, axes: { x: *w16_x, series: *nn_person }, y: *rows_y, visualization: { type: grouped_bar } }
+  - { name: cm_q2, query: cluster_monitoring/q2_original, description: "hop 60s/1s SUM by jobId",
+      axes: { x: *w16_x, series: *nn_num }, y: *rows_y, visualization: { type: grouped_bar } }
+  - { name: ysb_1k, query: yahoo/ysb_1k, description: "tumble 30s, ext24 120M rows",
+      axes: { x: *w16_x, series: *nn_xl_num }, y: *rows_y, visualization: { type: grouped_bar } }
+  - { name: ysb_10k, query: yahoo/ysb_10k, description: "tumble 30s single-pass",
+      axes: { x: *w16_x, series: *nn_num }, y: *rows_y, visualization: { type: grouped_bar } }
+  - { name: ysb_1k_varsized, query: yahoo/ysb_1k_varsized, description: "varsized tumble 30s, ext4 80M rows",
+      axes: { x: *w16_x, series: *nn_xl_ysbv }, y: *rows_y, visualization: { type: grouped_bar } }
+  - { name: ysb_10k_varsized, query: yahoo/ysb_10k_varsized, description: "varsized tumble 30s single-pass",
+      axes: { x: *w16_x, series: *nn_ysbv }, y: *rows_y, visualization: { type: grouped_bar } }
+  - { name: lrb_q1, query: lrb/q1_avg_speed, description: "AVG hop 5min/1s + HAVING, x200",
+      axes: { x: *w16_x, series: *nn_xl_num }, y: *rows_y, visualization: { type: grouped_bar } }
+  - { name: lrb_q2, query: lrb/q2_vehicle_count, description: "COUNT hop 30s/1s, x200",
+      axes: { x: *w16_x, series: *nn_xl_num }, y: *rows_y, visualization: { type: grouped_bar } }
+  - { name: mfg_multi_agg, query: manufacturing/window_multi_agg, description: "keyless 5-agg hop 1min/1s",
+      axes: { x: *w16_x, series: *nn_num }, y: *rows_y, visualization: { type: grouped_bar } }
+  - { name: sg1_global, query: smartgrid/sg1_global_avg, description: "keyless AVG hop 1h/1s, x120",
+      axes: { x: *w16_x, series: *nn_xl_num }, y: *rows_y, visualization: { type: grouped_bar } }
+  - { name: sg2_plug, query: smartgrid/sg2_plug_avg, description: "per-plug AVG hop 128s/1s, x120",
+      axes: { x: *w16_x, series: *nn_xl_num }, y: *rows_y, visualization: { type: grouped_bar } }
+  - { name: sg3_outlier, query: smartgrid/sg3_outlier_join, description: "outlier join hop 1h/1s, x120",
+      axes: { x: *w16_x, series: *nn_xl_num }, y: *rows_y, visualization: { type: grouped_bar } }

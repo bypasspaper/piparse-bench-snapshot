@@ -1,0 +1,80 @@
+experiment:
+  name: q3_why_heavy
+  description: >
+    Characterize WHY q3 needs ~2M buffers while q8 needs <=500K. Hypothesis: q3's
+    WHERE filters stall window finalization (watermark/slice accumulation) -> live
+    slices pile up. Test: run baseline q3 vs q3_nofilter (filters removed, identical
+    join/window/varsized×3 output) at count=1M (4 KiB), where baseline q3 FAILS. If
+    q3_nofilter PASSES at 1M (and lower), the filter is the cause (also clears
+    varsized×3, since the variant keeps it). File, single pass, W=4, slice_cache on.
+    Companion: HANDOVER §21c/§21d.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+
+  worker:
+    query_engine:
+      number_of_worker_threads: 4
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+    default_query_execution:
+      operator_buffer_size: 4096
+      execution_mode: COMPILER
+      slice_cache:
+        enable_slice_cache: true
+
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter:
+      type: SIMDCSV
+    input_parser:
+      uint64: TracedUINT64
+      int32: TracedINT32
+      int64: TracedINT64
+      f64: EiselFloatF64
+    output_formatter:
+      type: CSV
+
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: q3_baseline
+    description: "q3 WITH filters — expect FAIL at 1M (threshold (1.8M,2M])"
+    query: nexmark/q3_join
+    axes:
+      x:
+        label: "buffer count (x 4 KiB)"
+        parameter: worker.number_of_buffers_in_global_buffer_manager
+        values: [1000000]
+    y:
+      metric: throughput_mbps
+      label: "Throughput (MB/s)"
+    visualization:
+      type: line_chart
+
+  - name: q3_nofilter
+    description: "q3 WITHOUT filters — if it passes at 1M/500K, the filter is the cause"
+    query: nexmark/q3_nofilter
+    axes:
+      x:
+        label: "buffer count (x 4 KiB)"
+        parameter: worker.number_of_buffers_in_global_buffer_manager
+        values: [1000000, 500000, 250000]
+    y:
+      metric: throughput_mbps
+      label: "Throughput (MB/s)"
+    visualization:
+      type: line_chart

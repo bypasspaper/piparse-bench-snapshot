@@ -1,0 +1,86 @@
+experiment:
+  name: cold_iouring_direct
+  description: >
+    The decisive cold-read test: async File (QD1) vs io_uring BUFFERED (QD16) vs io_uring
+    O_DIRECT (QD16). Same bid_6GB passthrough, W=4 / IO=1, pool 4096, cold single pass.
+
+    Background: buffered io_uring QD16 gave NO cold win over QD1 (~2.14 -> ~2.24 GB/s,
+    cold_iouring_ab) because buffered sequential reads are kernel-READAHEAD-bound — the
+    readahead already drives the one sequential stream at its cold rate regardless of app
+    queue depth. O_DIRECT bypasses the page cache AND readahead, so each of the QD16 reads
+    is an independent device request -> true device QD16.
+
+    PREDICTION: File_QD1 ~2.1, IoUring_buffered ~2.2 (≈ QD1, readahead-bound), IoUring_direct
+    -> toward the single-thread io_uring O_DIRECT ceiling (§2: QD>=16 = 6.7, ≈ NVMe cap 6.9).
+    If O_DIRECT lands ~6, it proves (a) the QD machinery is sound and (b) buffered was
+    readahead-bound. If O_DIRECT ≈ buffered, the QD isn't reaching the device — investigate
+    io-wq / submission batching.
+
+    O_DIRECT is set via worker_env NES_IOURING_DIRECT=1 (NES_IOURING_QD tunes depth). It needs
+    512-byte (device logical block) alignment of offset/length/buffer; the source rounds the
+    partial tail up to 512 and asserts the pool buffer is aligned (128 KiB stride from a
+    page-aligned slab -> aligned in practice). Reads go DIRECTLY into pool buffers (zero-copy);
+    O_DIRECT also frees the page cache and the read-copy DRAM (the §21p _copy_to_iter the io
+    thread maxed on), so it should help the pinned/warm ceilings too (separate follow-up).
+
+    GOTCHAS: needs bid_6GB.csv + worker rebuilt with liburing + O_DIRECT. cold_read evicts
+    before each run (but O_DIRECT ignores the cache anyway — eviction just keeps the buffered
+    arms honest). Sandbox OFF (:8080). If the alignment INVARIANT trips, the worker dies and
+    the run fast-fails -> switch the source to a private 512-aligned pool.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: true
+  completion_timeout_s: 120
+  worker:
+    query_engine:
+      number_of_worker_threads: 4
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 4096
+  query_config:
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64}
+    output_formatter: {type: CSV}
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: cold_iouring_direct
+    description: "COLD bid_6GB passthrough: File QD1 vs io_uring buffered vs io_uring O_DIRECT"
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "source / mode"
+        explicit:
+          - name: "File_QD1"
+            baseline: true
+            overrides: {query_config.source_type: File}
+          - name: "IoUring_buffered"
+            overrides:
+              query_config.source_type: IoUringFile
+              worker_env.NES_IOURING_DIRECT: 0
+              worker_env.NES_IOURING_QD: 16
+          - name: "IoUring_O_DIRECT"
+            overrides:
+              query_config.source_type: IoUringFile
+              worker_env.NES_IOURING_DIRECT: 1
+              worker_env.NES_IOURING_QD: 16
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

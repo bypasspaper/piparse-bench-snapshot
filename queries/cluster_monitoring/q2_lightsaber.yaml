@@ -1,0 +1,48 @@
+query:
+  name: cm_q2_lightsaber
+  description: "Cluster Monitoring Q2: sliding window SUM(cpu) grouped by jobId, Lightsaber data"
+
+  sql: |
+    SELECT start, end, SUM(cpu) AS totalCpu, jobId
+    FROM monitoringLightsaber
+    WHERE eventType == INT16(3)
+    GROUP BY jobId
+    WINDOW SLIDING(creationTS, SIZE 60 SEC, ADVANCE BY 1 SEC)
+
+  sources:
+    - name: monitoringLightsaber
+      schema:
+        - { name: creationTS, type: UINT64, not_null: true }
+        - { name: jobId, type: UINT64, not_null: true }
+        - { name: taskId, type: UINT64, not_null: true }
+        - { name: machineId, type: INT64, not_null: true }
+        - { name: eventType, type: INT16, not_null: true }
+        - { name: userId, type: INT16, not_null: true }
+        - { name: category, type: INT16, not_null: true }
+        - { name: priority, type: INT16, not_null: true }
+        - { name: cpu, type: FLOAT32, not_null: true }
+        - { name: ram, type: FLOAT32, not_null: true }
+        - { name: disk, type: FLOAT32, not_null: true }
+        - { name: constraints, type: INT16, not_null: true }
+      data:
+        large:
+          # LF in place (2026-07-14): ExternalData ships CRLF, and the trailing "\r" on the last
+          # column (constraints INT16) breaks/mis-parses every fast parser (the auction story);
+          # values identical, recorded checksums stay valid
+          file: large/cluster_monitoring/google-cluster-data-lightsaber_1M.csv
+          size_bytes: 1067866
+          rows: 16292
+        native:
+          # 16,292 rows x 54 B (u64 x3, i64, i16 x4, f32 x3, i16 packed LE)
+          file: large/cluster_monitoring/google-cluster-data-lightsaber_1M.nes
+          size_bytes: 879768
+          rows: 16292
+
+  sink_schema:
+    - { name: monitoringLightsaber.start, type: UINT64, not_null: true }
+    - { name: monitoringLightsaber.end, type: UINT64, not_null: true }
+    - { name: monitoringLightsaber.totalCpu, type: FLOAT32, not_null: true }
+    - { name: monitoringLightsaber.jobId, type: UINT64, not_null: true }
+
+  validation:
+    large: { tuples: 3403, checksum: 7612888 }

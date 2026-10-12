@@ -1,0 +1,26 @@
+query:
+  name: nexmark_bid_star_parseall
+  # Same as bid_star (SELECT *) but every field is `* TYPE(1) AS field`, which forces the compiled path to
+  # MATERIALIZE (parse) every value -- passthrough elision is on by default and would otherwise skip parsing
+  # for a pure projection. This makes the compiled formatter comparable to the uncompiled one, which always
+  # parses all fields. `x * 1 == x` with a typed literal preserves value+type, so tuples/checksum are unchanged.
+  description: "bid_star with forced full materialization (*1 on every field) -- parse-all, no passthrough elision"
+  sql: "SELECT timestamp * UINT64(1) AS timestamp, auctionId * INT32(1) AS auctionId, bidder * INT32(1) AS bidder, price * FLOAT64(1) AS price FROM bid"
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+      data:
+        large: { file: large/nexmark/bid_6GB.csv, size_bytes: 6442450944 }
+        small: { file: large/nexmark/bid_653M.csv, size_bytes: 666738765 }
+  sink_schema:
+    - { name: timestamp, type: UINT64, not_null: true }
+    - { name: auctionId, type: INT32, not_null: true }
+    - { name: bidder, type: INT32, not_null: true }
+    - { name: price, type: FLOAT64, not_null: true }
+  validation:
+    large: { tuples: 183991721, checksum: 353216217968 }
+    small: { tuples: 18106394, checksum: 33146443404 }

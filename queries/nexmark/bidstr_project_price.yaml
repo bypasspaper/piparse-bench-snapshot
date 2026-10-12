@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: Apache-2.0
+query:
+  name: nexmark_bidstr_project_price
+  description: >
+    q_project of the FROZEN paper workload (PAPER_WORKLOAD.md): SELECT price FROM bid over
+    bid_strings -- k=1 projection, the parse-minimal + float-codec regime representative.
+    On compiled rungs lazy elision parses ONLY price; the uncompiled rung parses all 6
+    fields. Two data representations (csv / json) of the same 31.3M rows; select via
+    data_size + the matching input formatter (SIMDCSV family vs SchemaJSON family).
+
+  sql: "SELECT price FROM bid"
+
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+        - { name: channel, type: VARSIZED, not_null: true }
+        - { name: url, type: VARSIZED, not_null: true }
+      data:
+        csv:
+          file: large/nexmark/bid_strings_3GB.csv
+          size_bytes: 3595281395
+          rows: 31300000
+        json:
+          file: large/nexmark/bid_strings_3GB.json
+          size_bytes: 5567181395
+          rows: 31300000
+
+  sink_schema:
+    - { name: bid.price, type: FLOAT64, not_null: true }

@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: nes_vs_flink_vs_spark_scaling_step20_spark
+  description: >
+    SPARK-ONLY step-20 latency+throughput sweep (N=1,20,40,..,1000, 51 pts) on the FULL
+    bid_strings_3GB.csv, with the CHECKPOINT-FAIRNESS fix: every streaming query's checkpoint is on
+    tmpfs (/dev/shm) so its offset/commit log writes are RAM-backed (zero disk-I/O confound) -- the
+    fair analog to Flink's disabled checkpointing (Structured Streaming can't fully disable its
+    progress log, but our queries are stateless so it's only ~2 tiny writes/single-batch stream).
+    Re-run of just the Spark arm after the main sweep (nes_vs_flink_vs_spark_scaling_step20) ran
+    Spark with the implicit-local-disk checkpoint; NES+Flink from that run are reused. The figure
+    merges this run_group's Spark with the main run_group's NES+Flink:
+      plot_nes_flink_spark_scaling.py nes_vs_flink_vs_spark_scaling_step20 nes_vs_flink_vs_spark_scaling_step20_spark
+    Config = the validated Spark scaling arm: 24 cores, scheduler.mode=FAIR, single-file
+    single-reader (1 micro-batch/stream = whole-stream latency). ~15h. Same pre-flight; pbench run
+    --detach + PBENCH_SPARK_TIMEOUT=3600 PBENCH_KEEP_LOGS=1.
+  primary_metric: p99_latency_us
+  higher_is_better: false
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: spark
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: spark
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 3000
+  query_mix:
+    - nexmark/matrix/bidstr_q0
+    - nexmark/matrix/bidstr_qproject
+    - nexmark/matrix/bidstr_qroute
+    - nexmark/matrix/bidstr_q1
+    - nexmark/matrix/bidstr_q2og
+    - nexmark/matrix/bidstr_q2mod
+    - nexmark/matrix/bidstr_q10
+    - nexmark/matrix/bidstr_q14
+    - nexmark/matrix/bidstr_q22
+    - nexmark/matrix/bidstr_qex
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+  spark_output_format: json_void_latency
+  spark_single_reader: true
+  spark_parallelism: 24
+  generator:
+    repeat: 1
+
+_series_engines: &engines
+  label: "engine"
+  explicit:
+    - name: Spark
+      baseline: true
+
+_axis_n: &n_x
+  label: "concurrent sources/queries"
+  parameter: num_queries
+  values: [1, 20, 40, 60, 80, 100, 120, 140, 160, 180, 200, 220, 240, 260, 280, 300,
+           320, 340, 360, 380, 400, 420, 440, 460, 480, 500, 520, 540, 560, 580, 600,
+           620, 640, 660, 680, 700, 720, 740, 760, 780, 800, 820, 840, 860, 880, 900,
+           920, 940, 960, 980, 1000]
+
+_y: &lat_y { metric: p99_latency_us, label: "p99 per-batch ingest->sink latency (us)" }
+
+variants:
+  - name: mix
+    description: "Spark-only step-20 sweep with tmpfs-checkpoint fairness fix"
+    query: nexmark/matrix/bidstr_q0
+    axes: { x: *n_x, series: *engines }
+    y: *lat_y
+    visualization: { type: line_chart }

@@ -1,0 +1,96 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: naive_corr_diag
+  description: 'CORRECTED naive arm ONLY (stateless tier), to fix the final head-to-head:
+    NES-Naive with the GENUINE original (de)serializers -- NES_INPUT_CODEC=original
+    (stod) + NES_OUTPUT_CODEC=original (stringstream). The other 4 arms (Native/SIMD/Flink/Spark)
+    are unchanged from the 5-arm run. Records/s, 10 reps. Launch pbench run --detach;
+    --worker-port 9099; pkill -x main.'
+  primary_metric: throughput_mrows_s
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  worker:
+    query_engine:
+      number_of_worker_threads: 23
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter:
+      type: SIMDCSV
+      allow_commas_in_strings: false
+    input_parser:
+      uint64: TracedUINT64
+      int64: TracedINT64
+      int32: FastINT32
+      int16: TracedINT16
+      uint32: TracedUINT32
+      uint16: TracedUINT16
+      f64: EiselFloatF64
+      f32: EiselFloatF32
+      bool: TracedBOOL
+    output_formatter:
+      type: JSON
+    output_parser:
+      f64: ZMIJF64
+      f32: ZMIJF32
+  generator:
+    repeat: 1
+  worker_env:
+    NES_MMAP_POPULATE: '1'
+_series_engines: &id002
+  label: engine
+  explicit:
+  - name: NES-Naive
+    overrides:
+      generator.repeat: 1
+      worker.query_engine.number_of_worker_threads: 1
+      query_config.source_type: BlockingFile
+      query_config.input_formatter:
+        type: SequentialUncompiledOldCSV
+        threading_mode: sequential
+      query_config.output_formatter:
+        type: JSONUncompiled
+      query_config.input_parser: {}
+      query_config.output_parser: {}
+      worker_env:
+        NES_INPUT_CODEC: original
+        NES_OUTPUT_CODEC: original
+    baseline: true
+_axes_x: &id001
+  label: worker threads
+  parameter: worker.query_engine.number_of_worker_threads
+  values:
+  - 23
+_y: &id003
+  metric: throughput_mrows_s
+  label: Throughput (records/s)
+variants:
+- name: q0
+  description: 'q0: SELECT * FROM bid - full-stream forwarding / output serialization'
+  query: nexmark/matrix/bidstr_q0
+  axes:
+    x: *id001
+    series: *id002
+  y: *id003
+  visualization:
+    type: grouped_bar

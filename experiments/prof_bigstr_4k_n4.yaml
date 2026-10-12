@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: prof_bigstr_4k_n4
+  description: >
+    DECISIVE test for the 4 KiB source-emission-starvation hypothesis. Single InMemory-prefill source =
+    ONE emitter thread (BlockingSourceRunner is one-thread-per-source; io_threads only stripes pools). At
+    4 KiB the profile showed 24 workers 37% SPINNING while the lone DataSrc emitter (~0.84 core) runs
+    emitWork per buffer (WorkTask+AnyInvocable+queue+semaphore). If that per-buffer ADMISSION cost is the
+    wall, adding EMITTERS (num_queries = N independent bigstr passthrough queries, N source threads,
+    SHARED 24 workers) should scale AGGREGATE throughput ~linearly with N until the 24 workers saturate.
+    Plateau => a shared handoff/structure (bounded queue / semaphore / pool) is the wall, not the emitter.
+    bigstr 80KB CSV->CSV passthrough, InMemory prefill, 4 KiB input, 128 KiB op buffer, LOCK_FREE, WARN log.
+    y = AGGREGATE throughput_mbps (pbench sums across the N concurrent queries). REPEAT=40 (>1s windows).
+    RUN: cd ~/work/piparse-bench && pkill -x main; PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/bigstr_4k_multisrc_scaling.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 2
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  worker:
+    query_engine:
+      number_of_worker_threads: 24
+      number_of_io_threads: 8
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: false
+      pin_threads: false
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 65536
+    dump_compilation_result: NONE
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false, sequence_shredder_mode: LOCK_FREE }
+    output_formatter: { type: CSV }
+    input_parser: {}
+    output_parser: {}
+  generator:
+    repeat: 1
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 200
+    NES_INMEM_BUFSIZE: 4096
+    NES_LOG_LEVEL: WARNING
+
+variants:
+  - name: emitters
+    description: "N concurrent bigstr passthrough queries (N emitter threads) sharing 24 workers @4KiB"
+    query: formatter/bigstr_pass
+    axes:
+      x:
+        label: "concurrent sources (emitter threads)"
+        parameter: num_queries
+        values: [4]
+      series:
+        label: "shredder"
+        explicit:
+          - name: lock_free
+            baseline: true
+            overrides: {}
+    y:
+      metric: throughput_mbps
+      label: "Aggregate Throughput (MB/s)"
+    visualization:
+      type: line_chart

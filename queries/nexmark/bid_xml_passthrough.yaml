@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: Apache-2.0
+query:
+  name: nexmark_bid_xml_passthrough
+  description: >
+    bid passthrough over packed record-per-line XML input, parsed by the UNMODIFIED HL7 indexer
+    configured for XML (the XML plan's config-only claim): structural class {<,>} (segment '<',
+    field '>', component/subcomponent disabled), 1-byte '\n' message delimiter. Generated 1:1
+    from bid_strings_3GB.csv via piparse-bench scripts/xml/convert_csv_to_xml.py (tags
+    ts/aid/bid/pr/ch/url, root rec). Same 31.3M logical rows as the csv/json/hl7 variants
+    (Mrows/s comparable; MB/s charges XML its 5.66GB footprint = uniform +72 B/row tag glue
+    incl. the trailing newline, vs HL7's +68).
+    SCHEMA = ALL 29 leaves (arity 4F+5, F=6) in document order: splitting at EVERY '<' and '>'
+    makes the element values standalone leaves at slot 4f+4 (0-indexed 4,8,12,16,20,24); the
+    tag names, close tags and empties are junk leaves -- VARSIZED+nullable, never projected ->
+    lazy, never parsed. Per-record leaf count != 29 -> ERROR 4000 (also catches values
+    containing '<'/'>'; no escaping/entity processing -- assume-clean, '&' in the URLs is FINE
+    here because '&' is NOT structural in the XML config, unlike the HL7 arms).
+    Cross-format anchor: this file reproduces checksum 31300000,269477267979 through BOTH the
+    scalar HL7 and the SIMDHL7 (1-byte-delimiter mode) indexers (scripts/xml gates, 2026-07-31).
+  sql: |
+    SELECT auctionId, bidder, price, channel, url FROM bid
+  sources:
+    - name: bid
+      schema:
+        - { name: x01, type: VARSIZED }
+        - { name: x02, type: VARSIZED }
+        - { name: x03, type: VARSIZED }
+        - { name: x04, type: VARSIZED }
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: x05, type: VARSIZED }
+        - { name: x06, type: VARSIZED }
+        - { name: x07, type: VARSIZED }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: x08, type: VARSIZED }
+        - { name: x09, type: VARSIZED }
+        - { name: x10, type: VARSIZED }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: x11, type: VARSIZED }
+        - { name: x12, type: VARSIZED }
+        - { name: x13, type: VARSIZED }
+        - { name: price, type: FLOAT64, not_null: true }
+        - { name: x14, type: VARSIZED }
+        - { name: x15, type: VARSIZED }
+        - { name: x16, type: VARSIZED }
+        - { name: channel, type: VARSIZED, not_null: true }
+        - { name: x17, type: VARSIZED }
+        - { name: x18, type: VARSIZED }
+        - { name: x19, type: VARSIZED }
+        - { name: url, type: VARSIZED, not_null: true }
+        - { name: x20, type: VARSIZED }
+        - { name: x21, type: VARSIZED }
+        - { name: x22, type: VARSIZED }
+        - { name: x23, type: VARSIZED }
+      data:
+        xml:
+          file: large/nexmark/bid_strings_3GB.xml
+          size_bytes: 5661081395
+          rows: 31300000
+  sink_schema:
+    - { name: bid.auctionId, type: INT32, not_null: true }
+    - { name: bid.bidder, type: INT32, not_null: true }
+    - { name: bid.price, type: FLOAT64, not_null: true }
+    - { name: bid.channel, type: VARSIZED, not_null: true }
+    - { name: bid.url, type: VARSIZED, not_null: true }

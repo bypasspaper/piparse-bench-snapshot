@@ -1,0 +1,122 @@
+experiment:
+  name: io_worker_split_sweep
+  description: >
+    PoC #2 for the scaling paper (axis B, follow-up). Does giving the async source pool MORE
+    io threads relax the head-of-line-blocking TAIL that PoC #1 exposed? In PoC #1 async File
+    at 100 sources had a great median (p50 593us) but a catastrophic tail (p99 15.6ms = 26x
+    median) because 4 io threads multiplex all N sources round-robin -> some sources wait their
+    turn. User intuition: you want MORE io threads as the source count grows.
+
+    DESIGN: hold the TOTAL engine thread budget FIXED at 24 (= physical cores on this 24c/48t
+    Threadripper PRO) and sweep the io:worker SPLIT, so io_threads + worker_threads = 24 always.
+    Async File source only (BlockingFile ignores io threads -> nothing to sweep). Two source
+    counts (50, 100) = the high-fan-out regime where the async tail lives. The 8-io/16-worker
+    cell at 50 sources is the user's specific point of interest.
+
+      x = io:worker split (sum 24): (2,22) (4,20) (8,16) (12,12) (16,8)
+      series = num_queries: 50, 100
+      source = async File, warm bid_passthrough_1gb (1 GB), SIMDCSV lazy-elision passthrough.
+
+    HYPOTHESIS (predict before running):
+      - p99/p999 tail FALLS as io threads rise from 2->8(->16): more io threads = less
+        round-robin multiplexing contention = less head-of-line blocking. Biggest win going
+        from the starved end (2 io) toward 8.
+      - BUT total is fixed at 24, so more io threads = FEWER workers. Past some split the workers
+        (which run the JIT pipeline) starve -> aggregate throughput dips and/or median latency
+        rises. Expect a SWEET SPOT (U-shape): tail keeps improving while throughput holds, then
+        throughput degrades once workers get too few (likely at 16io/8w).
+      - The optimal split should shift toward MORE io threads at 100 vs 50 sources (more sources
+        to service) -- the user's "more io threads as sources increase" intuition, quantified.
+      - If the tail does NOT improve with io threads, HOL blocking is not the mechanism (would
+        redirect to per-source queueing / scheduling, not pool size).
+
+    METRICS: primary = p99_latency_us (lower better, the tail is the story); ALSO watch
+    throughput_mbps (wall-span aggregate), p50 (median), p999, and per-query throughput. All
+    stored. Compare the tail SHAPE (p99/p50 ratio) across splits.
+
+    GOTCHAS (load-bearing):
+      - io+worker MUST sum to 24 in every explicit entry (the fixed-budget control). Do not let a
+        split exceed 24 (SMT oversubscription) or drop below (idle cores) -- it confounds the split
+        effect with a thread-count effect.
+      - pin_threads OFF: threads float across the 48 logical CPUs; "24 threads" keeps us within the
+        24 physical cores without pinning. (A pinned variant is a separate future control.)
+      - Each async source still takes its own 64-buffer private pool; global pool 32768 (4 GB) for
+        outputs. 100 sources x 64 = 6400 private buffers -- fine.
+      - Latency is MICROSECONDS (sink fix). throughput_mbps is the defensible wall-span aggregate;
+        throughput_sum_mbps is the old overcounting sum (ignore). max_latency_us is a single-buffer
+        outlier -- trust p99/p999.
+      - warm_read warms the 1 GB file into page cache once before submit (shared across all N
+        queries). This is CPU-bound (no I/O parking) -- the io-thread effect here is pure
+        scheduling/HOL, NOT I/O-wait hiding (that's the later TCP experiment).
+  primary_metric: p99_latency_us
+  higher_is_better: false
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 300
+  worker:
+    query_engine:
+      number_of_worker_threads: 16   # overridden per split (io + worker = 24)
+      number_of_io_threads: 8        # overridden per split
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+  query_config:
+    source_type: File              # async multiplexed source (the one with io threads)
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64}
+    output_formatter: {type: CSV}
+  generator:
+    repeat: 6                  # steady-state window (NES_FILE_REPEAT=6) — was 1 (ramp-inflated tails)
+
+variants:
+  - name: io_worker_split
+    description: "async File, fixed 24 total threads, sweep io:worker split @ 50/100 sources"
+    query: nexmark/bid_passthrough_1gb
+    axes:
+      x:
+        label: "io:worker split (io+worker=24)"
+        explicit:
+          - name: "io2_w22"
+            overrides:
+              worker.query_engine.number_of_io_threads: 2
+              worker.query_engine.number_of_worker_threads: 22
+          - name: "io4_w20"
+            overrides:
+              worker.query_engine.number_of_io_threads: 4
+              worker.query_engine.number_of_worker_threads: 20
+          - name: "io8_w16"
+            baseline: true
+            overrides:
+              worker.query_engine.number_of_io_threads: 8
+              worker.query_engine.number_of_worker_threads: 16
+          - name: "io12_w12"
+            overrides:
+              worker.query_engine.number_of_io_threads: 12
+              worker.query_engine.number_of_worker_threads: 12
+          - name: "io16_w8"
+            overrides:
+              worker.query_engine.number_of_io_threads: 16
+              worker.query_engine.number_of_worker_threads: 8
+      series:
+        label: "Concurrent Queries (= Sources)"
+        parameter: num_queries
+        values: [50, 100]
+        baseline: 50
+    y:
+      metric: p99_latency_us
+      label: "p99 latency (us)"
+    visualization:
+      type: line_chart

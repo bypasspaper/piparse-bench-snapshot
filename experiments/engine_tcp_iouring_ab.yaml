@@ -1,0 +1,108 @@
+experiment:
+  name: engine_tcp_iouring_ab
+  description: >
+    TCP A/B for the io_uring TCP sources. Same query/config/file/generator as
+    engine_tcp_passthrough_smoke.yaml (single TCP source, bid_6GB passthrough ->
+    MonitoringSink, W=16 / IO=1, fastest-config stack) so numbers are comparable. NOTE: the
+    generator serves from RAM over localhost, so this is a ~5 GB/s MEMORY/COPY-bound stream,
+    NOT disk-bound -- the recv memcpy dominates, which bounds how much io_uring can help.
+    Three source arms:
+    - TCP                = the async asio TCPSource (epoll + recv, async_read fills each
+      128 KiB buffer). The baseline. Measured ~5.2-5.4 GB/s here.
+    - IoUringTCP         = the ASYNC io_uring source. recv via a liburing ring whose
+      completions are bridged into the asio io_context through a registered EVENTFD that
+      asio waits on with epoll. This pays epoll's cost (the thing io_uring should avoid)
+      PLUS the io_uring submit -> measured ~3.45 GB/s, ~33% SLOWER than asio. Kept as the
+      cautionary arm: async io_uring loses on a bandwidth-bound stream.
+    - IoUringTCPBlocking = the BLOCKING io_uring source (own thread, like the io_uring file
+      source). Waits on the ring DIRECTLY via io_uring_submit_and_wait_timeout -- recv
+      submitted AND awaited in ONE io_uring_enter (no eventfd/epoll hop), registered socket
+      fd, zero-copy offset-fill into full pool buffers. Measured ~3.4-3.5 GB/s.
+
+    KEY FINDING (negative): io_uring does NOT beat asio TCP on this workload. Order-controlled
+    A/B (arms ALTERNATED with cooldowns) -- TCP ~5.3, IoUringTCP(async) ~3.4, IoUringTCPBlocking
+    ~3.5 GB/s on bid_6GB (and 4.6 / -- / 3.2 on bid_1GB). The stream is recv-memcpy/bandwidth-
+    bound; asio's epoll+recv is already near-optimal there, and io_uring has no per-syscall
+    overhead to reclaim. io_uring's TCP edge needs a syscall-bound regime (real NIC, many
+    connections, small messages), absent here.
+
+    MEASUREMENT GOTCHA (important): do NOT trust a naive all-reps-per-arm sweep here. Throughput
+    degrades with run order on this box (thermal: TCP's own 3 consecutive reps fell 5.49->5.10,
+    and a cool first run of IoUringTCPBlocking once read 5.88 -- a fluke that vanished under fair
+    ordering). pbench runs all reps of an arm consecutively, so the first arm always runs coolest
+    -> a systematic bias. The numbers above come from ALTERNATING the arms (TCP,BLK,BLK,TCP,...)
+    with ~25s cooldowns so both arms see the same average thermal state. The 3-arm sweep below is
+    kept for the record but is thermally biased (BLK runs last/hottest); read the alternated run.
+
+    PREDICTION (this sweep, thermally biased): TCP ~5.1-5.5 (runs first, coolest), IoUringTCP ~3.3,
+    IoUringTCPBlocking ~3.3-3.8 (runs last, hottest). For the fair comparison alternate the arms.
+
+    CORRECTNESS: validated via systests (single + 200-row multi-buffer over the mock TCP
+    server) for both io_uring TCP sources; offset-fill emits full buffers in byte order.
+
+    GOTCHAS:
+    - source_type values: TCP / IoUringTCP (async) / IoUringTCPBlocking (blocking). The two
+      io_uring sources are new plugins; rebuild the worker AND nes-cli (nes-cli does
+      client-side source-type validation -- an un-rebuilt nes-cli rejects the new type with
+      a fast 'nes-cli failed (exit 1)', distinct from a stall).
+    - The async IoUringTCP arm is SLOW by design (eventfd->epoll). It is here to document
+      that, not as a contender.
+    - Both arms connect as CLIENTS to the piparse-bench TCP generator; the generator must
+      listen before the source connects (harness handles the listen-before-load sync).
+    - Buffer-pool deadlock guard (UNCHANGED from the smoke test): total data per run MUST
+      stay below the GLOBAL pool (65536 * 128 KiB = 8.59 GB). The MonitoringSink finalizes
+      at EoS, so in-flight buffers accumulate until then; 1 x 6.44 GB < 8.59 GB -> fits.
+      For IoUringTCP the provided buffer ring draws from the source's own inflight pool
+      (backpressure parks the multishot on -ENOBUFS and re-arms once buffers free), so the
+      8.59 GB guard on the global pool is the same constraint as for async TCP.
+    - generator.repeat: 1 (single 6.44 GB pass), burst, rate well above achievable (no
+      throttle) -- the exact rung-2b generator setup.
+    - Sandbox OFF (spawns worker, binds :8080 + the generator port); verify free first.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 65536
+  query_config:
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64}
+    output_formatter: {type: CSV}
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: engine_tcp_iouring_ab
+    description: "bid_6GB TCP passthrough -> Monitoring, W=16 IO=1: async TCP (QD1) vs IoUringTCP (multishot recv)"
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "source"
+        explicit:
+          - name: "TCP_asio_QD1"
+            baseline: true
+            overrides: {query_config.source_type: TCP}
+          - name: "IoUringTCP_async"
+            overrides: {query_config.source_type: IoUringTCP}
+          - name: "IoUringTCPBlocking"
+            overrides: {query_config.source_type: IoUringTCPBlocking}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

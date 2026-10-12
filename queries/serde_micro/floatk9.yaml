@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+# serde-micro: SELECT * on K=9 float64 columns. CSV + SystemNative binary twin.
+query:
+  name: serde_micro_floatk9
+  description: "serde micro: SELECT * on 9 float64 cols (passthrough projection)"
+  sql: |
+    SELECT * FROM src
+  sources:
+    - name: src
+      schema:
+        - { name: c0, type: FLOAT64, not_null: true }
+        - { name: c1, type: FLOAT64, not_null: true }
+        - { name: c2, type: FLOAT64, not_null: true }
+        - { name: c3, type: FLOAT64, not_null: true }
+        - { name: c4, type: FLOAT64, not_null: true }
+        - { name: c5, type: FLOAT64, not_null: true }
+        - { name: c6, type: FLOAT64, not_null: true }
+        - { name: c7, type: FLOAT64, not_null: true }
+        - { name: c8, type: FLOAT64, not_null: true }
+      data:
+        csv:
+          file: large/serde_micro/floatk9.csv
+          size_bytes: 231996484
+          rows: 2000000
+        native:
+          file: large/serde_micro/floatk9.nes
+          size_bytes: 144000000
+          rows: 2000000
+  sink_schema:
+    - { name: src.c0, type: FLOAT64, not_null: true }
+    - { name: src.c1, type: FLOAT64, not_null: true }
+    - { name: src.c2, type: FLOAT64, not_null: true }
+    - { name: src.c3, type: FLOAT64, not_null: true }
+    - { name: src.c4, type: FLOAT64, not_null: true }
+    - { name: src.c5, type: FLOAT64, not_null: true }
+    - { name: src.c6, type: FLOAT64, not_null: true }
+    - { name: src.c7, type: FLOAT64, not_null: true }
+    - { name: src.c8, type: FLOAT64, not_null: true }

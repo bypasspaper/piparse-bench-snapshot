@@ -1,0 +1,151 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: ablation_probe
+  description: >
+    QUICK-AND-DIRTY smoke probe on the CURRENT committed binary (cmake-build-release, output_parse ON,
+    tip b807710975). NOT the study -- this only confirms the general configuration is working before
+    investing in the long full-suite run: pbench harness launches the worker, binds worker-cli queries,
+    the JSONUncompiled (r2) + JSON (r3/r5) + File/SIMDCSV-parallel (r7) paths all run and produce sane
+    numbers, and binary B's newer inline/fast-path work (post 2026-07-18) shows up as r5 >= the old table.
+
+    2 float/computed queries (both exercise the ZMIJ output parser -- the codec the new output_parse
+    rung will isolate), both medium=bid_1GB (fast). 4 rungs spanning the whole machinery:
+      r2 uncompiled : SequentialUncompiledCSV (SIMD-band, interpreted) -> JSONUncompiled
+      r3 compiled   : SequentialCSV, JIT knobs OFF                      -> JSON
+      r5 inline     : + fnattr + inline_invoke_calls                    -> JSON
+      r7 parallel   : File + SIMDCSV PARALLEL, W16, ccx queues          -> JSON
+    1 rep. Sanity: 0 failed, numbers monotonic across rungs, in the ballpark of the 2026-07-18 table
+    (q1_price ~61/446/692/5429, q14_calc ~213/726/1298/7597) -- r5 may run HIGHER (newer binary).
+    RUN: cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/ablation_probe.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099 --detach
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: default
+      inline_invoke_calls: false
+      trace_constant_bytes: false
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: BlockingFile
+    sink_type: Monitoring
+    input_formatter: { type: SequentialUncompiledCSV, threading_mode: SEQUENTIAL }
+    output_formatter: { type: JSONUncompiled }
+    input_parser: {}
+    output_parser: {}
+  generator:
+    repeat: 1
+
+_fast_parsers: &fast_parsers
+  uint64: TracedUINT64
+  int64: TracedINT64
+  int32: FastINT32
+  int16: TracedINT16
+  uint32: TracedUINT32
+  uint16: TracedUINT16
+  bool: TracedBOOL
+  f64: EiselFloatF64
+  f32: EiselFloatF32
+_fast_out: &fast_out { f64: ZMIJF64, f32: ZMIJF32 }
+
+_ladder: &ladder
+  label: "optimization (cumulative)"
+  explicit:
+    - name: r2_uncompiled
+      baseline: true
+      overrides:
+        query_config.source_type: BlockingFile
+        query_config.input_formatter: { type: SequentialUncompiledCSV, threading_mode: SEQUENTIAL }
+        query_config.output_formatter: { type: JSONUncompiled }
+        query_config.input_parser: {}
+        query_config.output_parser: {}
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: default
+        worker.query_engine.inline_invoke_calls: false
+        worker.query_engine.trace_constant_bytes: false
+        overload: false
+        generator.repeat: 1
+    - name: r3_compiled
+      overrides:
+        query_config.source_type: BlockingFile
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: *fast_parsers
+        query_config.output_parser: *fast_out
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: default
+        worker.query_engine.inline_invoke_calls: false
+        worker.query_engine.trace_constant_bytes: false
+        overload: false
+        generator.repeat: 1
+    - name: r5_inline
+      overrides:
+        query_config.source_type: BlockingFile
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: *fast_parsers
+        query_config.output_parser: *fast_out
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: fnattr
+        worker.query_engine.inline_invoke_calls: true
+        worker.query_engine.trace_constant_bytes: false
+        overload: false
+        generator.repeat: 1
+    - name: r7_parallel
+      overrides:
+        query_config.source_type: File
+        query_config.input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: *fast_parsers
+        query_config.output_parser: *fast_out
+        worker.query_engine.number_of_worker_threads: 16
+        worker.query_engine.ccx_aware_task_queues: true
+        worker.query_engine.invoke_mode_configuration: fnattr
+        worker.query_engine.inline_invoke_calls: true
+        worker.query_engine.trace_constant_bytes: true
+        overload: false
+        generator.repeat: 5
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s)" }
+
+variants:
+  - name: nx_q1_price
+    description: "Q1: price * 908/1000 - float parse + arith + ZMIJ out (medium=bid_1GB)"
+    query: nexmark/q1_price
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: nx_q14_calc
+    description: "q14 (reduced): computed-float range filter (medium=bid_1GB)"
+    query: nexmark/q14_calc
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }

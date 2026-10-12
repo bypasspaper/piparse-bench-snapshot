@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: Apache-2.0
+# serde-micro MIXED f2i: TOINT64 cast on K=15 FLOAT64 columns -> INT64 output.
+# Reuses the pure-panel floatk15 datasets; needs the TOINT64 function plugin in the binary.
+query:
+  name: serde_micro_f2ik15
+  description: "serde micro mixed: float64 in -> INT64 out (expensive float parse, cheap int serialize), K=15"
+  sql: |
+    SELECT TOINT64(c0) AS c0, TOINT64(c1) AS c1, TOINT64(c2) AS c2, TOINT64(c3) AS c3, TOINT64(c4) AS c4, TOINT64(c5) AS c5, TOINT64(c6) AS c6, TOINT64(c7) AS c7, TOINT64(c8) AS c8, TOINT64(c9) AS c9, TOINT64(c10) AS c10, TOINT64(c11) AS c11, TOINT64(c12) AS c12, TOINT64(c13) AS c13, TOINT64(c14) AS c14 FROM src
+  sources:
+    - name: src
+      schema:
+        - { name: c0, type: FLOAT64, not_null: true }
+        - { name: c1, type: FLOAT64, not_null: true }
+        - { name: c2, type: FLOAT64, not_null: true }
+        - { name: c3, type: FLOAT64, not_null: true }
+        - { name: c4, type: FLOAT64, not_null: true }
+        - { name: c5, type: FLOAT64, not_null: true }
+        - { name: c6, type: FLOAT64, not_null: true }
+        - { name: c7, type: FLOAT64, not_null: true }
+        - { name: c8, type: FLOAT64, not_null: true }
+        - { name: c9, type: FLOAT64, not_null: true }
+        - { name: c10, type: FLOAT64, not_null: true }
+        - { name: c11, type: FLOAT64, not_null: true }
+        - { name: c12, type: FLOAT64, not_null: true }
+        - { name: c13, type: FLOAT64, not_null: true }
+        - { name: c14, type: FLOAT64, not_null: true }
+      data:
+        csv:
+          file: large/serde_micro/floatk15.csv
+          size_bytes: 386663393
+          rows: 2000000
+        native:
+          file: large/serde_micro/floatk15.nes
+          size_bytes: 240000000
+          rows: 2000000
+  sink_schema:
+    - { name: c0, type: INT64, not_null: true }
+    - { name: c1, type: INT64, not_null: true }
+    - { name: c2, type: INT64, not_null: true }
+    - { name: c3, type: INT64, not_null: true }
+    - { name: c4, type: INT64, not_null: true }
+    - { name: c5, type: INT64, not_null: true }
+    - { name: c6, type: INT64, not_null: true }
+    - { name: c7, type: INT64, not_null: true }
+    - { name: c8, type: INT64, not_null: true }
+    - { name: c9, type: INT64, not_null: true }
+    - { name: c10, type: INT64, not_null: true }
+    - { name: c11, type: INT64, not_null: true }
+    - { name: c12, type: INT64, not_null: true }
+    - { name: c13, type: INT64, not_null: true }
+    - { name: c14, type: INT64, not_null: true }

@@ -1,0 +1,58 @@
+experiment:
+  name: concurrent_query_scaling
+  description: "System throughput with increasing concurrent queries"
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 5
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-base
+  mode: worker-cli
+  build: native
+  worker:
+    query_engine:
+      number_of_worker_threads: 24
+      number_of_io_threads: 4
+    default_query_execution:
+      operator_buffer_size: 65536
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 80000
+  topology: single-node
+  duration_seconds: 60
+  query_config:
+    source_type: TCP
+    sink_type: Monitoring
+    input_formatter:
+      type: CSV
+    output_formatter:
+      type: CSV
+  generator:
+    data_file: data/nexmark/bid_6GB.csv
+    repeat: 100
+    mode: uniform
+
+variants:
+  - name: nexmark_bid_star_tcp
+    description: "Scaling concurrent SELECT * queries on TCP source"
+    query: nexmark/bid_star
+
+    axes:
+      x:
+        label: "Concurrent Queries"
+        parameter: num_queries
+        values: [1, 10, 50, 100, 200, 500, 1000]
+      series:
+        label: "Input Formatter"
+        parameter: query_config.input_formatter.type
+        values: [CSV, UncompiledCSV, SequentialCSV]
+        baseline: CSV
+
+    y:
+      metric: throughput_mbps
+      label: "Total System Throughput (MB/s)"
+
+    visualization:
+      type: line_chart
+      x_scale: log

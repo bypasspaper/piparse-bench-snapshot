@@ -1,0 +1,203 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: nexmark_new_stateless
+  description: >
+    THREE NEW STATELESS NEXMARK QUERIES (user selection 2026-07-13 after the opus source
+    survey of the paper + nexmark-flink repo): q2_original (the PAPER's Q2: 5-way OR point
+    selection - the user wants the shape a real user writes, and the lazy-eq-overload
+    question), q14_calc (computed-float range filter, flink q14 minus CASE/UDF),
+    q10_datetime (CASTFROMUNIXTS reformatting projection, flink q10 minus DATE_FORMAT
+    pattern/FS sink). All stateless -> repeat 24 is SAFE for measured variants (v2 steady
+    windows); smokes are single-pass arm-vs-arm (no recorded systest values exist - these
+    are new to our harness; record our first counts/checksums in RESULTS as the future
+    reference).
+
+    Q2_ORIGINAL OVERLOAD QUESTION (user): 5 eq comparisons amortize ONE int parse. The
+    2026-07-08 A/B (nexmark_filter_overload_ab) showed lazy eq-overload buys only +4.6%
+    at W1 on the SINGLE-eq filter (index+framing dominate, 14.0 vs 4.7 ns/row csv/native).
+    PREDICT: the 5-way OR moves overload's ceiling by at most parse_share (unchanged - the
+    parse happens once either way) so overload stays a <=5% effect at W1; a LARGER win
+    would mean the overload machinery also skips per-comparison boxing, a real finding.
+    Arms: csv / csv_overload (overload: true) / native, W in {1, 16}.
+
+    GOTCHAS: W1 csv passes over 6GB x repeat are slow - q2o W1 uses repeat 4 (matches the
+    old A/B protocol) and 1800s timeout; measured W16 variants use repeat 24; dd-class
+    rule applies to any per-byte reading (bid csv/nes pair not dd-measured here; rows/s
+    is the robust ratio); q10_datetime output is WIDE (ISO-8601 ~24 chars + 3 numeric
+    cols ~ 45B/row x 184M = ~8GB of sink CSV per pass) - it is deliberately
+    OUTPUT-serialization-heavy in both arms.
+    RESULTS (2026-07-13, 48/48 ok, reps=3 median):
+    SMOKE (first recordings, arm-identical x6 each): q2_original 55,45307 (55 survivors
+    of 184M - paper-faithful tiny output); q14_calc 52106704,88597785896 (28.3%
+    selectivity - the (1M,50M) band is a real filter); q10_datetime
+    183991721,500016435712 (ISO-8601 conversion byte-identical across arms).
+    MEASURED:
+      q2_original_overload W1:  csv 26.51s | csv_overload 27.32s (-3%) | native 1.85s
+      q2_original_overload W16: csv  4.22s | csv_overload  4.22s (0%)  | native 1.89s
+      q14_calc W16:  csv 24.89s / 177.4 Mr/s | native 12.97s / 340.3 Mr/s -> 1.92x
+      q10_datetime W16: csv 191.0s / 23.1 Mr/s | native 197.4s / 22.4 Mr/s -> 0.97x
+    READING:
+    (1) OVERLOAD ANSWER (the user's question): lazy eq-overloads have NO significant
+    impact on paper-Q2 - exactly 0 at W16 and slightly NEGATIVE (-3%) at W1: five lazy
+    byte-comparisons are marginally worse than parse-once + five int compares, and the
+    filter cost is index/framing-bound anyway (confirms and extends the 2026-07-08
+    single-eq A/B verdict; overload is not the lever for eq filters of any arity).
+    (1b) FOLLOW-UPS (user challenges, same day): W5-COMPACT (1io+5w one CCX, _q2o_w5):
+    csv 5.88s / overload 5.79s (+1.5%, spreads overlap) / native 1.86s - no impact at
+    ANY W (W1 -3%, W5 +1.5%, W16 0%). IR VERIFICATION (dump_compilation_result=CONSOLE,
+    opus agent diff of both arms' LLVM stage, scratchpad q2o_ir_{1,2}.log): the flag DID
+    engage - overload arm compiles all five == as inlined constantEq (length check +
+    memcmp of raw field bytes vs to_string'd constant; ZERO filter-side parses; the only
+    auctionId parse sits in the survivor block for output), baseline compiles pure
+    icmp i32 against 1007/1020/2001/2019/1087. THE KICKER: baseline RE-PARSES auctionId
+    ONCE PER OR TERM (five distinct inlined FastINT32 parses feeding five icmps - lazy
+    values do not cache their decode) plus one for output = ~6 parses/row vs overload's
+    1. The wall-time WASH is NOT because parse is free - W1 PROFILE (user challenge,
+    _q2o_w1prof + flat perf, worker thread only) CORRECTED the reading:
+      baseline: fast_float::from_chars_int_advanced<int> = 68.5% of cycles (the 5x
+        re-parse IS the filter cost), SimdCsv::indexBandInto only 7.0%;
+      overload: to_string(int) = 33.6% + __memmove (std::string traffic) 11.2%, index
+        6.5% - constantEq's RUNTIME constant stringification replaced the parse cost
+        ~1:1 (the source comment claims the compiler prepares the ascii in memory; the
+        IR and the profile prove it does NOT - std::to_string runs per row PER TERM).
+    So the A/B compared two different ~equal overheads, and BOTH prior "index+framing
+    dominates" conclusions (2026-07-08 single-eq +4.6% included) are CONFOUNDED by
+    constantEq's own unfolded cost. Sanity math: q2o W1 36 ns/row vs single-eq 14 ns/row
+    = +5.5 ns per extra OR term = one SWAR int parse; 68.5% of the 27.7s wall = 19s parse
+    ~= 5-6 parses x ~4ns x 736M row-passes. TWO CONCRETE ENGINE FIXES with predicted
+    magnitudes: (a) fold constantEq constants to .rodata bytes at trace time -> overload
+    arm loses 45% of its cycles -> eq filters ~2x faster and the overload becomes a REAL
+    lever; (b) cache the lazy decode per use (baseline re-parses per OR term) -> baseline
+    5-way OR ~2x faster. Both arms fully elide timestamp+bidder and parse price
+    survivors-only (scan plans are projection-driven lazy).
+    (2) q2_original W1 csv (972 MB/s) is ~2.7x slower per byte than the old single-mod
+    filter W1 (2662) - the 5-way OR chain itself costs in the JIT'd predicate; native W1
+    9567 MB/s -> 14.3x rows/s over csv at W1, compressed to 2.2x at W16 (supply band).
+    OPEN sub-question (not chased): how much of the W1 csv cost is the OR chain vs config
+    drift from the 2026-07-08 protocol - do not cross-compare those two experiments'
+    absolute W1 numbers.
+    (3) q14_calc = the most input-codec-bound stateless query in the matrix now: the
+    predicate forces the float parse on EVERY row while only 28% re-serialize -> native
+    1.92x rows/s, well ABOVE the 1.459 footprint (per-byte 1.31 native-favored; contrast
+    q1_price where 100% output serialization masks the input codec to per-byte ~0.9-1.0).
+    dd-class caveat applies to the per-byte split, not the direction.
+    (4) q10_datetime = output-bound as designed: ISO-8601 re-serialization dominates BOTH
+    arms equally (walls 191 vs 197s; parity 0.97) - input format is irrelevant when every
+    row pays a numeric->string conversion on output. Useful as the output-side pole of
+    the stateless matrix.
+  primary_metric: processing_time_s
+  higher_is_better: false
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser:
+      uint64: TracedUINT64
+      int32: FastINT32
+      f64: EiselFloatF64
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  generator:
+    repeat: 24
+
+_series_fmt: &fmt_series
+  label: "input format"
+  explicit:
+    - name: csv_optimized
+      baseline: true
+      overrides: {}
+    - name: native
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "16,32,32,16,4,256" }
+        query_config.input_parser: {}
+
+_series_overload: &overload_series
+  label: "arm"
+  explicit:
+    - name: csv_optimized
+      baseline: true
+      overrides: {}
+    - name: csv_overload
+      overrides:
+        overload: true
+    - name: native
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "16,32,32,16,4,256" }
+        query_config.input_parser: {}
+
+_axes_x: &w16_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [16]
+
+_y: &time_y { metric: processing_time_s, label: "Processing time (s)" }
+
+variants:
+  - name: smoke_q2o
+    description: "GATE: arm-vs-arm counts/checksums (first recording - no systest reference)"
+    query: nexmark/q2_original
+    overrides: { query_config.sink_type: Checksum, generator.repeat: 1 }
+    axes: { x: *w16_x, series: *fmt_series }
+    y: *time_y
+  - name: smoke_q14
+    description: "GATE: arm-vs-arm; also records the actual selectivity of the (1M,50M) band"
+    query: nexmark/q14_calc
+    overrides: { query_config.sink_type: Checksum, generator.repeat: 1 }
+    axes: { x: *w16_x, series: *fmt_series }
+    y: *time_y
+  - name: smoke_q10
+    description: "GATE: arm-vs-arm; ISO-8601 output equality proves identical ts parse both arms"
+    query: nexmark/q10_datetime
+    overrides: { query_config.sink_type: Checksum, generator.repeat: 1 }
+    axes: { x: *w16_x, series: *fmt_series }
+    y: *time_y
+
+  - name: q2_original_overload
+    description: "Paper Q2, csv vs csv+lazy-overloads vs native, W1 (honest) + W16"
+    query: nexmark/q2_original
+    overrides: { generator.repeat: 4, completion_timeout_s: 1800 }
+    axes:
+      x:
+        label: "worker threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [1, 16]
+      series: *overload_series
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: q14_calc
+    query: nexmark/q14_calc
+    axes: { x: *w16_x, series: *fmt_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: q10_datetime
+    query: nexmark/q10_datetime
+    axes: { x: *w16_x, series: *fmt_series }
+    y: *time_y
+    visualization: { type: grouped_bar }

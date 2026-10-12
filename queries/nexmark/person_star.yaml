@@ -1,0 +1,54 @@
+query:
+  name: nexmark_person_star
+  description: "SELECT * FROM person (full projection on varsized Nexmark person)"
+
+  sql: "SELECT * FROM person"
+
+  flink_sql: "SELECT * FROM person"
+
+  sources:
+    - name: person
+      schema:
+        - { name: id, type: INT32, not_null: true }
+        - { name: name, type: VARSIZED, not_null: true }
+        - { name: email_address, type: VARSIZED, not_null: true }
+        - { name: credit_card, type: VARSIZED, not_null: true }
+        - { name: city, type: VARSIZED, not_null: true }
+        - { name: state, type: VARSIZED, not_null: true }
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: extra, type: VARSIZED, not_null: true }
+      data:
+        large:
+          file: large/nexmark/person_840MB.csv
+          size_bytes: 876941057
+          rows: 4000000
+        native:
+          # 4,000,000 rows x 368 B; VARSIZED stored as fixed \x00-padded slots, schema-order
+          # lengths string_length='16,32,32,16,4,256'. Generated via csv_to_binary.py.
+          file: large/nexmark/person_840MB.nes
+          size_bytes: 1472000000
+          rows: 4000000
+
+  sink_schema:
+    - { name: person.id, type: INT32, not_null: true }
+    - { name: person.name, type: VARSIZED, not_null: true }
+    - { name: person.email_address, type: VARSIZED, not_null: true }
+    - { name: person.credit_card, type: VARSIZED, not_null: true }
+    - { name: person.city, type: VARSIZED, not_null: true }
+    - { name: person.state, type: VARSIZED, not_null: true }
+    - { name: person.timestamp, type: UINT64, not_null: true }
+    - { name: person.extra, type: VARSIZED, not_null: true }
+
+  validation:
+    # 2026-07-13: catalog moved to person_840MB.csv (CRLF stripped, -1 B/row -> 876941057 B;
+    # generated `tr -d '\r' < person_840MB.csv > person_840MB.csv` next to the ExternalData
+    # symlink, same pattern as auction_707MB.csv - REGENERATE after a build-dir wipe). The
+    # CRLF original made the engine's CSV parse keep a trailing \r on the LAST column (extra
+    # VARSIZED) that the .nes strings never had (python csv strips \r): csv checksum ran 13 x 4M
+    # above native (85430084707, measured 2026-07-08), and the \r forced the JSON escape path on
+    # every row's biggest field. LF makes both arms parse IDENTICAL values -> identical checksum.
+    # Values below are the SYSTEST convention (fused CSV output, quoteStrings=true). Under the
+    # worker-cli fast stack (quoteStrings=false) both arms measure 83746084707 (2026-07-13,
+    # Checksum sink) - exactly 12 quote chars x 34 x 4M rows below; csv == native BYTE-IDENTICAL.
+    large: { tuples: 4000000, checksum: 85378084707 }
+    native: { tuples: 4000000, checksum: 85378084707 }

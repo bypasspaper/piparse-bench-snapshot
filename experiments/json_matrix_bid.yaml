@@ -1,0 +1,93 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: json_matrix_bid
+  description: >
+    JSON-input pipelines over the bid_strings NDJSON dataset (bid_strings_3GB.json, generated from
+    bid_strings_3GB.csv). Three queries x two output formats. Input formatter = JSON (NOTE: SequentialJSON
+    is broken on multi-buffer files -- UNESCAPED_CHARS -- so we use the parallel "JSON" indexer at W1).
+    r6 fullopt, W1, single-node/fused, port 9099, governor performance, n=5 median. Throughput MB/s is
+    engine-measured on INPUT (JSON) bytes, so json->json and json->csv share a denominator and compare
+    directly (higher = cheaper output path).
+
+      passthrough  SELECT auctionId,bidder,price,channel,url   (drop timestamp; 2 varsized)
+      star         SELECT *                                     (all 6 fields)
+      q5           Nexmark Q5 sliding-window self-join on bid   (stateful; 4 fields used; event-time windows
+                   -- memory flags these as engine-unstable, a crash here is a known engine bug, not JSON)
+
+    Series: j2j (JSON out) vs j2c (CSV out).
+    RUN: cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+      experiments/json_matrix_bid.yaml --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 5
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: true
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: BlockingFile
+    sink_type: Monitoring
+    input_formatter: { type: JSON }
+    output_formatter: { type: JSON }
+    input_parser: { uint64: TracedUINT64, int64: TracedINT64, int32: FastINT32, int16: TracedINT16, uint32: TracedUINT32, uint16: TracedUINT16, bool: TracedBOOL, f64: EiselFloatF64, f32: EiselFloatF32 }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s)" }
+
+_fmt_series: &fmt_series
+  label: "output"
+  explicit:
+    - name: j2j
+      baseline: true
+      overrides: { query_config.output_formatter: { type: JSON } }
+    - name: j2c
+      overrides: { query_config.output_formatter: { type: CSV } }
+
+variants:
+  - name: passthrough
+    description: "bid passthrough (5 fields), JSON in -> {JSON,CSV} out"
+    query: nexmark/bid_json_passthrough
+    axes: { x: *noop_x, series: *fmt_series }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: star
+    description: "bid SELECT * (6 fields), JSON in -> {JSON,CSV} out"
+    query: nexmark/bid_json_star
+    axes: { x: *noop_x, series: *fmt_series }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: q5
+    description: "Nexmark Q5 sliding-window self-join, JSON in -> {JSON,CSV} out (stateful)"
+    query: nexmark/q5_json
+    axes: { x: *noop_x, series: *fmt_series }
+    y: *tput_y
+    visualization: { type: grouped_bar }

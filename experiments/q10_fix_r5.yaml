@@ -1,0 +1,103 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: q10_fix_r5
+  description: >
+    q10-ONLY r5 rung (general core inline, output fast-path + serializer NOT
+    inlined). MUST run on BINARY-X = a build with `nautilus_inline(json_output_
+    formatter_plugin)` COMMENTED (fastpath OFF) and InlineTagConfig `output_parse`
+    moved enable->disable (serializer OFF), reconfigured + rebuilt, WITH the
+    CASTFROMUNIXTS hand-rolled fix (bin_x_new). This is the q10 variant of
+    ablation_r5_outparse_off.yaml. r5 = inline_invoke_calls true, tcb false, W1.
+
+    For q10 (3 numeric passthrough + 1 VARSIZED dt): the output fast path never
+    fires (varsized declines it), and pre-fix the std::format cost drowned any
+    serializer-inline signal (canonical r5=r6=52, flat). Post-fix the conversion
+    is cheap, so r5 (output_parse OFF) vs r6 (output_parse ON) may now expose the
+    small ZMIJ-serializer-inline effect on the FLOAT64 price column -- which is
+    exactly why the binary switch must be honoured for a comparable table.
+    RUN (BINARY-X+fix MUST be in the build dir first):
+      cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+        experiments/q10_fix_r5.yaml \
+        --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099 --detach
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: false
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: BlockingFile
+    sink_type: Monitoring
+    input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+    output_formatter: { type: JSON }
+    input_parser: {}
+    output_parser: {}
+  generator:
+    repeat: 1
+
+_fast_parsers: &fast_parsers
+  uint64: TracedUINT64
+  int64: TracedINT64
+  int32: FastINT32
+  int16: TracedINT16
+  uint32: TracedUINT32
+  uint16: TracedUINT16
+  bool: TracedBOOL
+  f64: EiselFloatF64
+  f32: EiselFloatF32
+_fast_out: &fast_out { f64: ZMIJF64, f32: ZMIJF32 }
+
+_r5only: &r5only
+  label: "optimization (cumulative)"
+  explicit:
+    - name: r5_inline
+      baseline: true
+      overrides:
+        query_config.source_type: BlockingFile
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: *fast_parsers
+        query_config.output_parser: *fast_out
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: fnattr
+        worker.query_engine.inline_invoke_calls: true
+        worker.query_engine.trace_constant_bytes: false
+        overload: false
+        generator.repeat: 1
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s)" }
+
+variants:
+  - name: nx_q10_datetime
+    query: nexmark/q10_datetime
+    axes: { x: *noop_x, series: *r5only }
+    y: *tput_y
+    visualization: { type: grouped_bar }

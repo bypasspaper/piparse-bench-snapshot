@@ -1,0 +1,105 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: shredder_q1_n50_iosplit
+  description: >
+    Nexmark q1 (float parse + arithmetic, EiselFloat in / ZMIJ out) at N=50 sources on the
+    CERTIFIED fragment-shredder async-parallel setup (session 2026-07-12/13): striped CCX
+    cells, cell pools 192 x 128 KiB, LOCK_FREE_FRAGMENTS shredder, pin_threads +
+    ccx_aware_task_queues, timer-suspend dry-pool wait (commits 310a0be236..32e80c0e8e).
+    Two io/worker splits at a fixed 24-thread budget: 8io/16w (the certified passthrough
+    config) vs 4io/20w (q1 is worker-compute-bound -> spare io threads may be better spent
+    as workers).
+
+    EXPECTATION (user's hypothesis: NO CHANGE vs the pre-CCX tuned curve): old comparison
+    point = source_parse_scaling_q1_tuned N=50 async 24w/6io UNPINNED = 13474 MB/s
+    (p50 0.7 ms, p99 11.6 ms). q1 at ~13.5 GB/s aggregate needs only ~4 io threads of
+    supply (async File io supply ~12.5 GB/s on 4io was the old binding point), so 4io/20w
+    should be >= 8io/16w if worker CPU binds; a big drop on 8io/16w would mean 16 workers
+    can't parse 13.5 GB/s of q1 (plausible: old curve used 24 workers). Latency tails
+    should IMPROVE vs the old unpinned run (pinning kills the scheduling tail;
+    shredder session showed p99 ~2-4 ms at N<=256 passthrough).
+
+    GOTCHAS: dd-preflight bid_1GB (warm_read); pkill -x main pre-flight for stray workers;
+    the DIAG_FRAGSHREDDER lines in worker.log prove the fragment shredder ran (DIAG_SHREDDER
+    = classic would mean the mode key didn't reach the formatter); operator_buffer_size is
+    GLOBAL; medium bid_1GB is the 4-column file (small/653M is 5-column, do NOT swap);
+    diag commit 7d0e886e71 (watchdog + lifecycle tracing) is still on the branch - same
+    binary state as the certified N=1024 numbers, so comparable, but REVERT before merge.
+
+    RESULTS (2026-07-13, run_group 20260713T093229-cb5b291c, 1 rep): q1 at N=50 is
+    PURELY worker-bound on this setup - throughput is worker-count-proportional to
+    within 0.3%: io8_w16 = 12223 MB/s (764 MB/s per worker), io4_w20 = 15236 MB/s
+    (762 MB/s per worker). So the "no change" hypothesis holds in the per-worker sense
+    but NOT at the certified 8io/16w split: 16 workers land -9% below the old 24w/6io
+    unpinned 13474, while 4io/20w lands +13% ABOVE it (pinned+striped per-worker
+    efficiency 762-764 vs old unpinned 561 MB/s/worker = +36%). 4 io threads supply
+    15.2 GB/s without binding - io supply is NOT the wall for q1 at N=50, so for
+    parse-heavy workloads the io budget should shrink to ~4 and the cores go to
+    workers (opposite of the passthrough config, where workers+io co-saturate at
+    8/16). Latency (single rep, treat as indicative): io4_w20 p50/p99/p999 =
+    5.9/8.0/9.3 ms strictly better than io8_w16 7.5/10.4/15.1 ms - the faster drain
+    beats the bigger io pool even on tails. Both p50s sit well above the old unpinned
+    0.7 ms; saturated pinned workers queue where 24 unpinned workers had slack -
+    if median latency matters, N=50 q1 wants headroom, not a bigger io pool.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 600
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 8
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+    ccx_shared_source_pools: true
+    ccx_source_pool_buffers: 192
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, sequence_shredder_mode: LOCK_FREE_FRAGMENTS }
+    input_parser: { uint64: TracedUINT64, int32: TracedINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  worker_env:
+    NES_TASKQUEUE_STATS: 1
+  generator:
+    repeat: 6
+
+variants:
+  - name: q1_n50_iosplit
+    description: "nexmark q1_price, N=50 File sources, 8io/16w vs 4io/20w on the shredder cell setup"
+    query: nexmark/q1_price
+    axes:
+      x:
+        label: "Concurrent Queries (= Concurrent Sources)"
+        parameter: num_queries
+        values: [50]
+      series:
+        label: "io/worker split (24 threads total)"
+        explicit:
+          - name: io8_w16
+            baseline: true
+            overrides: {}
+          - name: io4_w20
+            overrides:
+              worker.query_engine.number_of_io_threads: 4
+              worker.query_engine.number_of_worker_threads: 20
+    y:
+      metric: throughput_mbps
+      label: "Aggregate System Throughput (MB/s)"

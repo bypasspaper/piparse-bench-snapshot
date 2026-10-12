@@ -1,0 +1,50 @@
+query:
+  name: nexmark_person_hl7_passthrough
+  description: >
+    person passthrough over MLLP-framed HL7 input (one PID-segment message per person; generated
+    1:1 from person_840MB.csv via the engine's HL7 output formatter -- scripts/hl7/). Same 4M
+    logical rows as the csv variant; HL7 footprint 1.15GB = uniform +68 B/message glue.
+    Varsized-heavy (6 of 8 data fields), the natural HL7 fit (PID demographics).
+    SCHEMA = ALL 25 leaves: 15 MSH-header leaves (default delimiters), segment name (PID),
+    8 data fields, pad. Values verified free of | ^ & CR -> default HL7 delimiter config.
+  sql: |
+    SELECT id, name, email_address, city, state FROM person
+  sources:
+    - name: person
+      schema:
+        - { name: h01, type: VARSIZED }
+        - { name: h02, type: VARSIZED }
+        - { name: h03, type: VARSIZED }
+        - { name: h04, type: VARSIZED }
+        - { name: h05, type: VARSIZED }
+        - { name: h06, type: VARSIZED }
+        - { name: h07, type: VARSIZED }
+        - { name: h08, type: VARSIZED }
+        - { name: h09, type: VARSIZED }
+        - { name: h10, type: VARSIZED }
+        - { name: h11, type: VARSIZED }
+        - { name: h12, type: VARSIZED }
+        - { name: h13, type: VARSIZED }
+        - { name: h14, type: VARSIZED }
+        - { name: h15, type: VARSIZED }
+        - { name: seg, type: VARSIZED }
+        - { name: id, type: INT32, not_null: true }
+        - { name: name, type: VARSIZED, not_null: true }
+        - { name: email_address, type: VARSIZED, not_null: true }
+        - { name: credit_card, type: VARSIZED, not_null: true }
+        - { name: city, type: VARSIZED, not_null: true }
+        - { name: state, type: VARSIZED, not_null: true }
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: extra, type: VARSIZED, not_null: true }
+        - { name: pad, type: VARSIZED }
+      data:
+        hl7:
+          file: large/nexmark/person_840MB.hl7
+          size_bytes: 1148941057
+          rows: 4000000
+  sink_schema:
+    - { name: person.id, type: INT32, not_null: true }
+    - { name: person.name, type: VARSIZED, not_null: true }
+    - { name: person.email_address, type: VARSIZED, not_null: true }
+    - { name: person.city, type: VARSIZED, not_null: true }
+    - { name: person.state, type: VARSIZED, not_null: true }

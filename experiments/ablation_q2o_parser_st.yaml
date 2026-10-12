@@ -1,0 +1,107 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: ablation_q2o_parser_st
+  description: >
+    SINGLE-THREADED (W1) version of ablation_q2o_parser: q2_original, full-opt (fnattr+inline+tcb),
+    JSON output, BlockingFile + SequentialCSV SEQUENTIAL, number_of_worker_threads=1. 2x2
+    {FastINT32,TracedINT32} x {overload on,off}. W1 is compute-bound (no ~11 GB/s read wall), so
+    unlike the W16 run — where fast_ovl/traced_ovl/fast_noovl all pinned the wall ~10.5-10.8 and
+    only traced_noovl (7815) escaped — every arm here shows its true parser/overload cost.
+    Predict: overload OFF still favours FastINT32 (GVN-merges q2o's 5 identical auctionId parses to
+    one; traced = 5 un-mergeable SWAR nests); overload ON bypasses the parse (fast==traced).
+    The magnitudes should be LARGER/cleaner than W16 since nothing is clipped by the read wall.
+    Medium bid_1GB, repeat 5, 3 reps, port 9099. overload in the RUNG override (validation trap).
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: true
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: BlockingFile
+    sink_type: Monitoring
+    input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+    output_formatter: { type: JSON }
+    input_parser: {}
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 5
+
+_fast_parsers: &fast_parsers
+  uint64: TracedUINT64
+  int64: TracedINT64
+  int32: FastINT32
+  int16: TracedINT16
+  uint32: TracedUINT32
+  uint16: TracedUINT16
+  bool: TracedBOOL
+  f64: EiselFloatF64
+  f32: EiselFloatF32
+_traced_parsers: &traced_parsers
+  uint64: TracedUINT64
+  int64: TracedINT64
+  int32: TracedINT32
+  int16: TracedINT16
+  uint32: TracedUINT32
+  uint16: TracedUINT16
+  bool: TracedBOOL
+  f64: EiselFloatF64
+  f32: EiselFloatF32
+
+_arms: &arms
+  label: "parser x overload"
+  explicit:
+    - name: fast_overload
+      baseline: true
+      overrides:
+        query_config.input_parser: *fast_parsers
+        overload: true
+    - name: traced_overload
+      overrides:
+        query_config.input_parser: *traced_parsers
+        overload: true
+    - name: fast_noverload
+      overrides:
+        query_config.input_parser: *fast_parsers
+        overload: false
+    - name: traced_noverload
+      overrides:
+        query_config.input_parser: *traced_parsers
+        overload: false
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+
+variants:
+  - name: nx_q2_original
+    description: "Q2 paper 5-way OR, full-opt SINGLE-THREADED JSON, parser A/B"
+    query: nexmark/q2_original
+    axes: { x: *noop_x, series: *arms }
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: grouped_bar }

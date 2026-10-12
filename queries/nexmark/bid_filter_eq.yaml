@@ -1,0 +1,44 @@
+query:
+  name: nexmark_bid_filter_eq
+  # Faithful port of "SELECT * FROM bid WHERE auctionId = INT32(1000)" from
+  # nes-systests/benchmark/Nexmark_with_varsized.test. Ultra-selective point filter
+  # (758 of 184M rows survive): the CSV arm must still index every row and parse auctionId
+  # per row; with the `overload: true` knob (LAZY_INT_OVERLOADS) the comparison can instead
+  # run on the lazy raw-byte value — this query exists in the .test precisely as that demo.
+  # pbench runs it WITHOUT overload by default (set `overload: true` in an experiment to A/B).
+  description: "SELECT * FROM bid WHERE auctionId = 1000 (point filter, 758 survivors)"
+
+  sql: "SELECT * FROM bid WHERE auctionId = INT32(1000)"
+
+  flink_sql: "SELECT * FROM bid WHERE auctionId = 1000"
+
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/nexmark/bid_6GB.csv
+          size_bytes: 6442450944
+          rows: 183991721
+        native:
+          # 183,991,721 rows x 24 B (uint64,int32,int32,float64 packed LE), see bid_ts_projection.
+          file: large/nexmark/bid_6GB.nes
+          size_bytes: 4415801304
+          rows: 183991721
+
+  sink_schema:
+    - { name: bid.timestamp, type: UINT64, not_null: true }
+    - { name: bid.auctionId, type: INT32, not_null: true }
+    - { name: bid.bidder, type: INT32, not_null: true }
+    - { name: bid.price, type: FLOAT64, not_null: true }
+
+  validation:
+    large: { tuples: 758, checksum: 1141904 }
+    # Arm-vs-arm equality CONFIRMED post-alignment-fix (2026-07-08, worker-cli Checksum smoke:
+    # both arms 758,1357116 — worker-cli sink-side form; the systest fused-CSV form may differ,
+    # value here assumes it matches `large` as both arms materialize identically there).
+    native: { tuples: 758, checksum: 1141904 }

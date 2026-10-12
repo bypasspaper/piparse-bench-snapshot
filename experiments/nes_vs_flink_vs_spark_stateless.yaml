@@ -1,0 +1,182 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: nes_vs_flink_vs_spark_stateless
+  description: >
+    NES vs FLINK vs SPARK three-way HEAD-TO-HEAD, csv -> json, on the FROZEN PAPER_WORKLOAD Set B
+    stateless tier (10 queries on bid_strings: q0, q_project, q_route, q1, q2-og, q2-mod, q10,
+    q14, q22, Q_ex). All three engines read the SAME bid_strings_3GB.csv and serialize full JSON
+    output into a void sink:
+      - NES   = worker-cli fast stack (W23, ccx/pin OFF = single-source healthy config, io=1,
+                fnattr, 128KiB, SIMDCSV fast parsers) with output_formatter JSON into Monitoring.
+      - Flink = mode flink (PyFlink 2.1.3, streaming, max-efficiency knobs) + json_blackhole =
+                Flink's real JsonRowDataSerializationSchema into the flink-ext void sink.
+      - Spark = mode spark (PySpark 3.5.9 Structured Streaming, local[N], availableNow) +
+                json_void = Spark's real to_json/JacksonGenerator per row into a foreachBatch
+                void sink (bytes summed + discarded; validated byte-identical to a filesystem
+                json sink minus per-row newline).
+    ARCHITECTURE (state in the paper, do not hide): Spark Structured Streaming is MICRO-BATCH,
+    not record-at-a-time like Flink/NES; a single CSV is split across local[N] tasks (Spark
+    parallel-ingests one file; Flink binds a local file to ONE split). Expect Spark to favor
+    throughput and hurt latency tails.
+    FAIRNESS: compare on throughput_mbps (same csv input bytes across all three arms). NES
+    replays the file (generator.repeat) for steady state; Flink and Spark read it once
+    (repeat:1) and account bytes/rows from their void sinks. The Set B stateless figure is
+    SEPARATE from the internal 4x4 ablation matrix (Flink/Spark never enter the matrix).
+    CORRECTNESS: every Spark port's output count was validated (batch --count) before timing;
+    the shared per-format checksum gate (31300000,269477267979) covers the NES arm.
+    PRE-FLIGHT: pkill -x main (stale NES worker); flink-ext/pbench-flink-ext.jar built; pyspark
+    importable; bid_strings_3GB.csv present in <testdata>/large/nexmark/ after any build-dir wipe;
+    --worker-port 9099 (a root-owned worker squats :8080). LAUNCH WITH `pbench run --detach`
+    (own-session re-exec; supervised background runs were killed ~20 min in twice before the flag).
+    PBENCH_FLINK_TIMEOUT / PBENCH_SPARK_TIMEOUT bump the 900s per-run cap for slow high-N runs.
+    CALIBRATION: NES vs Flink csv->json geomean 54x (2026-07-14, Set A); Spark's number is the
+    point of the exercise (prior art: micro-batch lands throughput between Flink and NES on
+    scans, loses on latency tails).
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  worker:
+    query_engine:
+      number_of_worker_threads: 23
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      # Single-source head-to-head: ccx_aware+pin is the ~2x PATHOLOGY for single-source runs
+      # (matrix v2, 2026-08-06) -> OFF. 23 workers + 1 source thread = 24 physical cores.
+      pin_threads: false
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser:
+      uint64: TracedUINT64
+      int64: TracedINT64
+      int32: FastINT32
+      int16: TracedINT16
+      uint32: TracedUINT32
+      uint16: TracedUINT16
+      f64: EiselFloatF64
+      f32: EiselFloatF32
+      bool: TracedBOOL
+    output_formatter: { type: JSON }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+  # Only the NES MmapFile source reads this; Flink/Spark runners ignore worker_env. Prefault the
+  # whole mmap in open() (outside the timed window) so the zero-copy path isn't charged per-window
+  # minor page faults — the mmap analog of a warm pool.
+  worker_env:
+    NES_MMAP_POPULATE: "1"
+
+# FAIR MODEL A (single sequential reader for ALL engines): NES = MmapFile (zero-copy single reader
+# -> 23 parallel parse workers = its decoupled architecture); Flink = single local-file split;
+# Spark = spark_single_reader (maxPartitionBytes>=filesize + minPartitionNum=1 -> ONE split =
+# single-threaded read+parse, since Spark couples them). No engine offset-splits the single stream;
+# parallelism-in-processing is each engine's own. warm_read now fires for all three runners.
+# NES replays the 3.6 GB file for steady state (repeat 8); Flink/Spark read it once.
+_series_engines: &engines
+  label: "engine"
+  explicit:
+    - name: NebulaStream
+      baseline: true
+      overrides: { generator.repeat: 8, query_config.source_type: MmapFile }
+    - name: Flink
+      system: flink
+      overrides:
+        mode: flink
+        flink_execution_mode: streaming
+        flink_output_format: json_blackhole
+        generator.repeat: 1
+    - name: Spark
+      system: spark
+      overrides:
+        mode: spark
+        spark_output_format: json_void
+        spark_single_reader: true
+        generator.repeat: 1
+
+_axes_x: &w16_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [23]
+
+_y: &mbps_y { metric: throughput_mbps, label: "Throughput (MB/s, csv input bytes)" }
+
+variants:
+  - name: q0
+    description: "q0: SELECT * FROM bid - full-stream forwarding / output serialization"
+    query: nexmark/matrix/bidstr_q0
+    axes: { x: *w16_x, series: *engines }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: q_project
+    description: "q_project: SELECT price FROM bid - k=1 projection"
+    query: nexmark/matrix/bidstr_qproject
+    axes: { x: *w16_x, series: *engines }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: q_route
+    description: "q_route: SELECT * WHERE channel = 'google' - filter -> full-record output"
+    query: nexmark/matrix/bidstr_qroute
+    axes: { x: *w16_x, series: *engines }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: q1
+    description: "q1: price * 908/1000 currency conversion (compute + codec)"
+    query: nexmark/matrix/bidstr_q1
+    axes: { x: *w16_x, series: *engines }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: q2_og
+    description: "q2-og: 5-way OR point selection (repeated-parse/GVN territory)"
+    query: nexmark/matrix/bidstr_q2og
+    axes: { x: *w16_x, series: *engines }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: q2_mod
+    description: "q2-mod: auctionId % 123 = 0 filter (~0.82% survivors)"
+    query: nexmark/matrix/bidstr_q2mod
+    axes: { x: *w16_x, series: *engines }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: q10
+    description: "q10: ms-epoch -> ISO-8601 datetime export (both engines, UTC)"
+    query: nexmark/matrix/bidstr_q10
+    axes: { x: *w16_x, series: *engines }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: q14
+    description: "q14: computed-float range filter"
+    query: nexmark/matrix/bidstr_q14
+    axes: { x: *w16_x, series: *engines }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: q22
+    description: "q22: unconditional CONCAT alert (string-output regime)"
+    query: nexmark/matrix/bidstr_q22
+    axes: { x: *w16_x, series: *engines }
+    y: *mbps_y
+    visualization: { type: grouped_bar }
+  - name: q_ex
+    description: "Q_ex: HOSP working example (mixed-predicate filter -> nested CONCAT, ~220 rows)"
+    query: nexmark/matrix/bidstr_qex
+    axes: { x: *w16_x, series: *engines }
+    y: *mbps_y
+    visualization: { type: grouped_bar }

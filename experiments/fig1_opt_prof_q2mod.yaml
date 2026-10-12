@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: Apache-2.0
+# Fig1 TEASER profiling window (2026-09-25): OPTIMISED arm = compiled SequentialCSV, LAZY (default) parsing +
+# passthrough, fnattr, fast codecs, JSON fast writer, InMemory prefill (read nulled), W1 sequential.
+# Same query/dataset as the 2026-08-19 naive window fig1_prof_q2mod.yaml. repeat=120 -> long warm window so
+# nes-profile.sh can attach on :9099 and sample. NOT a throughput datapoint; the value is the per-thread /
+# per-symbol self-time split (deser = index [+ parse of consumed fields] / process incl. raw passthrough copy /
+# serialize = JSON keys+framing+formatted computed fields). bid_1GB; q2 parses only auctionId (lazy), 0.8% survivors passthrough; ~1 s/pass, 120 passes ~2 min.
+experiment:
+  name: fig1_opt_prof_q2mod
+  description: 'Fig1 teaser optimised per-stage profiling window: q2mod'
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  cold_read: false
+  completion_timeout_s: 900
+  overload: false
+  worker:
+    query_engine: {number_of_worker_threads: 1, number_of_io_threads: 1, invoke_mode_configuration: fnattr, pin_threads: false, admission_queue_size: 1024}
+    default_query_execution: {operator_buffer_size: 131072, execution_mode: COMPILER}
+    number_of_buffers_in_global_buffer_manager: 16384
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: {type: SequentialCSV, threading_mode: sequential}
+    input_parser: {uint64: TracedUINT64, int64: TracedINT64, int32: FastINT32, int16: TracedINT16, uint32: TracedUINT32, uint16: TracedUINT16, bool: TracedBOOL, f64: EiselFloatF64, f32: EiselFloatF32}
+    output_formatter: {type: JSON}
+    output_parser: {f64: ZMIJF64, f32: ZMIJF32}
+  generator: {repeat: 120, mode: burst, rate: 1000000}
+  worker_env: {NES_INMEM_PREFILL: '1', NES_INMEM_REPEAT: '120', NES_INMEM_BUFSIZE: '131072'}
+variants:
+  - name: q2mod
+    description: 'optimised InMemory profiling window: q2mod'
+    query: nexmark/q2_filter
+    axes:
+      x: {label: config, explicit: [{name: optimised, baseline: true, overrides: {}}]}
+    y: {metric: throughput_mbps, label: MB/s}
+    visualization: {type: bar_chart}

@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: nes_vs_flink_vs_spark_scaling_reprobe_spark128
+  description: >
+    SPARK-ONLY re-probe at N=128 with the corrected fair config: spark.scheduler.mode=FAIR + all
+    24 cores + single-file single-reader (1 micro-batch/stream = whole-stream latency; Spark can't
+    sub-divide a bounded file). Confirms nothing broke and quantifies whether FAIR changes Spark vs
+    the original N=128 probe (16 cores, FIFO): expect ~same (each single-reader stream is one atomic
+    task, so FAIR has nothing to interleave; throughput should rise ~1.5x from the 24 vs 16 cores).
+    NES/Flink unchanged from nes_vs_flink_vs_spark_scaling_probe (not re-run here). Same pre-flight;
+    pbench run --detach, PBENCH_SPARK_TIMEOUT=3600 PBENCH_KEEP_LOGS=1.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: spark
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: spark
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  query_mix:
+    - nexmark/matrix/bidstr_q0
+    - nexmark/matrix/bidstr_qproject
+    - nexmark/matrix/bidstr_qroute
+    - nexmark/matrix/bidstr_q1
+    - nexmark/matrix/bidstr_q2og
+    - nexmark/matrix/bidstr_q2mod
+    - nexmark/matrix/bidstr_q10
+    - nexmark/matrix/bidstr_q14
+    - nexmark/matrix/bidstr_q22
+    - nexmark/matrix/bidstr_qex
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+  spark_output_format: json_void_latency
+  spark_single_reader: true
+  spark_parallelism: 24
+  generator:
+    repeat: 1
+
+_series_engines: &engines
+  label: "engine"
+  explicit:
+    - name: Spark
+      baseline: true
+
+_axis_n: &n_x
+  label: "concurrent sources/queries"
+  parameter: num_queries
+  values: [128]
+
+_y: &mbps_y { metric: throughput_mbps, label: "Aggregate throughput (MB/s, csv input bytes)" }
+
+variants:
+  - name: mix
+    description: "Spark-only N=128 re-probe (FAIR + 24 cores + single-file)"
+    query: nexmark/matrix/bidstr_q0
+    axes: { x: *n_x, series: *engines }
+    y: *mbps_y
+    visualization: { type: line_chart }

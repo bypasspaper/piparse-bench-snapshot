@@ -1,0 +1,53 @@
+query:
+  name: nexmark_bid_hl7_passthrough
+  description: >
+    bid passthrough over MLLP-framed HL7 input (one ORU-like message per bid; generated 1:1 from
+    bid_strings_3GB.csv via the engine's HL7 output formatter -- scripts/hl7/ in piparse-bench).
+    Same logical rows as the csv/json variants (Mrows/s comparable; MB/s charges HL7 its 5.72GB
+    footprint = uniform +68 B/message MSH+MLLP glue over the CSV bytes).
+    SCHEMA = ALL 22 leaves of a message in document order: 14 MSH-header leaves (h01="\x0bMSH",
+    the ^-splits, empty MSH-8, ...), the segment name (BID), the 6 data fields at their leaf
+    positions, and the empty pad leaf after the final <CR>. Junk leaves are VARSIZED+nullable and
+    never projected -> lazy, never parsed.
+    GOTCHA: the bid URLs contain '&' (query=1&channel_id=0), so every HL7 arm over this dataset
+    MUST set input_formatter.subcomponent_delimiter: '' (takes '&' out of the structural class;
+    this is also why the header contributes 14 leaves here, not the default-config 15). Without
+    it every message fails arity validation (ERROR 4000).
+  sql: |
+    SELECT auctionId, bidder, price, channel, url FROM bid
+  sources:
+    - name: bid
+      schema:
+        - { name: h01, type: VARSIZED, not_null: true }
+        - { name: h02, type: VARSIZED, not_null: true }
+        - { name: h03, type: VARSIZED, not_null: true }
+        - { name: h04, type: VARSIZED, not_null: true }
+        - { name: h05, type: VARSIZED, not_null: true }
+        - { name: h06, type: VARSIZED, not_null: true }
+        - { name: h07, type: VARSIZED, not_null: true }
+        - { name: h08, type: VARSIZED, not_null: true }
+        - { name: h09, type: VARSIZED, not_null: true }
+        - { name: h10, type: VARSIZED, not_null: true }
+        - { name: h11, type: VARSIZED, not_null: true }
+        - { name: h12, type: VARSIZED, not_null: true }
+        - { name: h13, type: VARSIZED, not_null: true }
+        - { name: h14, type: VARSIZED, not_null: true }
+        - { name: seg, type: VARSIZED, not_null: true }
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+        - { name: channel, type: VARSIZED, not_null: true }
+        - { name: url, type: VARSIZED, not_null: true }
+        - { name: pad, type: VARSIZED, not_null: true }
+      data:
+        hl7:
+          file: large/nexmark/bid_strings_3GB.hl7
+          size_bytes: 5723681395
+          rows: 31300000
+  sink_schema:
+    - { name: bid.auctionId, type: INT32, not_null: true }
+    - { name: bid.bidder, type: INT32, not_null: true }
+    - { name: bid.price, type: FLOAT64, not_null: true }
+    - { name: bid.channel, type: VARSIZED, not_null: true }
+    - { name: bid.url, type: VARSIZED, not_null: true }

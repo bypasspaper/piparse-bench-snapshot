@@ -1,0 +1,52 @@
+# csv -> hl7 conversion: YSB 1k-campaign ad events (5M rows, 474MB CSV) -> MLLP-framed HL7.
+# Run via convert_csv_to_hl7.sh. All 11 fields numeric; default HL7 delimiters apply on
+# re-parse -> leaf arity 28 (15 header leaves incl. the ^~\& splits + seg + 11 data + pad).
+# One record = one message: <VT> MSH-header <CR> YSB|f1|..|f11 <CR> <FS><CR>.
+query: SELECT * FROM ysb INTO ysbHl7Sink
+logical:
+  - name: ysb
+    schema:
+      - { name: user_id, type: UINT64 }
+      - { name: page_id, type: UINT64 }
+      - { name: campaign_id, type: UINT64 }
+      - { name: ad_type, type: UINT64 }
+      - { name: event_type, type: UINT64 }
+      - { name: current_ms, type: UINT64 }
+      - { name: ip, type: UINT64 }
+      - { name: d1, type: UINT64 }
+      - { name: d2, type: UINT64 }
+      - { name: d3, type: UINT32 }
+      - { name: d4, type: UINT16 }
+physical:
+  - logical: ysb
+    type: File
+    host: "localhost:8080"
+    parser_config:
+      type: SIMDCSV
+      allow_commas_in_strings: "false"
+    source_config:
+      file_path: __TESTDATA__/large/ysb/ysb_1k_data_474M.csv
+sinks:
+  - name: ysbHl7Sink
+    type: File
+    host: "localhost:8080"
+    schema:
+      - { name: ysb$user_id, type: UINT64 }
+      - { name: ysb$page_id, type: UINT64 }
+      - { name: ysb$campaign_id, type: UINT64 }
+      - { name: ysb$ad_type, type: UINT64 }
+      - { name: ysb$event_type, type: UINT64 }
+      - { name: ysb$current_ms, type: UINT64 }
+      - { name: ysb$ip, type: UINT64 }
+      - { name: ysb$d1, type: UINT64 }
+      - { name: ysb$d2, type: UINT64 }
+      - { name: ysb$d3, type: UINT32 }
+      - { name: ysb$d4, type: UINT16 }
+    config:
+      output_format: HL7
+      file_path: __OUTPUT__
+    parser_config:
+      segment_name: YSB
+workers:
+  - host: "localhost:8080"
+    max_operators: 10000

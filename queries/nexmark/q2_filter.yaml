@@ -1,0 +1,42 @@
+query:
+  name: nexmark_q2_filter
+  description: "Nexmark Q2: WHERE auctionId % 123 = 0 (filter on INT32)"
+
+  sql: "SELECT * FROM bid WHERE auctionId % INT32(123) = INT32(0)"
+
+  # Flink-dialect equivalent (added 2026-09-03 for the Fig1 serde-share repeat on Flink):
+  # `%` is not a Flink SQL operator -> MOD(); INT32 typed literals are plain INT literals.
+  flink_sql: "SELECT * FROM bid WHERE MOD(auctionId, 123) = 0"
+
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/nexmark/bid_6GB.csv
+          size_bytes: 6442450944
+          rows: 183991721
+        medium:
+          # head -n 31300000 of bid_6GB.csv (~1 GB, 4-field aligned) -- the uncompiled
+          # naive arm needs an exact 4-field file (bid_653M/small has 5 columns).
+          file: large/nexmark/bid_1GB.csv
+          size_bytes: 1089194961
+          rows: 31300000
+        small:
+          file: large/nexmark/bid_653M.csv
+          size_bytes: 666738765
+          rows: 18106394
+
+  sink_schema:
+    - { name: bid.timestamp, type: UINT64, not_null: true }
+    - { name: bid.auctionId, type: INT32, not_null: true }
+    - { name: bid.bidder, type: INT32, not_null: true }
+    - { name: bid.price, type: FLOAT64, not_null: true }
+
+  validation:
+    large: { tuples: 1511777, checksum: 2902072835 }
+    small: { tuples: 147244, checksum: 269093596 }

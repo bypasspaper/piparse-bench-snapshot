@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: flink_spark_smoke_n1
+  description: >
+    N=1 smoke for the external Flink + Spark toolchains (jars/JVM/pyspark) before the full
+    22-pt low-N run. Verifies both produce sane throughput + latency end-to-end. ~5 min.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  query_mix:
+    - nexmark/matrix/bidstr_q0
+    - nexmark/matrix/bidstr_qproject
+    - nexmark/matrix/bidstr_qroute
+    - nexmark/matrix/bidstr_q1
+    - nexmark/matrix/bidstr_q2og
+    - nexmark/matrix/bidstr_q2mod
+    - nexmark/matrix/bidstr_q10
+    - nexmark/matrix/bidstr_q14
+    - nexmark/matrix/bidstr_q22
+    - nexmark/matrix/bidstr_qex
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+  generator:
+    repeat: 1
+
+_series_arms: &arms
+  label: "engine"
+  explicit:
+    - name: Flink
+      baseline: true
+      system: flink
+      overrides:
+        mode: flink
+        flink_execution_mode: streaming
+        flink_output_format: latency_json
+    - name: Spark
+      system: spark
+      overrides:
+        mode: spark
+        spark_output_format: json_void_latency
+        spark_source: file-microbatch-csv
+        spark_batch_bytes: 67108864
+        spark_parallelism: 24
+
+_axis_n: &n_x
+  label: "concurrent sources/queries"
+  parameter: num_queries
+  values: [1]
+
+_y: &tput_y { metric: throughput_mbps, label: "Aggregate throughput (MB/s)" }
+
+variants:
+  - name: mix
+    description: "Flink + Spark N=1 smoke"
+    query: nexmark/matrix/bidstr_q0
+    axes: { x: *n_x, series: *arms }
+    y: *tput_y
+    visualization: { type: line_chart }

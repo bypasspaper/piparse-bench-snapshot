@@ -1,0 +1,78 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: shredder_e2e_unmask_4k_batch32
+  description: >
+    Can we show the SequenceShredder LF-vs-LK gap in e2e? Single InMemory-prefill source (ONE shredder,
+    max workers hammering it) + heavy spanning (bigstr_80k = 20-buffer spans at 4 KiB, each find* op
+    expensive) + fastest supply (prefill) + WARN (LogContext fix in). Sweep worker threads; LF vs LK.
+    SIGNAL: LF/LK RATIO growing with W (LK mutex serializes as workers rise; LF scales). The ratio is
+    accounting-robust (both arms identical rows/repeat). Last session saw LF~=LK e2e at 2K single-source
+    (starvation-dominated); this isolates whether reduced machinery + heavy spans + prefill supply unmask
+    it. y=throughput_mbps (InMem: reported already matched via generator.repeat==NES_INMEM_REPEAT).
+    RUN: cd ~/work/piparse-bench && pkill -x main; PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/shredder_e2e_unmask_4k.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 2
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  worker:
+    query_engine:
+      number_of_worker_threads: 8
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      pin_threads: false
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 65536
+    dump_compilation_result: NONE
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false }
+    output_formatter: { type: CSV }
+    input_parser: {}
+    output_parser: {}
+  generator:
+    repeat: 40
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 40
+    NES_INMEM_BUFSIZE: 4096
+    NES_LOG_LEVEL: WARNING
+    NES_TASKQUEUE_STATS: 1
+    NES_SOURCE_EMIT_BATCH: 32
+
+variants:
+  - name: unmask
+    query: formatter/bigstr_pass
+    axes:
+      x:
+        label: "worker threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [4, 8, 16, 24]
+      series:
+        label: "shredder"
+        explicit:
+          - name: lock_free
+            baseline: true
+            overrides:
+              query_config.input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false, sequence_shredder_mode: LOCK_FREE }
+          - name: locking
+            overrides:
+              query_config.input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false, sequence_shredder_mode: LOCKING }
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: line_chart }

@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: Apache-2.0
+# serde-micro INT: SELECT * on K=10 int64 columns. CSV + SystemNative binary twin.
+query:
+  name: serde_micro_intk10
+  description: "serde micro: SELECT * on 10 int64 cols (passthrough projection)"
+  sql: |
+    SELECT * FROM src
+  sources:
+    - name: src
+      schema:
+        - { name: c0, type: INT64, not_null: true }
+        - { name: c1, type: INT64, not_null: true }
+        - { name: c2, type: INT64, not_null: true }
+        - { name: c3, type: INT64, not_null: true }
+        - { name: c4, type: INT64, not_null: true }
+        - { name: c5, type: INT64, not_null: true }
+        - { name: c6, type: INT64, not_null: true }
+        - { name: c7, type: INT64, not_null: true }
+        - { name: c8, type: INT64, not_null: true }
+        - { name: c9, type: INT64, not_null: true }
+      data:
+        csv:
+          file: large/serde_micro/intk10.csv
+          size_bytes: 197775082
+          rows: 2000000
+        native:
+          file: large/serde_micro/intk10.nes
+          size_bytes: 160000000
+          rows: 2000000
+  sink_schema:
+    - { name: src.c0, type: INT64, not_null: true }
+    - { name: src.c1, type: INT64, not_null: true }
+    - { name: src.c2, type: INT64, not_null: true }
+    - { name: src.c3, type: INT64, not_null: true }
+    - { name: src.c4, type: INT64, not_null: true }
+    - { name: src.c5, type: INT64, not_null: true }
+    - { name: src.c6, type: INT64, not_null: true }
+    - { name: src.c7, type: INT64, not_null: true }
+    - { name: src.c8, type: INT64, not_null: true }
+    - { name: src.c9, type: INT64, not_null: true }

@@ -1,0 +1,159 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: ablation_query_scaling_A
+  description: >
+    ABLATION SCALING STUDY — PASS A (rungs 0-4, inline-OFF binary). How each optimization
+    improves TOTAL SYSTEM THROUGHPUT as the number of CONCURRENT queries grows (1 -> 1000).
+    Companion to the per-query contribution study (ablation_all_queries_{A,B}.yaml); the
+    same 7-knob cumulative ladder, but here in the TCP STREAMING regime (duration-based,
+    generator-fed) which is where concurrent-query scaling and the async-vs-blocking
+    story live.
+
+    TCP LADDER (the async/blocking knob is BlockingTCP -> TCP; BlockingTCP satisfies the
+    sequential-source constraint. Everything else identical to the File ladder):
+      0 baseline : BlockingTCP + SequentialUncompiledCSV/CSVUncompiled (SEQUENTIAL) + default
+      1 +parallel(cat2) : formatter -> UncompiledCSV/CSVUncompiled (PARALLEL), still BlockingTCP
+      2 +async  (cat1)  : source -> TCP (async asio io-pool)
+      3 +compiled(cat3) : formatter -> SIMDCSV/CSV (JIT + lazy elision) + the fast codec
+                          plugins (Eisel in / ZMIJ out, Traced/Fast ints)
+      4 +fnattr (cat4a) : invoke_mode_configuration -> fnattr
+    (B file: 5 +inline / 6 +overload, inline-ON binary.) 7 rungs / 6 bars.
+
+    CODEC HELD CONSTANT AT *FAST* ACROSS THE LADDER — parsing-function performance is NOT
+    ablated (user ruling 2026-07-16): it is not a contribution; plugging codecs in at ZERO
+    OVERHEAD is (cat 4a/4b). Codec-vs-codec x execution-mode is a separate MICRO benchmark.
+    This also removes the Default*-int JIT-crash confound and measures inline/fnattr on
+    their real target. cat3 is a clean MECHANISM bar because the uncompiled arm's hardcoded
+    fast_float/zmij ARE the same algorithms as EiselFloatF64/ZMIJ.
+
+    THE SCALING STORY: expect async (rung 2) and the function-context/codec rungs to widen
+    the gap as num_queries grows. The async fixed-thread asio io-pool should survive high
+    fan-out where BlockingTCP COLLAPSES (voluntary recv wake/park storm once runnable source
+    threads > engine cores — the TCP_COLLAPSE_MECHANISM finding). That collapse is a RESULT,
+    not a bug.
+
+    CAVEATS:
+    - BLOCKING rungs (0,1) spawn one DataSrc thread per source per query -> at num_queries
+      500/1000 they oversubscribe and may collapse or stall (expected; the async rungs are
+      the contrast). If a blocking cell hangs, cap its num_queries; do not "fix" it.
+    - Integer parsers are a release correctness floor (Traced*/FastINT32 from rung 3; Default*
+      int/bool crash the JIT) -> the fast-codec bar isolates the FLOAT codec swap. See
+      ablation_all_queries_A.yaml for the full caveat list.
+    - throughput_mbps is the wall-span aggregate (total bytes / cross-query wall-span), NOT
+      the overcounting sum-of-per-query-rates.
+    - RUN: pbench run experiments/ablation_query_scaling_A.yaml --build-dir <INLINE-OFF dir> --detach
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 5
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  topology: single-node
+  duration_seconds: 60
+  worker:
+    query_engine:
+      number_of_worker_threads: 24
+      number_of_io_threads: 4
+      invoke_mode_configuration: default   # overridden per rung
+    default_query_execution:
+      operator_buffer_size: 65536
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 80000
+  query_config:
+    source_type: TCP           # overridden per rung
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    output_formatter: { type: CSV }
+    input_parser: {}
+    output_parser: {}
+  generator:
+    data_file: data/nexmark/bid_6GB.csv
+    repeat: 100
+    mode: uniform
+
+# ── TCP ablation ladder, PASS A (rungs 0-4) ────────────────────────────────────
+_ladder_A_tcp: &ladder_A_tcp
+  label: "optimization (cumulative)"
+  explicit:
+    - name: r0_baseline
+      baseline: true
+      overrides:
+        query_config.source_type: BlockingTCP
+        query_config.input_formatter: { type: SequentialUncompiledCSV, threading_mode: SEQUENTIAL }
+        query_config.output_formatter: { type: CSVUncompiled }
+        query_config.input_parser: {}
+        query_config.output_parser: {}
+        worker.query_engine.invoke_mode_configuration: default
+        overload: false
+    - name: r1_parallel
+      overrides:
+        query_config.source_type: BlockingTCP
+        query_config.input_formatter: { type: UncompiledCSV }
+        query_config.output_formatter: { type: CSVUncompiled }
+        query_config.input_parser: {}
+        query_config.output_parser: {}
+        worker.query_engine.invoke_mode_configuration: default
+        overload: false
+    - name: r2_async
+      overrides:
+        query_config.source_type: TCP
+        query_config.input_formatter: { type: UncompiledCSV }
+        query_config.output_formatter: { type: CSVUncompiled }
+        query_config.input_parser: {}
+        query_config.output_parser: {}
+        worker.query_engine.invoke_mode_configuration: default
+        overload: false
+    - name: r3_compiled
+      overrides:
+        query_config.source_type: TCP
+        query_config.input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: CSV }
+        # Fast codec plugins — same algorithms the uncompiled arm hardcodes; codec held
+        # constant fast across the ladder so cat3 isolates the JIT/lazy MECHANISM.
+        query_config.input_parser: &fast_parsers
+          uint64: TracedUINT64
+          int64: TracedINT64
+          int32: FastINT32
+          int16: TracedINT16
+          uint32: TracedUINT32
+          uint16: TracedUINT16
+          bool: TracedBOOL
+          f64: EiselFloatF64
+          f32: EiselFloatF32
+        query_config.output_parser: &fast_out { f64: ZMIJF64, f32: ZMIJF32 }
+        worker.query_engine.invoke_mode_configuration: default
+        overload: false
+    - name: r4_fnattr
+      overrides:
+        query_config.source_type: TCP
+        query_config.input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: CSV }
+        query_config.input_parser: *fast_parsers
+        query_config.output_parser: *fast_out
+        worker.query_engine.invoke_mode_configuration: fnattr
+        overload: false
+
+_scale_x: &scale_x
+  label: "Concurrent Queries"
+  parameter: num_queries
+  values: [1, 10, 50, 100, 200, 500, 1000]
+
+_tput_y: &tput_y { metric: throughput_mbps, label: "Total System Throughput (MB/s)" }
+
+variants:
+  - name: bid_star_scaling
+    description: "Scaling concurrent SELECT * (passthrough) — source/threading/async dominate"
+    query: nexmark/bid_star
+    axes: { x: *scale_x, series: *ladder_A_tcp }
+    y: *tput_y
+    visualization: { type: line_chart, x_scale: log }
+  - name: q1_price_scaling
+    description: "Scaling concurrent Q1 float codec — plugins/inline/fnattr dominate"
+    query: nexmark/q1_price
+    axes: { x: *scale_x, series: *ladder_A_tcp }
+    y: *tput_y
+    visualization: { type: line_chart, x_scale: log }

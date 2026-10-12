@@ -1,0 +1,256 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: nexmark_native_vs_csv
+  description: >
+    NATIVE (binary .nes, SystemNative formatter) vs FULLY-OPTIMIZED CSV input across the
+    Nexmark_with_varsized.test query set — "what does the text format cost e2e after all CSV
+    optimizations?" Both arms keep CSV OUTPUT (+ ZMIJF64) so this isolates the INPUT side
+    (user call 2026-07-07; a native-out arm can be added later). Production path: worker-cli
+    (nes-cli + single-node-worker), MonitoringSink measures wall-span throughput + latency.
+
+    ARMS (series): csv_optimized = SIMDCSV + TracedUINT64/FastINT32/EiselFloatF64, quote checking
+    OFF (allow_commas=false; all nexmark CSVs are quote-free), input+output parse inlining is the
+    committed build default. native = SystemNative reading .nes (packed LE rows; VARSIZED as fixed
+    \x00-padded slots, string_length '16,32,32,16,4,256'; extra entries ignored by no-VARSIZED
+    schemas so the one value serves bid/auction/person). NO input parsers in the native arm —
+    fields are read at fixed strides, no index, no codec.
+
+    METRIC: compare processing_time_s (or derived rows/s), NOT throughput_mbps — the same logical
+    rows are 24 B/row binary vs ~35 B/row text for bid (4.4 GB .nes vs 6.4 GB .csv), so MB/s has
+    different denominators per arm. throughput_mbps stays recorded (honest per-arm input MB/s).
+
+    EXPECT (predict-first, W16): native faster everywhere in rows/s; gap LARGEST on parse-forced
+    cheap-per-row queries (q1 float codec, bid_ts/person projections, q2/filter_eq int-parse+index
+    — CSV pays SIMD index + per-field codecs, native pays a stride read); gap SMALLEST on q5/q8/q8v
+    (join/window state dominates, Amdahl) . CAVEATS built in: (1) bid_star CSV-in->CSV-out rides the
+    lazy passthrough elision (byte-copy, no parse) while native must FORMAT CSV output from binary —
+    the CSV arm may WIN bid_star; that asymmetry is the elision working, not native being slow.
+    (2) At W16 a single async File source supplies ~7 GB/s warm — arms that hit producer supply
+    (native bid passthrough-ish reads) get their gap COMPRESSED; W1 or per-CCX profiling separates
+    per-row cost if needed.
+
+    GOTCHAS: .nes files generated 2026-07-07 by csv_to_binary.py (now with the byte-validated fast
+    numpy path) into cmake-build-release testdata large/nexmark/ — bid 4,415,801,304 B / auction
+    432,000,000 B / person 1,472,000,000 B; regenerate if the build tree is wiped. NES_FILE_REPEAT=4
+    (via generator.repeat) widens the steady window for the 7 STATELESS queries only; q5/q8/q8v run
+    repeat=1 — replaying the file makes event-time go BACKWARD at the wrap (windows/watermarks
+    break). person CSV is quote-free (checked: 0 double-quotes) so allow_commas=false is correct.
+    Native person tuples are 368 B (extra slot mostly padding) — the .nes is BIGGER than the CSV.
+    Stray-worker preflight: pkill -x main / :8080 free (never pkill -f). Buffer pool 16384 x 128 KiB.
+
+    CRLF (found 2026-07-08): auction_707MB.csv and person_840MB.csv have \r\n line endings (bid is
+    \n). Consequences: (1) the LAST auction column (category INT32) parses as "12\r" — strict
+    FastINT32 THROWS "malformed", the engine-DEFAULT int32 parser hits the release-JIT __emutls
+    crash, and TracedINT32 silently MIS-parses (wrong checksum, non-constant delta). Fix: the q8
+    catalog entries now point at auction_707MB_lf.csv (tr -d '\r' copy; identical values, recorded
+    checksums stay valid) so the full fast stack applies. (2) person's LAST column (extra VARSIZED)
+    keeps the \r in the CSV arm but the .nes strings are clean (python csv strips \r) ->
+    person_star checksums differ by exactly 13 x 4M rows (csv 85430084707 vs native 85378084707);
+    counts identical. Semantically equal data.
+
+    NATIVE MISALIGNMENT BUG (found + FIXED 2026-07-08): what looked like "+11229 duplicate rows"
+    was the native indexer computing cross-buffer alignment with the COMPILE-TIME buffer size
+    (metaData.getBufferSize()=4096) instead of the real raw buffer size (131072): 2/3 of buffers
+    were bulk-read at shifted offsets (garbage VALUES, count-neutral) and undersized spanning
+    tuples emitted 1 phantom row per misaligned boundary (Release compiles the size INVARIANT out).
+    Only subset-projections without filters showed it (q0/star/filter/agg pipelines were value-
+    correct even pre-fix). Fixed in NativeInputFormatIndexer.cpp (rawBuffer.getBufferSize()); all
+    10 queries arm-EQUAL post-fix, person/bid projections reproduce recorded checksums exactly.
+    Numbers below from the POST-FIX re-run (pre-fix table kept for reference where marked).
+
+    SYSTEST-MODE WARNING (do NOT port this experiment to mode:systest as-is): the native path there
+    exhausts the global pool ~O(input size) before EoS (bid needs an 8.6GB pool and runs 31s) —
+    worker-cli is fine (private source pool throttles; validated 2026-07-08: q0 native 5.8GB/s).
+    Also: CSV-arm SELECT * checksums are ELIDED raw bytes (bid_star 353216217968) while native must
+    ZMIJ-format floats (388223174259) — equal floats, different shortest-form text; arm-vs-arm
+    checksum equality holds only for queries whose floats are formatted in BOTH arms (e.g. q1).
+
+    RESULTS — AUTHORITATIVE POST-FIX RE-RUN (2026-07-08, W16, reps=3 median, 60/60 ok), in the
+    TWO-METRIC / TWO-RATIO convention (user call 2026-07-08): GB/s = each arm's OWN input
+    bytes/s (per-byte engine efficiency — the read path is priced in bytes); Mrows/s =
+    format-invariant workload outcome (charges each format its byte footprint; time-per-dataset
+    is redundant given Mrows/s and dropped). TWO speedups: "GB/s x" = NAT/CSV per-byte
+    efficiency ratio, "Mr/s x" = NAT/CSV outcome ratio (= t_csv/t_native). Their quotient is
+    the byte-footprint ratio (1.459 bid, 0.599 person). Now first-class in pbench: catalog
+    DataEntry.rows -> runners derive input_rows/throughput_mrows_s (NULL on legacy rows; this
+    table computed offline from stored processing_time_s + catalog rows).
+      query               | CSV GB/s NAT GB/s GB/s x | CSV Mr/s NAT Mr/s Mr/s x
+      person_projection   |     7.27     9.27  1.28x |     33.0     25.2  0.76x
+      person_star         |     8.14     6.93  0.85x |     37.0     18.8  0.51x
+      bid_ts_projection   |     6.81     6.74  0.99x |    194.5    280.8  1.44x
+      bid_filter_eq       |     5.96     6.88  1.15x |    170.2    286.5  1.68x
+      q0_bid_star         |     6.57     5.74  0.87x |    187.6    239.0  1.27x
+      q1_price            |     5.80     5.79  1.00x |    165.7    241.3  1.46x
+      q2_filter_proj      |     5.96     5.75  0.96x |    170.3    239.6  1.41x
+      q5_window_join      |     0.64     0.64  1.00x |     18.3     26.8  1.47x
+      q8_join             |     0.39     0.41  1.07x |      3.8      3.5  0.90x
+      q8_variant          |     0.19     0.14  0.72x |      5.1      5.5  1.07x
+    Reading the ratio pair: GB/s x ~1.00 (q1/q5/ts/q2) -> the Mr/s gap is PURE encoding density
+    (the 1.459x text footprint). GB/s x > 1 with Mr/s x > 1 (bid_filter_eq 1.15/1.68) -> CSV
+    also pays real per-byte cost (predicate index+parse). GB/s x > 1 with Mr/s x < 1
+    (person_projection 1.28/0.76) -> the native ENGINE path is more efficient per byte but the
+    format's 1.67x bloat overwhelms it. GB/s x < 1 (q0 0.87, person_star 0.85, q8v 0.72) ->
+    native pays serialize/varsized work per byte that elided/lighter CSV arms skip.
+    vs the PRE-FIX run: bid scans/joins/person stable (±5%); the filter speedups settled DOWN
+    (filter_eq 2.12->1.68, q2 1.99->1.41) — the pre-fix native filter readings (8992/7986 MB/s)
+    were outliers (the overload A/B had already measured filter_eq native at 6728, matching the
+    post-fix 6877); the post-fix values are the trustworthy ones. Note post-fix bid full scans
+    cluster 1.27-1.46 ~ the 1.459 byte ratio = both arms in the warm supply band (W16-compressed);
+    the honest W1 filter gap is 2.8-2.9x (see nexmark_filter_overload_ab).
+    READING: (1) native wins BIG only where CSV must index+int-parse per row with tiny output
+    (point/mod filters ~2x). (2) bid full-scan queries cluster at speedup ~1.29-1.44 ~= the 1.459
+    byte ratio — BOTH arms run ~5.6-6.6 GB/s = the warm single-source supply/copy band, so W16 is
+    SUPPLY-compressed (per-row parse cost hidden; W1 needed to expose it). (3) person: native
+    LOSES because the .nes is 1.67x BIGGER (368B rows, 256B mostly-padding extra slot) AND the CSV
+    arm elides (person_star csv 8.4 GB/s = passthrough, no parse); native pays fixed-slot->varsized
+    materialization. Fixed-width native is hostile to wide mostly-short VARSIZED data. (4) joins:
+    format ~irrelevant (Amdahl). CSV-arm q5 648.8 vs native 602.5 MB/s but smaller native file ->
+    1.35x. q8_join native slightly SLOWER despite fewer bytes (varsized build side).
+  primary_metric: processing_time_s
+  higher_is_better: false
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  completion_timeout_s: 600
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser: { uint64: TracedUINT64, int32: FastINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  generator:
+    repeat: 4
+
+# Series (shared by every variant): baseline = the fully-optimized CSV stack from the defaults;
+# native swaps the data files, the formatter, and drops the (CSV-only) input parsers.
+_series: &format_series
+  label: "input format"
+  explicit:
+    - name: csv_optimized
+      baseline: true
+      overrides: {}
+    - name: native
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "16,32,32,16,4,256" }
+        query_config.input_parser: {}
+
+_axes_x: &w16_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [16]
+
+_y: &time_y { metric: processing_time_s, label: "Processing time (s)" }
+
+variants:
+  # ── pre-Nexmark warm-up queries from Nexmark_with_varsized.test (user-added, file order) ──
+  - name: person_projection
+    description: "SELECT id FROM person — 1 fixed col of a varsized schema"
+    query: nexmark/person_projection
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  - name: person_star
+    description: "SELECT * FROM person — full varsized materialization"
+    query: nexmark/person_star
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  - name: bid_ts_projection
+    description: "SELECT timestamp FROM bid — 1-of-4 strict projection"
+    query: nexmark/bid_ts_projection
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  - name: bid_filter_eq
+    description: "SELECT * WHERE auctionId = 1000 — point filter, 758 survivors"
+    query: nexmark/bid_filter_eq
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  # ── Nexmark queries ──
+  - name: q0_bid_star
+    description: "Q0: SELECT * FROM bid (CSV arm = passthrough-elided!)"
+    query: nexmark/bid_star
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  - name: q1_price
+    description: "Q1: price * 908/1000 — float parse + arith + ZMIJ out"
+    query: nexmark/q1_price
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  - name: q2_filter_proj
+    description: "Q2: auctionId,price WHERE %123 — int-parse/index bound on CSV"
+    query: nexmark/q2_filter_proj
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  # Stateful variants: NO file repeat (event-time wraps backward on replay -> broken windows/
+  # watermarks) AND the stateful-join pool shape from stateful_join_knowngood.yaml: state is
+  # consumed by buffer COUNT (per-slice), not bytes -> many SMALL buffers (2M x 4 KiB = 8 GB;
+  # the passthrough-tuned 16384 x 128 KiB pool is 30-500x too small — q8_join's person build
+  # side alone exhausted it, verified 2026-07-08). Arms compare WITHIN a variant, so the
+  # different worker config vs the stateless variants does not bias the native-vs-csv ratio.
+  - name: q5_window_join
+    description: "Q5: sliding-window agg + self-join (repeat=1, stateful pool)"
+    query: nexmark/q5_window_join
+    overrides:
+      generator.repeat: 1
+      worker.default_query_execution.operator_buffer_size: 4096
+      worker.number_of_buffers_in_global_buffer_manager: 2000000
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  - name: q8_join
+    description: "Q8: person JOIN auction (varsized build side; repeat=1, stateful pool)"
+    query: nexmark/q8_join
+    # full fast stack is safe again: the catalog now points auction at the LF copy (the CRLF
+    # original broke every fast int32 parser one way or another — see q8_join.yaml)
+    overrides:
+      generator.repeat: 1
+      worker.default_query_execution.operator_buffer_size: 4096
+      worker.number_of_buffers_in_global_buffer_manager: 2000000
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  - name: q8_variant
+    description: "Q8 variant: bid JOIN auction, 182M output rows (repeat=1, stateful pool)"
+    query: nexmark/q8_variant
+    overrides:
+      generator.repeat: 1
+      worker.default_query_execution.operator_buffer_size: 4096
+      worker.number_of_buffers_in_global_buffer_manager: 2000000
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+    visualization: { type: grouped_bar }

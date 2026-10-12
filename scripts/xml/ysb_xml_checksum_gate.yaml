@@ -1,0 +1,93 @@
+# CORRECTNESS GATE: the ysb XML twin through the UNMODIFIED HL7 indexer (XML config)
+# must reproduce the checksum of the XML-independent CSV arm (ysb_csv_checksum_gate.yaml)
+# over the same rows -- the cross-format anchor for the ysb/person XML datasets.
+query: SELECT user_id, page_id, campaign_id, ad_type, event_type, current_ms, ip, d1, d2, d3, d4 FROM ysb INTO chk
+logical:
+  - name: ysb
+    schema:
+      - { name: x01, type: VARSIZED }
+      - { name: x02, type: VARSIZED }
+      - { name: x03, type: VARSIZED }
+      - { name: x04, type: VARSIZED }
+      - { name: user_id, type: UINT64 }
+      - { name: x05, type: VARSIZED }
+      - { name: x06, type: VARSIZED }
+      - { name: x07, type: VARSIZED }
+      - { name: page_id, type: UINT64 }
+      - { name: x08, type: VARSIZED }
+      - { name: x09, type: VARSIZED }
+      - { name: x10, type: VARSIZED }
+      - { name: campaign_id, type: UINT64 }
+      - { name: x11, type: VARSIZED }
+      - { name: x12, type: VARSIZED }
+      - { name: x13, type: VARSIZED }
+      - { name: ad_type, type: UINT64 }
+      - { name: x14, type: VARSIZED }
+      - { name: x15, type: VARSIZED }
+      - { name: x16, type: VARSIZED }
+      - { name: event_type, type: UINT64 }
+      - { name: x17, type: VARSIZED }
+      - { name: x18, type: VARSIZED }
+      - { name: x19, type: VARSIZED }
+      - { name: current_ms, type: UINT64 }
+      - { name: x20, type: VARSIZED }
+      - { name: x21, type: VARSIZED }
+      - { name: x22, type: VARSIZED }
+      - { name: ip, type: UINT64 }
+      - { name: x23, type: VARSIZED }
+      - { name: x24, type: VARSIZED }
+      - { name: x25, type: VARSIZED }
+      - { name: d1, type: UINT64 }
+      - { name: x26, type: VARSIZED }
+      - { name: x27, type: VARSIZED }
+      - { name: x28, type: VARSIZED }
+      - { name: d2, type: UINT64 }
+      - { name: x29, type: VARSIZED }
+      - { name: x30, type: VARSIZED }
+      - { name: x31, type: VARSIZED }
+      - { name: d3, type: UINT32 }
+      - { name: x32, type: VARSIZED }
+      - { name: x33, type: VARSIZED }
+      - { name: x34, type: VARSIZED }
+      - { name: d4, type: UINT16 }
+      - { name: x35, type: VARSIZED }
+      - { name: x36, type: VARSIZED }
+      - { name: x37, type: VARSIZED }
+      - { name: x38, type: VARSIZED }
+physical:
+  - logical: ysb
+    type: File
+    host: "localhost:8080"
+    parser_config:
+      type: HL7
+      message_delimiter: '\n'
+      segment_delimiter: '<'
+      field_delimiter: '>'
+      component_delimiter: ""
+      subcomponent_delimiter: ""
+    source_config:
+      file_path: __TESTDATA__/large/ysb/ysb_1k_data_474M.xml
+sinks:
+  - name: chk
+    type: Checksum
+    host: "localhost:8080"
+    schema:
+      - { name: ysb$user_id, type: UINT64 }
+      - { name: ysb$page_id, type: UINT64 }
+      - { name: ysb$campaign_id, type: UINT64 }
+      - { name: ysb$ad_type, type: UINT64 }
+      - { name: ysb$event_type, type: UINT64 }
+      - { name: ysb$current_ms, type: UINT64 }
+      - { name: ysb$ip, type: UINT64 }
+      - { name: ysb$d1, type: UINT64 }
+      - { name: ysb$d2, type: UINT64 }
+      - { name: ysb$d3, type: UINT32 }
+      - { name: ysb$d4, type: UINT16 }
+    config:
+      file_path: __OUTPUT__
+      legacy_output_format: CSV
+    ## the nes-cli Sink decoder requires the key even when empty
+    parser_config: {}
+workers:
+  - host: "localhost:8080"
+    max_operators: 10000

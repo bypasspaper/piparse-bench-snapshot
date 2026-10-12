@@ -1,0 +1,92 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: stateful_reverify_ysb_large
+  description: >
+    STATEFUL RE-VERIFICATION on the current branch tip (paper-workload item 6, session
+    2026-08-04b): the 3 stateful paper queries (ysb_1k_varsized, q8_join, cm_q2) ran clean in
+    the head-to-head era (nes_vs_flink_csv_json_stateful, 2026-07-14); re-run them once on
+    the CURRENT binary (uncommitted: concat serialize-fallback + sequential formatter
+    plugins) to confirm nothing regressed before the 480-run matrix session. NES arm only,
+    1 rep, identical protocol: event-time over FILE sources, generator.repeat=1 ALWAYS
+    (replay into event-time windows corrupts the NES heap - OPEN BUG), q8 needs the
+    buffer-COUNT-bound stateful pool (4KiB x 2M buffers), ysb_1k_varsized needs xlarge
+    (4x forward-shifted 80M-row stream), TracedBOOL REQUIRED (cm BOOLEAN column;
+    DefaultBOOL SIGABRTs release workers).
+    PASS CRITERIA (from the 2026-07-14 run): completes without failure AND output counts
+    match: ysb_1k_varsized 68000, q8 10999751, cm 3094778 (check the kept monitoring csvs);
+    throughput ballpark (csv-input MB/s, was: ysb_1k_var 10674, q8 291, cm 319).
+    RUN: cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/stateful_reverify_tip.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Checksum
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser:
+      uint64: TracedUINT64
+      int64: TracedINT64
+      int32: FastINT32
+      int16: TracedINT16
+      uint32: TracedUINT32
+      uint16: TracedUINT16
+      f64: EiselFloatF64
+      f32: EiselFloatF32
+      bool: TracedBOOL
+    output_formatter: { type: JSON }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+
+_series_nes: &nes_only
+  label: "engine"
+  explicit:
+    - name: NebulaStream
+      baseline: true
+      overrides: {}
+
+_axes_x: &w16_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [16]
+
+_y: &mbps_y { metric: throughput_mbps, label: "Throughput (MB/s, csv input bytes)" }
+
+_stateful_pool: &stateful_pool
+  worker.default_query_execution.operator_buffer_size: 4096
+  worker.number_of_buffers_in_global_buffer_manager: 2000000
+
+variants:
+  - name: ysb_1k_varsized
+    description: "varsized YSB 1k, tumble 30s, 4x forward-shifted 80M-row stream (expect count 68000)"
+    query: yahoo/ysb_1k_varsized
+    overrides: { data_size: large }
+    axes: { x: *w16_x, series: *nes_only }
+    y: *mbps_y
+    visualization: { type: grouped_bar }

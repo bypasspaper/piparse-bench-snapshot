@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+query:
+  name: bid_star_materialize
+  description: >
+    MATERIALIZE side of the parse-vs-forward A/B on the realistic nexmark bid row (SELECT *). csv->json,
+    every field multiplied by a typed identity (* 1) so ALL 4 fields are parsed to native + re-serialized:
+    UINT64 timestamp, INT32 auctionId, INT32 bidder, FLOAT64 price. Float codec = Eisel in / ZMIJ out
+    (fastest); ints use the default int codec. Compare vs parsergrid/bid_star_passthrough. Data bid_250M.csv.
+  sql: "SELECT timestamp * UINT64(1) AS timestamp, auctionId * INT32(1) AS auctionId, bidder * INT32(1) AS bidder, price * FLOAT64(1) AS price FROM bid"
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/multicol/bid_250M.csv
+          size_bytes: 252114512
+  sink_schema:
+    - { name: timestamp, type: UINT64, not_null: true }
+    - { name: auctionId, type: INT32, not_null: true }
+    - { name: bidder, type: INT32, not_null: true }
+    - { name: price, type: FLOAT64, not_null: true }

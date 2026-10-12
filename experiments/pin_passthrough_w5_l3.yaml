@@ -1,0 +1,84 @@
+experiment:
+  name: pin_passthrough_w5_l3
+  description: >
+    THE L3 TEST — single operating point, no sweep. Does pinning worker+io threads to
+    one CCX, with a buffer pool that fits that CCX's L3, lift single-source passthrough?
+
+    CONFIG: bid passthrough (SELECT timestamp,auctionId,bidder,price FROM bid -> the
+    lazy CSV byte-copy fast path, parse ELIDED), File source (warm, replayed 4x via
+    NES_FILE_REPEAT for a steady multi-second window), IO=1, W=5. With pin_threads ON
+    the engine pins from core 0 => io + 5 workers = 6 threads land in CCX0 (cores 0-5),
+    sharing one 32 MB L3. Pool = 256 buffers x 128 KiB = 32 MB = exactly the CCX L3, so
+    the produce->consume->recycle cycle stays L3-resident (the BufferManager free-list
+    is a FIFO => reuse distance ~ pool size; pool <= L3 => a recycled buffer is still
+    L3-hot on the next fill, no DRAM write-allocate/RFO). See 2_engine_to_e2e §21.
+
+    SERIES: pin_threads off (baseline) vs on. This is the contrast that makes the test
+    interpretable; it is NOT a sweep (one thread config, one pool, one query).
+
+    MECHANISM being isolated: unpinned, thread migration scatters the handoff working
+    set across all 4 CCX (cross-CCX DRAM round-trip, amp ~3.7x). Pinned + pool<=L3, the
+    io->worker buffer handoff stays in the shared CCX0 L3 (amp ~1.54x). Single-source
+    passthrough = one producer, so pinning to ONE CCX is the right move (not the W=16
+    multi-producer case where confining to 1 CCX bandwidth-splits and HURTS).
+
+    PREDICTION (this Threadripper PRO 5965WX, native release; from §21 pin_pool_w4 @
+    pool 256 and the IO1/W5 sweep): pin OFF ~5.1 GB/s, pin ON ~8.7 GB/s (~+69%). W=5
+    ~= W=4 here (passthrough saturates ~W=4; the 6th CCX core adds little for one src).
+
+    GOTCHAS:
+      - mode: worker-cli (single-node-worker + nes-cli). pin_threads is a WORKER engine
+        feature (QueryEngine pins from core 0) — the systest/bench-runner embedded path
+        does not pin the same way, so the production worker path is required here.
+      - File source needs NO TCP generator: generator.repeat -> NES_FILE_REPEAT (replay
+        the 6.4 GB file 4x = 25.6 GB processed). MonitoringSink meters+discards, so the
+        small 32 MB pool does NOT overflow (precedent: pin_pool_w4 runs at 16-32 MB).
+      - Pool fits L3 with NO headroom at 256 (=32 MB). §21 found the pin optimum a notch
+        smaller (128 = 16 MB, leaves L3 headroom -> lower amp). 256 is the clean
+        "= CCX L3" point; expect within a few % of the 128 optimum.
+      - bid_6GB price column is an INTEGER (INT64) on disk -> lazy passthrough elision
+        fires (no float parse). Don't swap in a float-price schema here.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 2
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  worker:
+    query_engine:
+      number_of_worker_threads: 5
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+    default_query_execution:
+      operator_buffer_size: 131072            # 128 KiB
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 256   # 256 x 128 KiB = 32 MB = CCX L3
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64}
+    output_formatter: {type: CSV}            # lazy byte-copy passthrough (parse elided)
+  generator:
+    repeat: 4
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: pin_w5_l3
+    description: "bid passthrough, IO=1 W=5, pool 256 (=CCX L3), pin off vs on"
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "pin_threads"
+        explicit:
+          - {name: "off", overrides: {worker.query_engine.pin_threads: false}}
+          - {name: "on",  overrides: {worker.query_engine.pin_threads: true}}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

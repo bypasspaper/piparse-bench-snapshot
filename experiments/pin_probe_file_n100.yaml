@@ -1,0 +1,102 @@
+experiment:
+  name: pin_probe_file_n100
+  description: >
+    PINNED thread-budget probes at N=100, FILE async q1 (2026-07-07). All prior scaling
+    runs used pin_threads: false; PoC#3 found a pinned worker + unified io pool = the
+    BEST/FLATTEST tail. Constraint: pinned threads must NOT exceed the 24 physical cores
+    -> splits 16w/8io, 18w/6io, 20w/4io (24 threads each, 1:1 core mapping).
+
+    PINNING MECHANISM (pinning-ccx-results.md + QueryEngine.cpp): pin_threads=true pins
+    sequentially, IO at cores 0..nIO-1, workers at nIO..nIO+W-1 (workerCPUOffset=numIO).
+    CCX topology (5965WX): CCX0=0-5, CCX1=6-11, CCX2=12-17, CCX3=18-23, 32MB L3 each.
+    -> 18w/6io is the CCX-ALIGNED split: io@0-5 = exactly CCX0, workers@6-23 = CCX1-3.
+       16w/8io and 20w/4io straddle CCX boundaries on the io side.
+
+    UNPINNED BASELINES at N=100 (same workload, 1 rep each unless noted):
+      24w/6io 13634 (p50 1.1 / p99 12.2) | 18w/6io 13349 (p50 10.8 / p99 13.4)
+      20w/4io 12645 (p50 1.2 / p99 12.7) | 24w/4io 12601 (p50 1.2 / p99 12.3, n=3)
+      16w/8io 11530 (p50 12.6 / p99 15.1)
+
+    PREDICTIONS (write before running):
+      - Throughput: pinning adds L3-locality + kills migrations -> each split >= its
+        unpinned twin. 18w/6io pinned = best bet (~13.5-14.2 GB/s, CCX-aligned io).
+        20w/4io ~12.6-13.2 (io=4 supply cap still binds). 16w/8io ~11.5-12.5.
+      - TAIL (the real question): unpinned 16w/18w had queueing-dominated p50 (~11-13 ms,
+        below the ~20-worker knee). If pinning's efficiency gain effectively shifts the
+        knee, 18w/6io pinned p50 could DROP toward ~1-3 ms; if p50 stays ~10 ms, the knee
+        is purely service-capacity (worker count) and pinning can't move it. PoC#3-style
+        hope: p99 tightens below the ~12 ms unpinned tail everywhere.
+      - Risk: 100 sources' io load on a pinned-to-CCX0 io pool could saturate those 6
+        cores (read copies) -- watch for 18w/6io UNDERperforming its unpinned twin.
+
+    GOTCHAS: threads must fit 24 cores when pinned (offsets past 23 land on SMT siblings
+    24-47). Same fast stack + timestamp fix as source_parse_scaling_q1. pkill -x main.
+
+    RESULTS (2026-07-07, 1 rep each) -- PoC#3's TAIL FINDING REPRODUCES ON q1:
+      16w/8io = 12090 (+4.9% vs unpinned twin), p50 12.2 / p99 13.5 / p999 14.3
+      18w/6io = 12748 (-4.5%),                  p50  1.2 / p99  2.2 / p999  2.8
+      20w/4io = 11640 (-7.9%),                  p50  1.3 / p99  1.6 / p999  2.7
+      READING: pinning trades a few % throughput for a ~6-8x TIGHTER TAIL once workers
+      are above the queueing knee (18w/20w: p99 12-13 -> 1.6-2.2 ms, p999 <= 2.8 -- the
+      PoC#3 ~1 ms class). 18w/6io pinned even SHIFTS the knee: its unpinned twin was
+      queueing-dominated (p50 10.8), pinned it drops to 1.2 -- the CCX-aligned layout
+      (io@0-5 = CCX0) buys enough efficiency to move 18 workers above the knee. 16w is
+      below the knee either way. vs the best-throughput unpinned 24w/6io (13634, p99
+      12.2): pinned 18w/6io costs -6.5% throughput for -82% p99. THE LATENCY CONFIG:
+      pin=true 18w/6io; THE THROUGHPUT CONFIG: pin=false 24w/6io.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 600
+  num_queries: 100
+  worker:
+    query_engine:
+      pin_threads: true
+      invoke_mode_configuration: fnattr
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV }
+    input_parser: { uint64: TracedUINT64, int32: TracedINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  generator:
+    repeat: 6
+
+variants:
+  - name: pin_splits
+    description: "q1 file async, N=100, pin_threads=true: 16w/8io vs 18w/6io (CCX-aligned) vs 20w/4io"
+    query: nexmark/q1_price
+    axes:
+      x:
+        label: "workers/io split (24 pinned threads = 24 cores)"
+        explicit:
+          - name: 16w_8io
+            overrides:
+              worker.query_engine.number_of_worker_threads: 16
+              worker.query_engine.number_of_io_threads: 8
+          - name: 18w_6io
+            overrides:
+              worker.query_engine.number_of_worker_threads: 18
+              worker.query_engine.number_of_io_threads: 6
+          - name: 20w_4io
+            overrides:
+              worker.query_engine.number_of_worker_threads: 20
+              worker.query_engine.number_of_io_threads: 4
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: bar_chart }

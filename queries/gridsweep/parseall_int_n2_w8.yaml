@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+query:
+  name: gridsweep_parseall_int_n2_w8
+  description: >
+    2-D grid point (PARSE-ALL companion of the projection grid): 2-field schema, 8-digit values; parse+
+    serialize ALL 2 columns as UINT64 (cI*UINT64(1)). Index scales with N AND codec scales with N. Subtract the
+    projection grid (parse 1) to isolate the pure per-field parse+serialize cost. Data n2_w8.csv (209715318 B).
+  sql: "SELECT c0 * UINT64(1) AS c0, c1 * UINT64(1) AS c1 FROM t"
+  sources:
+    - name: t
+      schema:
+        - { name: c0, type: UINT64, not_null: true }
+        - { name: c1, type: UINT64, not_null: true }
+      data:
+        large: { file: large/multicol/n2_w8.csv, size_bytes: 209715318 }
+  sink_schema:
+    - { name: c0, type: UINT64, not_null: true }
+    - { name: c1, type: UINT64, not_null: true }

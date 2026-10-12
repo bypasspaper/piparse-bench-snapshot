@@ -1,0 +1,373 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: ablation_all_queries_A
+  description: >
+    ABLATION STUDY — PASS A (rungs 0-4, inline-OFF binary). Cumulative ladder that
+    attributes end-to-end CSV-parse speedup to each of 5 optimization categories
+    (split into 7 fine knobs). Same 25 all_queries variants as all_queries_benchmark.yaml,
+    but the csv-vs-native SERIES is replaced by the ablation ladder. Metric =
+    processing_time_s; figures convert to speedup vs rung 0.
+
+    WHY TWO FILES (A + B): rung 4->5 is the BUILD-TIME inline knob
+    (testing/configurations/InlineTagConfig.yaml -> generated header, needs recompile),
+    and pbench's --build-dir is per-run. So rungs 0-4 run against the inline-OFF build
+    dir (this file) and rungs 5-7 against the inline-ON build dir (ablation_all_queries_B.yaml).
+    Rung 5's config == rung 4's config; the ONLY difference is the binary -> the 4->5
+    delta IS the inline contribution. Merge the two run_groups at figure time (join on
+    variant + series/rung).
+
+    THE LADDER (each rung = prev + one flip; dependency-ordered). 7 rungs / 6 bars:
+      0 baseline : BlockingFile + SequentialUncompiledCSV/CSVUncompiled (SEQUENTIAL) +
+                   invoke=default + overload=false
+      1 +parallel (cat2)  : formatter -> UncompiledCSV/CSVUncompiled (PARALLEL), still BlockingFile
+      2 +async    (cat1)  : source -> File (async)
+      3 +compiled (cat3)  : formatter -> SIMDCSV/CSV (JIT + lazy elision) + the fast codec
+                            plugins (Eisel in / ZMIJ out, Traced/Fast ints)
+      4 +fnattr   (cat4a) : invoke_mode_configuration -> fnattr
+    (B file continues: 5 +inline / 6 +overload.)
+
+    THE CODEC IS HELD CONSTANT AT *FAST* ACROSS THE WHOLE LADDER — deliberately.
+    Parsing-FUNCTION PERFORMANCE is NOT a contribution of this work and is NOT ablated here
+    (user ruling 2026-07-16): the contribution is being able to plug codecs in with ZERO
+    OVERHEAD (that is cat 4a/4b's job), not the fact that Eisel beats from_chars. The
+    codec-vs-codec x execution-mode (inlined/traced) comparison is its own MICRO benchmark,
+    in the separate micro/macro section. Consequences, all good:
+      - no fast->slow->fast codec dip in the ladder (it is monotonic);
+      - no Default*-int JIT-crash (__emutls) confound — the crash-prone Default int/bool
+        parsers simply never appear; the fast stack is used throughout;
+      - inline/fnattr are measured WITH the fast codecs in place, i.e. on their real target
+        and in the production configuration (previously they would have been measured
+        against Default codecs, understating them).
+
+    WHY cat3 IS A CLEAN MECHANISM BAR: uncompiledFastParse (the uncompiled path's hardcoded
+    numeric parse) IS fast_float = the Eisel-Lemire core == EiselFloatF64, and the uncompiled
+    output path was rewritten to to_chars+zmij, byte-identical to the compiled ZMIJ. So both
+    sides of the compiled/uncompiled boundary run THE SAME CODEC ALGORITHMS -> rung 3
+    isolates the MECHANISM (JIT + lazy elision vs interpreted + materialized), not the codec.
+    NOTE (expected, honest): at rung 3 the codec is a PLUGIN PROXY CALL that is not yet
+    inlined, while the uncompiled arm calls its codec directly with no std::function
+    indirection. So for codec-bound (float) queries rung 3 may DIP below rung 2 — that is a
+    real effect, and rungs 4-5 (fnattr, inline) are exactly what drive the plugin overhead
+    back to zero. That dip-then-recover IS the "zero-overhead plugins" story; do not
+    engineer it away.
+
+    CAVEATS (must appear in the write-up):
+    - DEPENDENCY: SequentialUncompiledCSV requires a Blocking source (parameters.yaml
+      constraint); that is why the baseline is BlockingFile and async (cat1) can only be
+      added after parallel (cat2). uncompiled bypasses the JIT so fnattr/inline are no-ops
+      until rung 3 (compiled) -> function-context steps come after compiled.
+    - STATE-BOUND queries (joins, sliding windows, CM, ysb_10k, all smart grid) are
+      parse-invisible by design (their own laws): expect ~flat ladders for them. Kept in
+      the matrix per user request (all 25) as an honest negative signal.
+
+    PROTOCOL (inherited from all_queries_benchmark.yaml, unchanged):
+    - v2 controlled protocol: W16 pinned + CCX-sharded admission queue, io=1, 128KiB
+      buffers, warm reads, reps=3 median.
+    - generator.repeat: DEFAULT 1. Stateless nexmark scans use 24 for steady windows
+      (SAFE: no window state). NES_FILE_REPEAT>1 into ANY event-time window corrupts the
+      heap -> stateful queries stay repeat=1.
+    - stateful pool (4KiB x 2M) for nexmark joins q5/q8/q8v only (join state is
+      buffer-COUNT-bound); window aggregations run on the default 16384 x 128KiB.
+    - The rung overrides (source/formatter/parser/invoke/overload) and the per-variant
+      repeat/pool overrides touch DISJOINT keys -> they compose cleanly.
+    - RUN: pbench run experiments/ablation_all_queries_A.yaml --build-dir <INLINE-OFF dir> --detach
+  primary_metric: processing_time_s
+  higher_is_better: false
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: default   # overridden per rung (default -> fnattr)
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File          # overridden per rung
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV }   # overridden per rung
+    output_formatter: { type: CSV }      # overridden per rung
+    input_parser: {}           # overridden per rung
+    output_parser: {}          # overridden per rung
+  generator:
+    repeat: 1
+
+# ── The ablation ladder, PASS A (rungs 0-4) ────────────────────────────────────
+# Each rung fully specifies every knob it controls so it does not inherit a
+# neighbouring rung's state. `query_config.input_formatter` (a 2-level dotted key)
+# REPLACES the whole dict via _set_nested; same for input_parser/output_parser.
+_ladder_A: &ladder_A
+  label: "optimization (cumulative)"
+  explicit:
+    - name: r0_baseline
+      baseline: true
+      overrides:
+        query_config.source_type: BlockingFile
+        query_config.input_formatter: { type: SequentialUncompiledCSV, threading_mode: SEQUENTIAL }
+        query_config.output_formatter: { type: CSVUncompiled }
+        query_config.input_parser: {}
+        query_config.output_parser: {}
+        worker.query_engine.invoke_mode_configuration: default
+        overload: false
+    - name: r1_parallel
+      overrides:
+        query_config.source_type: BlockingFile
+        query_config.input_formatter: { type: UncompiledCSV }
+        query_config.output_formatter: { type: CSVUncompiled }
+        query_config.input_parser: {}
+        query_config.output_parser: {}
+        worker.query_engine.invoke_mode_configuration: default
+        overload: false
+    - name: r2_async
+      overrides:
+        query_config.source_type: File
+        query_config.input_formatter: { type: UncompiledCSV }
+        query_config.output_formatter: { type: CSVUncompiled }
+        query_config.input_parser: {}
+        query_config.output_parser: {}
+        worker.query_engine.invoke_mode_configuration: default
+        overload: false
+    - name: r3_compiled
+      overrides:
+        query_config.source_type: File
+        query_config.input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: CSV }
+        # Fast codec plugins — the SAME algorithms the uncompiled arm hardcodes (fast_float
+        # == Eisel-Lemire == EiselFloatF64; uncompiled output == zmij == ZMIJ). The codec is
+        # held constant FAST for the whole ladder, so cat3 isolates the JIT/lazy MECHANISM,
+        # not codec performance (which is a micro-benchmark, not a contribution).
+        query_config.input_parser: &fast_parsers
+          uint64: TracedUINT64
+          int64: TracedINT64
+          int32: FastINT32
+          int16: TracedINT16
+          uint32: TracedUINT32
+          uint16: TracedUINT16
+          bool: TracedBOOL
+          f64: EiselFloatF64
+          f32: EiselFloatF32
+        query_config.output_parser: &fast_out { f64: ZMIJF64, f32: ZMIJF32 }
+        worker.query_engine.invoke_mode_configuration: default
+        overload: false
+    - name: r4_fnattr
+      overrides:
+        query_config.source_type: File
+        query_config.input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: CSV }
+        query_config.input_parser: *fast_parsers
+        query_config.output_parser: *fast_out
+        worker.query_engine.invoke_mode_configuration: fnattr
+        overload: false
+
+_axes_x: &w16_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [16]
+
+_y: &time_y { metric: processing_time_s, label: "Processing time (s)" }
+
+_stateless_repeat: &stateless_repeat
+  generator.repeat: 24
+
+_stateful_pool: &stateful_pool
+  generator.repeat: 1
+  worker.default_query_execution.operator_buffer_size: 4096
+  worker.number_of_buffers_in_global_buffer_manager: 2000000
+
+variants:
+  # ── Nexmark stateless ──────────────────────────────────────────────────────
+  - name: nx_person_projection
+    description: "SELECT id FROM person - 1 fixed col of a varsized schema"
+    query: nexmark/person_projection
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *ladder_A }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_person_star
+    description: "SELECT * FROM person - full varsized materialization"
+    query: nexmark/person_star
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *ladder_A }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_bid_ts_projection
+    description: "SELECT timestamp FROM bid - 1-of-4 strict projection"
+    query: nexmark/bid_ts_projection
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *ladder_A }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_bid_filter_eq
+    description: "SELECT * WHERE auctionId = 1000 - point filter"
+    query: nexmark/bid_filter_eq
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *ladder_A }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_q0_bid_star
+    description: "Q0: SELECT * FROM bid (passthrough)"
+    query: nexmark/bid_star
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *ladder_A }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_q1_price
+    description: "Q1: price * 908/1000 - float parse + arith + ZMIJ out (the codec query)"
+    query: nexmark/q1_price
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *ladder_A }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_q2_filter_proj
+    description: "Q2 (repo shape): auctionId,price WHERE %123 - int-parse/index bound on csv"
+    query: nexmark/q2_filter_proj
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *ladder_A }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_q2_original
+    description: "Q2 (PAPER shape): 5-way OR point selection"
+    query: nexmark/q2_original
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *ladder_A }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_q14_calc
+    description: "q14 (reduced): computed-float range filter, tunable selectivity"
+    query: nexmark/q14_calc
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *ladder_A }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_q10_datetime
+    description: "q10 (reduced): CASTFROMUNIXTS ISO-8601 reformat - numeric->string output"
+    query: nexmark/q10_datetime
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *ladder_A }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_q22_concat
+    description: "q22 (interim CONCAT): string manipulation over string-bearing bid"
+    query: nexmark/q22_concat
+    overrides: { generator.repeat: 4 }
+    axes: { x: *w16_x, series: *ladder_A }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  # ── Nexmark stateful (joins) ────────────────────────────────────────────────
+  - name: nx_q5_window_join
+    description: "Q5: sliding-window agg + self-join (repeat=1, stateful pool)"
+    query: nexmark/q5_window_join
+    overrides: *stateful_pool
+    axes: { x: *w16_x, series: *ladder_A }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_q8_join
+    description: "Q8: person JOIN auction (varsized build side; repeat=1, stateful pool)"
+    query: nexmark/q8_join
+    overrides: *stateful_pool
+    axes: { x: *w16_x, series: *ladder_A }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_q8_variant
+    description: "Q8 variant: bid JOIN auction, 182M output rows (repeat=1, stateful pool)"
+    query: nexmark/q8_variant
+    overrides: *stateful_pool
+    axes: { x: *w16_x, series: *ladder_A }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  # ── ClusterMonitoring ───────────────────────────────────────────────────────
+  - name: cm_q2_original
+    description: "CM Q2 on the 1.53GB google trace: sliding 60s/1s SUM(cpu) by jobId"
+    query: cluster_monitoring/q2_original
+    axes: { x: *w16_x, series: *ladder_A }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  # ── YSB fixed-width ─────────────────────────────────────────────────────────
+  - name: ysb_1k
+    description: "YSB 1k campaigns on the 24x forward-shifted 120M-row stream (steady windows)"
+    query: yahoo/ysb_1k
+    overrides: { data_size: xlarge }
+    axes: { x: *w16_x, series: *ladder_A }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: ysb_10k
+    description: "YSB 10k campaigns, single-pass 0.5GB (state-bound)"
+    query: yahoo/ysb_10k
+    axes: { x: *w16_x, series: *ladder_A }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  # ── YSB varsized ────────────────────────────────────────────────────────────
+  - name: ysb_1k_varsized
+    description: "varsized YSB 1k on the 4x forward-shifted 80M-row stream (steady windows)"
+    query: yahoo/ysb_1k_varsized
+    overrides: { data_size: xlarge }
+    axes: { x: *w16_x, series: *ladder_A }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: ysb_10k_varsized
+    description: "varsized YSB 10k, single-pass 3.7GB"
+    query: yahoo/ysb_10k_varsized
+    axes: { x: *w16_x, series: *ladder_A }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  # ── Linear Road + Manufacturing ─────────────────────────────────────────────
+  - name: lrb_q1
+    description: "LRB Q1: AVG(speed) 5min/1s + HAVING over nested projection, x200 tiling"
+    query: lrb/q1_avg_speed
+    overrides: { data_size: xlarge }
+    axes: { x: *w16_x, series: *ladder_A }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: lrb_q2
+    description: "LRB Q2: COUNT per vehicle 30s/1s (1499 vehicles x posDiv), x200 tiling"
+    query: lrb/q2_vehicle_count
+    overrides: { data_size: xlarge }
+    axes: { x: *w16_x, series: *ladder_A }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: mfg_multi_agg
+    description: "Manufacturing: keyless 5-agg 1min/1s, real 1.43GB/14.8-day stream"
+    query: manufacturing/window_multi_agg
+    axes: { x: *w16_x, series: *ladder_A }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  # ── Smart Grid ──────────────────────────────────────────────────────────────
+  - name: sg1_global
+    description: "SG1 global AVG 1h/1s on the x120 tiling (trigger-path lock-bound at W16)"
+    query: smartgrid/sg1_global_avg
+    overrides: { data_size: xlarge }
+    axes: { x: *w16_x, series: *ladder_A }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: sg2_plug
+    description: "SG2 per-plug AVG 128s/1s on the x120 tiling"
+    query: smartgrid/sg2_plug_avg
+    overrides: { data_size: xlarge }
+    axes: { x: *w16_x, series: *ladder_A }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: sg3_outlier
+    description: "SG3 DEBS outlier NL-join 1h/1s on the x120 tiling (shape load-bearing!)"
+    query: smartgrid/sg3_outlier_join
+    overrides: { data_size: xlarge }
+    axes: { x: *w16_x, series: *ladder_A }
+    y: *time_y
+    visualization: { type: grouped_bar }

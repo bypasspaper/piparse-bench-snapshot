@@ -1,0 +1,57 @@
+query:
+  name: sg2_plug_avg
+  description: "Smart Grid SG2: per-plug AVG(value), sliding 128s/1s (= the disabled .test's Query 2)"
+
+  sql: |
+    SELECT start, end, plugId, householdId, houseId, AVG(value) AS avg_value
+    FROM smartGrid
+    GROUP BY (plugId, householdId, houseId)
+    WINDOW SLIDING(creationTS, SIZE 128 SEC, ADVANCE BY 1 SEC)
+
+  flink_sql: |
+    SELECT CAST(TIMESTAMPDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', CAST(window_start AS TIMESTAMP(3))) AS BIGINT) * 1000 AS `start`, CAST(TIMESTAMPDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', CAST(window_end AS TIMESTAMP(3))) AS BIGINT) * 1000 AS `end`, plugId, householdId, houseId,
+    AVG(CAST(`value` AS DOUBLE)) AS avg_value
+    FROM TABLE(HOP(TABLE smartGrid, DESCRIPTOR(`__rt`), INTERVAL '1' SECOND, INTERVAL '128' SECOND(3)))
+    GROUP BY window_start, window_end, plugId, householdId, houseId
+
+  sources:
+    - name: smartGrid
+      flink_rowtime: { column: creationTS, delay: "0.001 SECOND" }
+      schema:
+        - { name: creationTS, type: UINT64, not_null: true }
+        - { name: value, type: FLOAT32, not_null: true }
+        - { name: property, type: FLOAT32, not_null: true }
+        - { name: plugId, type: INT16, not_null: true }
+        - { name: householdId, type: INT16, not_null: true }
+        - { name: houseId, type: INT16, not_null: true }
+      data:
+        large:
+          file: large/smartgrid/smartgrid-data_974K.csv
+          size_bytes: 963766
+          rows: 33627
+        native:
+          file: large/smartgrid/smartgrid-data_974K.nes
+          size_bytes: 739794
+          rows: 33627
+        xlarge:
+          file: large/smartgrid/smartgrid_ext120_115M.csv
+          size_bytes: 115651920
+          rows: 4035240
+        xlarge_native:
+          file: large/smartgrid/smartgrid_ext120_115M.nes
+          size_bytes: 88775280
+          rows: 4035240
+
+  sink_schema:
+    - { name: smartGrid.start, type: UINT64, not_null: true }
+    - { name: smartGrid.end, type: UINT64, not_null: true }
+    - { name: smartGrid.plugId, type: INT16, not_null: true }
+    - { name: smartGrid.householdId, type: INT16, not_null: true }
+    - { name: smartGrid.houseId, type: INT16, not_null: true }
+    - { name: smartGrid.avg_value, type: FLOAT64, not_null: true }
+
+  validation:
+    # From the disabled SmartGrid.test (Query 2). The .test records THREE checksum variants
+    # (201359101/201359115/201359117) - the f32 AVG is combine-order nondeterministic; the
+    # COUNT is the stable gate. Valid for the large (seed) file only.
+    large: { tuples: 98176, checksum: 201359117 }

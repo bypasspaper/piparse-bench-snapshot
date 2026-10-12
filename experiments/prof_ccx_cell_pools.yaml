@@ -1,0 +1,99 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: prof_ccx_cell_pools
+  description: >
+    VALIDATION of per-CCX SHARED source pools (worker.ccx_shared_source_pools; engine commit on
+    benchmark-piparse-lazyparse-fast-csv): all non-prefill sources whose io threads live on one
+    CCX draw from ONE 128-buffer pool -> ring working set = numCcx x 16 MB = 64 MB, independent
+    of source count. Structural version of the ring-discriminator result (probe_ccx_cells:
+    16 src with manually halved inflight = 42.7 GB/s vs 28.1 at defaults).
+
+    ARMS: private_pools (feature off = per-source 8 MB rings) vs cell_pools (on), passthrough
+    bid_1GB, 8io+16w striped cells, N in {16, 32}.
+
+    EXPECT (predict-first): private 16 src ~28, 32 src ~20 (reproduces probe_ccx_cells);
+    cell_pools 16 src ~42-43 (the discriminator value WITHOUT manual inflight tuning) and
+    32 src ~38-42 (working set unchanged at 64 MB; per-source inflight cap = min(64, 128/2)=64
+    unchanged; the only new cost is 32 sources contending on 4 MPMC free lists). If 32-src
+    cell_pools ~= 40, the supply law is made structural: sources scale freely, rings never
+    spill L3.
+
+    GOTCHAS: dd-preflight bid_1GB (page class re-rolls); stray-worker check; prefill/io_uring
+    sources are scoped OUT of cell pools by design (preFillsBuffers()); the INFO line
+    "ccx_shared_source_pools: created 4 cell pools" in worker.log confirms engagement (log
+    level permitting) - otherwise confirm via the throughput signature.
+
+    RESULTS (2026-07-10, 4/4 ok, bid_1GB dd class 10.9):
+                        N=16      N=32
+      private_pools     28043     20585   (reproduces probe_ccx_cells baseline)
+      cell_pools        42133     42748   (+50% / +108%; FLAT in N - N=32 even edges N=16)
+    BOTH PREDICTIONS HIT: cell pools deliver the ring-discriminator value (42.7) WITHOUT any
+    manual inflight tuning, and the curve is flat in source count - the supply law is now
+    STRUCTURAL (working set = 4 x 16 MB regardless of N; 32 sources contending on 4 MPMC free
+    lists costs nothing measurable). Correctness: ccx_cell_pool_checksum_smoke - all 4 queries
+    (person_projection/q2/q1/q5 incl. stateful) checksum-identical to the single-queue arm and
+    the recorded catalog values; 29 engine unit tests pass flag off/on.
+    N=128 EXTENSION (2026-07-10): cell_pools 42434 vs private 19724 (+115%) - FLAT across a
+    full order of magnitude of source count (42.1/42.7/42.4 GB/s at N=16/32/128). 16 sources
+    multiplexed per io thread cost NOTHING once rings stay L3-resident, further confirming the
+    earlier "multiplexing penalty" was pure ring spill. Private at 128 = the DRAM-ring floor
+    (~20, same as N=32).
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 8
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV }
+    input_parser: { uint64: TracedUINT64, int32: TracedINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  worker_env:
+    NES_TASKQUEUE_STATS: 1
+  generator:
+    repeat: 6
+
+_series: &pool_series
+  label: "source pools"
+  explicit:
+    - name: private_pools
+      baseline: true
+      overrides: {}
+    - name: cell_pools
+      overrides:
+        worker.ccx_shared_source_pools: true
+
+variants:
+  - name: passthrough_cell_pools
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "Concurrent Queries (= Concurrent Sources)"
+        parameter: num_queries
+        values: [16, 32]
+      series: *pool_series
+    y: { metric: throughput_mbps, label: "Aggregate System Throughput (MB/s)" }
+    visualization: { type: line_chart }

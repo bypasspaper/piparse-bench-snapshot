@@ -1,0 +1,79 @@
+experiment:
+  name: cold_read_validation
+  description: >
+    VALIDATION that the cold_read mechanism actually forces a cold disk read — proven
+    the convincing way (user's call): run the SAME query/config twice, flipping ONLY
+    the cache-state knob, and show the measured throughput collapse warm->cold.
+
+    Two arms over the identical bid_6GB passthrough (W=4 / IO=1, pool 4096, pin off):
+    - warm: warm_read: true  -> the runner sequentially reads bid_6GB into the page
+      cache before submit (mincore logs "resident 0 -> 6369 MB"); the query's reads
+      are cache hits.
+    - cold: cold_read: true  -> the runner posix_fadvise(DONTNEED)s it out (mincore
+      logs "resident 6369 -> 0 MB"); the query's reads hit the disk.
+    Both arms set their cache state EXPLICITLY, so the result is order-independent (a
+    cold run leaves the cache warm, but the next warm arm re-warms and the next cold
+    arm re-evicts regardless). repeat: 1 (single 6.44 GB pass) — cold_read requires it.
+
+    PREDICTION (the proof criterion):
+    - warm ~5.4 GB/s (= rung-2b single-pass File, §21h) — memory-path bound.
+    - cold ~2.36 GB/s (= rung-1, §3) — QD1 disk-latency bound.
+    A clean ~2.2-2.3x warm/cold gap, with the matching mincore residency lines in the
+    run log, proves: (1) eviction works (residency 6369->0), AND (2) it actually moves
+    the measured throughput (not just a counter). If warm and cold came out equal, the
+    eviction would be a no-op and the whole cold-read arc would be invalid — so this is
+    the gate before trusting any cold number (incl. cold_file_baseline.yaml).
+
+    GOTCHAS:
+    - Needs bid_6GB.csv under <build>/nes-systests/testdata/large/nexmark/ (gitignored
+      generated data). Sandbox OFF (spawns worker, binds :8080); verify :8080 free.
+    - The warm arm's pre-read is itself disk-bound on a truly cold cache (~2-3 s for
+      6 GB) — that's setup, not part of the measured window.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  worker:
+    query_engine:
+      number_of_worker_threads: 4
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 4096
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64}
+    output_formatter: {type: CSV}
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: cold_read_validation
+    description: "Same bid_6GB passthrough, warm-cache vs cold-cache"
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "cache state"
+        explicit:
+          - name: "warm"
+            baseline: true
+            overrides: {warm_read: true}
+          - name: "cold"
+            overrides: {cold_read: true}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

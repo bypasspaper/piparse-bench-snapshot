@@ -1,0 +1,181 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: nexmark_native_native_v3
+  description: >
+    V3 = the NATIVE->NATIVE arm (user call 2026-07-09): native .nes input AND native output,
+    completing the pipeline story next to v2's csv->csv and native->csv arms
+    (nexmark_native_vs_csv_v2, same protocol: pinned W16 + ccx_aware_task_queues + repeat 24
+    stateless / 1 stateful + dd-preflight ceilings).
+
+    HOW NATIVE OUTPUT WORKS (no engine change was needed): sink output_format NATIVE makes the
+    query compiler skip the output-formatting pipeline entirely (PipeliningPhase.cpp:351-359,
+    addDefaultEmit) - the sink receives ENGINE-LAYOUT rows, no codecs anywhere. NOTE the output
+    is the engine REPRESENTATION (VARSIZED as 16-B child-buffer refs), NOT a serialized .nes
+    file - exactly the right no-serialization upper bound for the Monitoring-sink benchmark,
+    but do not read this arm as "writes .nes files" (a fixed-slot native FILE writer would be
+    a separate task). Full source+sink elision does NOT fire (sourceFormat SYSTEMNATIVE !=
+    NATIVE) and must not: SystemNative raw buffers have spanning tuples at buffer boundaries.
+
+    PROBE VALIDATION (2026-07-09): q0 native->native, repeat=1, Checksum sink -> count
+    183,991,721 EXACT and checksum 388223174259 == the recorded arm-equal q0 value. Monitoring
+    probe: 7785 MB/s single-pass (vs v2 native->csv 6196 = +26% before any window tuning).
+
+    EXPECT (predict-first, vs v2's native->csv arm): q0 6.2 -> toward the supply wall ~9-10
+    GB/s (per-byte >= csv-elided parity; Mr/s ~x1.46 over csv by footprint); q1 6.15 (50%
+    ceil, ZMIJ-bound) -> ~8-10 (remaining work = stride read + arith + emit); person_star
+    10.3 -> ~wall (sheds CSV string serialization; input-side varsized materialization
+    remains); q8_variant 0.14 GB/s -> flips UP (182M-row output serialize was its wall);
+    q5/q8_join ~unchanged (state-bound); person_projection/bid scans small gains. After this
+    arm, the only text cost left in the matrix is INPUT-side index+parse (v2: 1.05-1.11x).
+
+    DD CEILINGS THIS RUN (2026-07-09 pre-launch, after re-rolls): bid_6GB.nes 13.0 (close to
+    v2's 12.3 - bid rows cross-comparable) / person_840MB.nes 9.1-9.2 (SLOW-CLASS, resisted two
+    rewrites - person rows must be read as %-of-own-ceiling, raw GB/s will look low vs v2's
+    11.7!) / auction_707MB.nes 11.7 / auction_707MB_lf.csv 11.4 (joins state-bound, ceiling
+    irrelevant).
+
+    RESULTS (2026-07-09, 30/30 ok, reps=3 median; %ceil = GB/s / own dd ceiling; three-arm
+    columns quote v2 for csv->csv and native->csv):
+      query           | csv->csv     | nat->csv     | NAT->NAT      | Mr/s nat-nat vs csv-csv
+      person_proj     | 10.91 (79%)  | 10.76        |  8.00 (88%*)  |  21.7 vs 49.5 (0.44)
+      person_star     | 10.88 (79%)  | 10.29        |  7.58 (83%*)  |  20.6 vs 49.4 (0.42)
+      bid_ts_proj     |  9.06 (75%)  |  9.48        | 10.19 (78%)   | 424.4 vs 258.7 (1.64)
+      bid_filter_eq   |  9.24 (76%)  | 10.26        | 10.49 (81%)   | 437.3 vs 264.0 (1.66)
+      q0_bid_star     |  9.33 (77%)  |  6.20 (50%)  |  9.60 (74%)   | 399.9 vs 266.3 (1.50)
+      q1_price        |  6.81 (56%)  |  6.15 (50%)  |  9.64 (74%)   | 401.7 vs 194.5 (2.07)
+      q2_filter_proj  |  9.32 (77%)  | 10.10        | 10.55 (81%)   | 439.7 vs 266.0 (1.65)
+      q5_window_join  |  0.63        |  0.64        |  0.65         |  27.0 vs 18.0  (1.50)
+      q8_join         |  0.34        |  0.38        |  0.39         |   3.2 vs  3.4  (0.94)
+      q8_variant      |  0.18        |  0.14        |  0.15         |   6.2 vs  4.9  (1.27)
+      (* person nes rolled SLOW-CLASS 9.1 this run vs 11.7 in v2 - raw person GB/s and Mr/s
+       are NOT cross-run comparable; %ceil is: 88/83% here vs 92/88% in v2 ~= same wall.)
+    PREDICTION SCORECARD + READING:
+    (1) q1 = THE headline, predicted and hit: 6.15 -> 9.64 (74% ceil, now supply-bound - the
+        ZMIJ float output was its entire binding cost). Native pipeline beats the text pipeline
+        2.07x in rows/s on the codec-heavy query - the cleanest "what a text pipeline costs"
+        number in the matrix.
+    (2) q0 flipped as predicted: 6.20 -> 9.60 (74%), per-byte parity with csv's elided 9.33
+        (77%); Mr/s x1.50 ~= footprint. The v2 0.66x row was pure output-serialization tax.
+    (3) Native->native is now the upper bound everywhere: every scan row sits at 74-88% of its
+        own file ceiling (supply-bound across the board); bid rows beat csv->csv per byte
+        1.03-1.13x AND in Mr/s 1.50-1.66x.
+    (4) q8_variant did NOT flip (0.14 -> 0.15, +9%; Mr/s 1.27x vs csv) - prediction WRONG in
+        magnitude: its wall is the join + 182M-row output MATERIALIZATION through 4KiB
+        stateful-pool buffers, not the text codec. The v2 0.79x per-byte was mostly join-output
+        machinery. Remaining dig candidate if joins ever matter.
+    (5) person rows: CSV string serialization removed -> at the wall of a slow-class file
+        (%ceil comparable to v2); input-side fixed-slot->varsized materialization is now their
+        only remaining format cost. q5/q8_join unchanged (state-bound), as predicted.
+    BOTTOM LINE (3-arm matrix complete): text costs live in (a) encoding density (footprint
+    ratios 1.46 bid / 0.60 person), (b) output serialization (q0 x1.55, q1 x1.57 per byte -
+    REMOVED by native out), (c) input index+parse (only 1.05-1.11x at W16). The engine core
+    is supply-bound at ~80% of memcpy ceiling whenever codecs are absent.
+  primary_metric: processing_time_s
+  higher_is_better: false
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: native
+  topology: single-node
+  completion_timeout_s: 600
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SystemNative, string_length: "16,32,32,16,4,256" }
+    output_formatter: { type: NATIVE }
+  generator:
+    repeat: 24
+
+_axes_x: &w16_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [16]
+
+_y: &time_y { metric: processing_time_s, label: "Processing time (s)" }
+
+_stateful: &stateful_overrides
+  generator.repeat: 1
+  worker.default_query_execution.operator_buffer_size: 4096
+  worker.number_of_buffers_in_global_buffer_manager: 2000000
+
+variants:
+  - name: person_projection
+    query: nexmark/person_projection
+    axes: { x: *w16_x }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  - name: person_star
+    query: nexmark/person_star
+    axes: { x: *w16_x }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  - name: bid_ts_projection
+    query: nexmark/bid_ts_projection
+    axes: { x: *w16_x }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  - name: bid_filter_eq
+    query: nexmark/bid_filter_eq
+    axes: { x: *w16_x }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  - name: q0_bid_star
+    query: nexmark/bid_star
+    axes: { x: *w16_x }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  - name: q1_price
+    query: nexmark/q1_price
+    axes: { x: *w16_x }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  - name: q2_filter_proj
+    query: nexmark/q2_filter_proj
+    axes: { x: *w16_x }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  - name: q5_window_join
+    query: nexmark/q5_window_join
+    overrides: *stateful_overrides
+    axes: { x: *w16_x }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  - name: q8_join
+    query: nexmark/q8_join
+    overrides: *stateful_overrides
+    axes: { x: *w16_x }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  - name: q8_variant
+    query: nexmark/q8_variant
+    overrides: *stateful_overrides
+    axes: { x: *w16_x }
+    y: *time_y
+    visualization: { type: grouped_bar }

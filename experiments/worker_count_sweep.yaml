@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: worker_count_sweep
+  description: >
+    WORKER-COUNT SWEEP for the r-par rung (machine = TR PRO 5965WX: 24 cores in 4 CCXs of 6,
+    SMT off-pattern via pinning). Question: is the historic W16 optimal, or does 20-24 win?
+    W in {8,12,16,20,22,24}: 12/16/20/24 are CCX-even (4 cells x 3/4/5/6), 22 leaves 2 cores
+    for the InMemory source + io thread, 24 gives workers every core (source thread must
+    preempt a pinned worker -- watch for a REGRESSION here, the known runnable-threads>cores
+    failure shape). Two queries at opposite poles: iso_q2 (cheapest per-row, source-hand-out
+    sensitive) and csv->csv passthrough (output-bound). InMemory prefill + REPEAT=20 (true =
+    reported x20; identical correction across W -> the CURVE SHAPE needs no correction).
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 2
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: true
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false }
+    output_formatter: { type: NATIVE }
+    input_parser:
+      uint64: TracedUINT64
+      int64: TracedINT64
+      int32: FastINT32
+      int16: TracedINT16
+      uint32: TracedUINT32
+      uint16: TracedUINT16
+      bool: TracedBOOL
+      f64: EiselFloatF64
+      f32: EiselFloatF32
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 20
+    NES_INMEM_BUFSIZE: 131072
+
+_w_x: &w_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [8, 12, 16, 20, 22, 24]
+
+_w16: &w16
+  label: "config"
+  explicit:
+    - name: w16_inmem
+      baseline: true
+      overrides: {}
+
+# The bidstr_iso_* catalog entries name their data representations json/csv/native (no 'large');
+# data_size MUST select 'csv' or the renderer falls back to the FIRST entry (json) and feeds JSON
+# bytes to the CSV parser -> "fast integer parse" failures (burned this session, 2026-08-04).
+_w16csv: &w16csv
+  label: "config"
+  explicit:
+    - name: w16_inmem
+      baseline: true
+      overrides: { data_size: csv }
+
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s, x20 for true)" }
+
+variants:
+  - name: iso_q2_native
+    description: "cheapest per-row: %123 filter, ~0.8% survivors, NATIVE out"
+    query: nexmark/bidstr_iso_q2
+    axes: { x: *w_x, series: *w16csv }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: passthrough_csv
+    description: "output-bound pole: full csv->csv passthrough serialization"
+    query: nexmark/bid_strings_passthrough
+    axes: { x: *w_x, series: *w16 }
+    y: *tput_y
+    visualization: { type: grouped_bar }

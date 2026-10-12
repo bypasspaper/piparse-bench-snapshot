@@ -1,0 +1,151 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: nes_vs_flink_vs_spark_scaling
+  description: >
+    FULL 1->1024 many-source SCALING head-to-head: how do NES, Flink and Spark hold up as the
+    number of CONCURRENT sources/queries grows, running the FROZEN 10-query stateless
+    PAPER_WORKLOAD as a HETEROGENEOUS MIX (each of the N concurrent sources runs one of the 10
+    shapes, round-robin: q0, q_project, q_route, q1, q2-og, q2-mod, q10, q14, q22, Q_ex),
+    csv -> json. Real-workload generalization of the 2026-07 "green curve" (which scaled ONE
+    parse-free passthrough query to 1024): now BOTH parse AND JSON serialization are real work.
+    RUN THE PROBE (nes_vs_flink_vs_spark_scaling_probe.yaml, N=128/256) FIRST and gate this full
+    sweep on it (NES bounded, Flink collapsing, Spark characterized).
+      - NES   = the many-source PRODUCTION config (NOT the single-source head-to-head config):
+                CCX cells + fragment shredder (LOCK_FREE_FRAGMENTS) + pin_threads + 16 workers /
+                8 io threads + 192x128KiB shared source pools; File sources; SIMDCSV fast parsers
+                -> JSON output into Monitoring. num_queries = N concurrent File-source queries,
+                round-robining query_mix; MonitoringSink stamps per-TupleBuffer ingest->sink
+                latency + aggregate throughput (throughput_mbps over the true cross-query wall).
+      - Flink = mode flink, flink_output_format latency_json = N StatementSet pipelines (one task
+                slot each), pipeline i runs query_mix[i%10]'s flink_sql into the json-latency-
+                blackhole sink (Flink's real JSON encoder per row + per-readBatch nanoTime stamp).
+      - Spark = mode spark, spark_output_format json_void_latency = N concurrent Structured
+                Streaming queries in one SparkSession (local[N]), round-robining query_mix; the
+                fair to_json void sink + per-micro-batch triggerExecution latency (recentProgress).
+    LATENCY SEMANTICS (the consistency rule): all three measure PER-BATCH ingest->sink latency
+    (NES per-TupleBuffer, Flink per-readBatch, Spark per-micro-batch). NES/Flink batch = 128 KiB
+    (operator_buffer_size / io-fetch-size). SPARK ARCHITECTURAL LIMIT: its file streaming source
+    admits WHOLE FILES per trigger, so on a single bounded file each stream is exactly ONE
+    micro-batch (128 KiB / any sub-file batching is IMPOSSIBLE) -- Spark's per-batch latency is
+    thus whole-stream latency, which is WHY it cannot offer sub-stream latency at all (a citable
+    limitation, stated as the finding).
+    EXPECTATION: NES stays BOUNDED (throughput plateau + p99 flat to 1024, per the certified
+    green curve), Flink's tail COLLAPSES past core count (~N=32-64), Spark's driver micro-batch
+    scheduler is the unknown. If a competitor dies before 1024, that ceiling IS a result (cap its
+    curve, report it). At N=1024 the NES config is the certified 192x128KiB pool plateau.
+    FAIRNESS: all read the SAME bid_strings_3GB.csv, generator.repeat 1 (each source/pipeline
+    reads the file once = N x 3.6 GB aggregate input); compare on throughput_mbps (csv input bytes)
+    + p50/p99/p999 latency.
+    PRE-FLIGHT: pkill -x main (stale NES worker); flink-ext/pbench-flink-ext.jar built; pyspark
+    importable; bid_strings_3GB.csv present in <testdata>/large/nexmark/; dd/warm the file first;
+    --worker-port 9099 (root worker squats :8080). RUN WITH `pbench run --detach` and
+    PBENCH_FLINK_TIMEOUT=3600 PBENCH_SPARK_TIMEOUT=3600 PBENCH_KEEP_LOGS=1. High-N runs are slow
+    (aggregate ~a few GB/s / N-GB of work); N=1024 can take many minutes per engine.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 2400
+  # Heterogeneous mix: the N concurrent sources/queries round-robin these 10 stateless shapes.
+  query_mix:
+    - nexmark/matrix/bidstr_q0
+    - nexmark/matrix/bidstr_qproject
+    - nexmark/matrix/bidstr_qroute
+    - nexmark/matrix/bidstr_q1
+    - nexmark/matrix/bidstr_q2og
+    - nexmark/matrix/bidstr_q2mod
+    - nexmark/matrix/bidstr_q10
+    - nexmark/matrix/bidstr_q14
+    - nexmark/matrix/bidstr_q22
+    - nexmark/matrix/bidstr_qex
+  worker:
+    query_engine:
+      # Many-source PRODUCTION config: CCX cells + pinned workers is the RIGHT config here (it is
+      # a ~2x pathology only for SINGLE-source runs; this is the many-source regime it was built
+      # for). 16 workers + 8 io threads = 24 physical cores.
+      number_of_worker_threads: 16
+      number_of_io_threads: 8
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+    # One shared source buffer pool per CCX cell (needs ccx_aware_task_queues + pin_threads);
+    # 192 x 128 KiB = 24 MB/cell -- the certified L3-governed plateau config (serves N=1..1024).
+    ccx_shared_source_pools: true
+    ccx_source_pool_buffers: 192
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    # Fragment shredder decouples cell-pool sizing from source fan-in (the N>=512 wedge fix).
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false, sequence_shredder_mode: LOCK_FREE_FRAGMENTS }
+    input_parser:
+      uint64: TracedUINT64
+      int64: TracedINT64
+      int32: FastINT32
+      int16: TracedINT16
+      uint32: TracedUINT32
+      uint16: TracedUINT16
+      f64: EiselFloatF64
+      f32: EiselFloatF32
+      bool: TracedBOOL
+    output_formatter: { type: JSON }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+
+_series_engines: &engines
+  label: "engine"
+  explicit:
+    - name: NebulaStream
+      baseline: true
+    - name: Flink
+      system: flink
+      overrides:
+        mode: flink
+        flink_execution_mode: streaming
+        flink_output_format: latency_json
+    - name: Spark
+      system: spark
+      overrides:
+        mode: spark
+        spark_output_format: json_void_latency
+        spark_single_reader: true
+        # Give Spark all 24 physical cores (matches NES 16w+8io and Flink's up-to-24 slots);
+        # without this Spark would inherit NES's 16 worker threads and be under-provisioned.
+        spark_parallelism: 24
+        # NOTE: no maxBytesPerTrigger. Spark's file streaming source admits WHOLE FILES per trigger
+        # (verified: 1 MiB..64 MiB all -> 1 batch on the single 3.6 GB file), so it CANNOT sub-divide
+        # a single bounded file: each stream = exactly ONE micro-batch. Its "per-batch" latency is
+        # therefore whole-stream latency -- an architectural limit (no sub-stream latency possible),
+        # not a config choice. spark.scheduler.mode=FAIR is set (template) but is ~moot here since
+        # each single-reader stream is one atomic task.
+
+_axis_n: &n_x
+  label: "concurrent sources/queries"
+  parameter: num_queries
+  values: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1000]
+
+_y: &mbps_y { metric: throughput_mbps, label: "Aggregate throughput (MB/s, csv input bytes)" }
+
+variants:
+  - name: mix
+    description: "Heterogeneous 10-query mix, csv->json, scaled over N concurrent sources/queries"
+    # Primary query_ref (for cache-warm + row/label resolution); all 10 share bid_strings_3GB.csv.
+    query: nexmark/matrix/bidstr_q0
+    axes: { x: *n_x, series: *engines }
+    y: *mbps_y
+    visualization: { type: line_chart }

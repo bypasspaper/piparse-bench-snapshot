@@ -1,0 +1,101 @@
+experiment:
+  name: tcp_1src_worker_sweep
+  description: >
+    HOW MANY WORKER THREADS SATURATE ONE asio TCP source? (Never cleanly measured for TCP:
+    tcp_pin_pool_1src fixed W=16; the old "W=4 saturates passthrough" claim came from a
+    pre-fix, history-contaminated pool/worker sweep -- not trusted.) Single cold-ish asio TCP
+    source, bid_6GB passthrough -> MonitoringSink (output_format=CSV => parse ELIDED, pure
+    ingestion), IO=1. Sweep worker threads W={1,2,3,4} (user expects ~3 to saturate). Each W is
+    measured under THREE pool/pinning modes (series):
+      - large : private inflight pool 4096 (=512 MB) -> recv-copy DESTINATION spills to DRAM, pin off
+      - L3    : private inflight pool   64 (=8 MB)   -> copy destination stays in 32 MB CCX L3, pin off
+      - L3pin : private inflight pool   64 (=8 MB)   + pin_threads -> confine io+workers to one CCX
+    The relevant pool is the PER-SOURCE PRIVATE inflight pool (default_max_inflight_buffers) -- the
+    buffers the single io thread copies socket bytes into and recycles -- because THAT determines
+    whether the recv-copy destination is L3- or DRAM-resident. Global pool stays large (32768) and
+    is not the cap (private pool bounds inflight). At W<=4, pin mode fits one CCX cleanly: io(1) +
+    workers(<=4) = <=5 threads <= 6 cores/CCX, NO oversubscription (unlike the W=16 pin case that
+    HURTS).
+
+    HYPOTHESIS (reasoned, pre-measurement):
+    - Saturation: passthrough has ~no per-tuple compute (parse elided), so workers only memcpy the
+      band + hand to the sink. Expect W=1 supply-limited (one drainer < io supply), climbing to a
+      knee at W~=2-3, FLAT by W=4. Ceiling = the single io thread's recv (~5.2 GB/s, the validated
+      1-src point; raw recv ceiling 6.17 GB/s on 1 core).
+    - Modes: TCP copies FRESH kernel data every buffer (no warm source data to keep resident, unlike
+      warm File reads), so the L3-pool win is ONLY the faulted-warm copy DESTINATION (avoids
+      first-touch / DRAM write-allocate on a 512 MB pool). Expect L3 modestly > large (~+5-15%, far
+      less than File's +76%). Pinning at low W: single producer + global MPMC queue has no affinity
+      routing, so pin controls only WHERE threads run; expect small locality gain (L3pin >= L3 by
+      0-10%). The interesting result would be if a mode SHIFTS the saturation W.
+
+    GOTCHAS (read before trusting numbers):
+    - repeat 4 = STEADY-STATE window (~26 GB streamed/run). A single 1-pass run is ramp-dominated and
+      W-insensitive (the engine-scaling "collapse with W" artifact) -- do NOT read saturation off a
+      cold 1-pass run.
+    - pbench tcp-generator is BLOCKING thread-per-client (no async-write deadlock under backpressure);
+      1 generator / 1 client / burst -> supply ~>5 GB/s, exceeds the engine. If a row looks supply-
+      capped, check the generator log MB/s (it prints per-iteration).
+    - Aggregation is now run-group-scoped (store.py fix 2026-06-29): the headline reflects ONLY this
+      run's reps. Still cross-check the per-rep -> X MB/s prints.
+    - PRE-FLIGHT `pkill -x main` (stray workers from a Ctrl-C'd run contaminate measurement).
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  completion_timeout_s: 180
+  worker:
+    query_engine:
+      number_of_io_threads: 1
+      number_of_worker_threads: 4          # overridden per x-value
+      invoke_mode_configuration: fnattr
+    default_query_execution:
+      operator_buffer_size: 131072         # 128 KiB
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+  query_config:
+    source_type: TCP
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64}
+    output_formatter: {type: CSV}
+  generator:
+    repeat: 4                              # steady-state (NOT cold 1-pass)
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: tcp_1src_worker_sweep
+    description: "worker-saturation for one asio TCP source x {large, L3, L3+pin} pool/pin modes"
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "Worker threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [1, 2, 3, 4]
+      series:
+        label: "pool / pin mode"
+        explicit:
+          - name: large
+            baseline: true
+            overrides:
+              worker.default_max_inflight_buffers: 4096
+              worker.query_engine.pin_threads: false
+          - name: L3
+            overrides:
+              worker.default_max_inflight_buffers: 64
+              worker.query_engine.pin_threads: false
+          - name: L3pin
+            overrides:
+              worker.default_max_inflight_buffers: 64
+              worker.query_engine.pin_threads: true
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: line_chart}

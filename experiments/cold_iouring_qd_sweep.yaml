@@ -1,0 +1,74 @@
+experiment:
+  name: cold_iouring_qd_sweep
+  description: >
+    Push the O_DIRECT io_uring cold ceiling: sweep queue depth (NES_IOURING_QD) for the
+    IoUringFile source, all O_DIRECT, cold. bid_6GB passthrough, W=4 / IO=1, pool 4096,
+    cold single pass, median n=3.
+
+    Context: at QD16 O_DIRECT = 5.31 GB/s cold (cold_iouring_direct), 77% of the ~6.9 NVMe
+    cap; the raw single-thread fio ceiling is ~6.7 (§2). This sweep finds whether more
+    depth closes the gap.
+
+    PREDICTION / what it tells us:
+    - If throughput RISES with QD toward ~6.7 -> the source was DEVICE-QD-bound; pick the
+      knee as the default QD.
+    - If FLAT from QD16 -> the limiter is the single source thread's per-buffer reap/emit
+      loop (one io_uring_wait_cqe + submit + getBufferBlocking + emit per 128 KiB = ~40k
+      iters/s at 5.3 GB/s), NOT the device. Then the lever is fewer/cheaper iterations:
+      batched CQE reaping (io_uring_peek_batch_cqe), bigger operator_buffer_size, or
+      multi-read submission — NOT more depth. Most likely outcome given the iter rate.
+    - A DROP at very high QD = oversubscription / cache pressure from too many in-flight
+      pool buffers.
+
+    GOTCHAS: needs bid_6GB.csv + worker rebuilt with liburing+O_DIRECT. cold_read evicts
+    before each run (O_DIRECT ignores cache anyway). worker_env sets NES_IOURING_DIRECT=1
+    (all arms) + NES_IOURING_QD per arm. Each arm holds QD x 128 KiB pool buffers in flight
+    (QD128 = 16 MB, well within the 512 MB pool). Sandbox OFF (:8080).
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: true
+  completion_timeout_s: 120
+  worker:
+    query_engine:
+      number_of_worker_threads: 4
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 4096
+  query_config:
+    source_type: IoUringFile
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64}
+    output_formatter: {type: CSV}
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+  worker_env:
+    NES_IOURING_DIRECT: 1
+
+variants:
+  - name: cold_iouring_qd_sweep
+    description: "COLD O_DIRECT IoUringFile, sweep NES_IOURING_QD"
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "NES_IOURING_QD (O_DIRECT)"
+        parameter: worker_env.NES_IOURING_QD
+        values: [8, 16, 32, 64, 128]
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: line_chart, x_scale: log}

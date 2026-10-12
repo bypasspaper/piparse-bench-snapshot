@@ -1,0 +1,76 @@
+experiment:
+  name: worker_thread_sweep
+  description: >
+    Steady-state passthrough throughput vs worker-thread count at the optimal pool
+    (4096 buffers = 512 MB), for File and TCP sources. Passthrough saturates at ~4
+    worker threads — the per-tuple work is only CSV indexing + a lazy byte copy, so
+    more workers don't help. At the ceiling the limiter is the single io thread's
+    read (TCP recv ~6.1 GB/s; File read-copy ~6.7 GB/s), not worker compute. At W=2
+    all of {2 workers + io thread} are CPU-saturated (index-bound). See HANDOVER.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+
+  worker:
+    query_engine:
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      # number_of_worker_threads is the X axis below.
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 4096   # 512 MB optimum
+
+  query_config:
+    source_type: TCP
+    sink_type: Monitoring
+    input_formatter:
+      type: SIMDCSV
+    input_parser:
+      uint64: TracedUINT64
+      int32: TracedINT32
+      int64: TracedINT64
+    output_formatter:
+      type: CSV
+
+  generator:
+    repeat: 4
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: bid_passthrough_threads
+    description: "bid_6GB passthrough -> Monitoring, sweep W x {File,TCP}, pool=4096"
+    query: nexmark/bid_passthrough
+
+    axes:
+      x:
+        label: "Worker Threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [1, 2, 4, 8, 16, 24]
+      series:
+        label: "Source"
+        explicit:
+          - name: File
+            baseline: true
+            overrides:
+              query_config.source_type: File
+          - name: TCP
+            overrides:
+              query_config.source_type: TCP
+
+    y:
+      metric: throughput_mbps
+      label: "Throughput (MB/s)"
+
+    visualization:
+      type: line_chart

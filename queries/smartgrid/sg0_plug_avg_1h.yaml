@@ -1,0 +1,40 @@
+query:
+  name: sg0_plug_avg_1h
+  description: "Smart Grid (disabled .test Query 1): per-plug AVG, sliding 1h/1s - SMOKE-ONLY entry (recorded count; = sg3's local side without the join)"
+
+  sql: |
+    SELECT start, end, plugId, householdId, houseId, AVG(value) AS avg_value
+    FROM smartGrid
+    GROUP BY (plugId, householdId, houseId)
+    WINDOW SLIDING(creationTS, SIZE 1 HOUR, ADVANCE BY 1 SEC)
+
+  sources:
+    - name: smartGrid
+      schema:
+        - { name: creationTS, type: UINT64, not_null: true }
+        - { name: value, type: FLOAT32, not_null: true }
+        - { name: property, type: FLOAT32, not_null: true }
+        - { name: plugId, type: INT16, not_null: true }
+        - { name: householdId, type: INT16, not_null: true }
+        - { name: houseId, type: INT16, not_null: true }
+      data:
+        large:
+          file: large/smartgrid/smartgrid-data_974K.csv
+          size_bytes: 963766
+          rows: 33627
+        native:
+          file: large/smartgrid/smartgrid-data_974K.nes
+          size_bytes: 739794
+          rows: 33627
+
+  sink_schema:
+    - { name: smartGrid.start, type: UINT64, not_null: true }
+    - { name: smartGrid.end, type: UINT64, not_null: true }
+    - { name: smartGrid.plugId, type: INT16, not_null: true }
+    - { name: smartGrid.householdId, type: INT16, not_null: true }
+    - { name: smartGrid.houseId, type: INT16, not_null: true }
+    - { name: smartGrid.avg_value, type: FLOAT64, not_null: true }
+
+  validation:
+    # From the disabled SmartGrid.test (Query 1); f32 AVG checksum nondeterministic, count is the gate.
+    large: { tuples: 1730016, checksum: 3598524228 }

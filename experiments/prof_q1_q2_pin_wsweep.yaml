@@ -1,0 +1,126 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: prof_q1_q2_pin_wsweep
+  # PROBE (user ask 2026-07-08): q1_price + q2_filter_proj — the two "per-byte WASH" rows of
+  # nexmark_native_vs_csv (W16 unpinned: q1 5.80/5.79 = 1.00x, q2 5.96/5.75 = 0.96x) — under the
+  # pinned protocol with a WORKER SWEEP [5,11,17,23] (io=cpu0, workers=cpu1..W; 24-core 5965WX,
+  # 6 cores/CCX). Unlike the person queries (supply-bound at any W), these are PARSE-FORCED bid
+  # queries: the sweep should DE-COMPRESS the old wash into per-row cost curves.
+  # dd ceilings THIS SESSION (per-session rule, both re-rolled): bid csv 14.9, bid nes 14.9 GB/s
+  # — IDENTICAL, so the file-class confound is absent and raw GB/s is arm-comparable. Expected
+  # supply wall ~80% x 14.9 ~= 11.9 GB/s.
+  # EXPECT (predict-first):
+  #   q1 csv: codec-bound (float Eisel-in + ZMIJ-out; W1 engine ~0.82 GB/s/worker with inline
+  #     defaults) -> W5 ~4-4.5 GB/s compute-bound, near-linear to W11 (~8-9), saturating at the
+  #     supply wall (~11-12) around W17-23.
+  #   q1 native: only output-side float serialize (~1.2-1.3 GB/s/worker guess) -> W5 ~6 GB/s,
+  #     saturates ~W11-17 at the wall. Native BEATS csv per byte at low W (real codec-cost gap,
+  #     like the honest W1 filter gap 2.8x), gap closes to ~1.0x at high W (same dd class).
+  #   q2 csv: index+framing-bound (~14 ns/row from the filter A/B -> ~2.5 GB/s/worker) -> W5
+  #     ~10-12 = AT or NEAR the wall already; flat in W after.
+  #   q2 native: near-free per row -> wall at W5, flat; q2 arms ~wash at ALL W (both supply-bound
+  #     everywhere = the old W16 wash was "real" for q2 but only because q2 is cheap enough).
+  #   Mr/s at compute-bound points = the honest per-row cost decompression (the W1-sweep story).
+  # Windows: repeat csv 50 (320 GB; q1W5 ~78s worst, ~30s typical), native 75 (331 GB; ~32-53s)
+  # — sized so the mid-window probe (needs ~24s of stable pid) catches most cells.
+  #
+  # RESULTS (2026-07-08, 16/16 ok; probe = mid-window rchar rate + io/worker CPU ticks):
+  #   q1_price          W5              W11             W17             W23
+  #     csv    GB/s|Mr/s 4.52|129.1     7.04|201.0      6.57|187.8      6.33|180.7
+  #            probe     io 46% wk 5.0  io PEG wk 8.7   io PEG wk 8.3   io PEG wk 8.1
+  #     native GB/s|Mr/s 3.30|137.6     6.72|279.9      6.93|288.6      6.70|279.2
+  #            probe     io 33% wk 5.0  io 98% wk 10.9  io PEG wk 12.2  io PEG wk 12.1
+  #   q2_filter_proj    W5              W11             W17             W23
+  #     csv    GB/s|Mr/s 11.20|319.8    8.21|234.5      6.98|199.3      6.45|184.2
+  #            probe     io PEG wk 4.9  io PEG wk 4.3   io PEG wk 4.0   io PEG wk 3.8
+  #     native GB/s|Mr/s 11.88|494.9    11.16|465.2     10.62|442.3     10.11|421.2
+  #            probe     io PEG wk 1.4  io PEG wk 1.5   io PEG wk 1.6   io PEG wk 1.9
+  # FINDINGS:
+  # 1. q1 HONEST PER-ROW COST ~EQUAL (prediction "native cheaper" WRONG): W5 compute-bound cells
+  #    give csv 25.8 vs native 27.5 Mr/s per worker (38.8 vs 36.4 ns/row, gap 1.07x) — the ZMIJ
+  #    float OUTPUT dominates BOTH arms; Eisel input parse + SIMD index add only ~2.4 ns/row.
+  #    (Matches the old output_parse-is-the-expensive-side finding.) Native's LOWER W5 GB/s
+  #    (3.3 vs 4.5) is just equal rows/s on 24B-vs-35.4B rows.
+  # 2. THE SUPPLY WALL IS LOAD-DEPENDENT (the big engine finding): io thread PEGGED in 14/16
+  #    cells but delivers 11.9 GB/s with ~1.4 busy worker cores (q2 native W5 = 79.7% of the
+  #    14.9 dd ceiling, the universal ~80%) degrading to ~6.5-7.0 with 8-12 busy cores spread
+  #    over 2-4 CCXs (q1 plateau, q2 csv high-W). Extra workers do not just idle - they DEGRADE
+  #    the copy: q2 csv 11.2@W5 -> 6.4@W23 (-43%!), q2 native -15%, q1 csv peak W11 then decline.
+  #    Byte-scanning workers hurt most (csv q2 worker-cores DROP 4.9->3.8 while throughput falls
+  #    = fewer bytes to scan, all coupling), but even non-scanning native q1 workers cap the io
+  #    thread at ~7 (heavy output-buffer traffic). Mechanism beyond CCX-RFO not yet separated
+  #    (output-write DRAM traffic? pool contention?) - a dig candidate.
+  # 3. OPTIMAL W IS SMALL & QUERY-SPECIFIC: q2 both arms W=5 (supply-bound; csv workers 4.9/5 =
+  #    just enough to index at wall rate, 15.6 ns/row == the 14 ns index+framing estimate); q1
+  #    csv W~11, q1 native W~17. Overshoot costs up to 43%. "Right-size W, compact CCXs".
+  # 4. THE OLD W16-UNPINNED WASH DECONSTRUCTED: q1 at optimal W is STILL a per-byte wash (7.04
+  #    vs 6.93, ratio 0.98) but now for a REAL reason - equal per-row codec cost + both arms
+  #    hitting the same degraded supply wall; Mr/s ratio 1.44 ~= footprint 1.477. q2 de-
+  #    compresses to native +6% GB/s / +55% Mr/s at W5 (csv needs exactly its 5 workers for
+  #    index+framing, native cruises at 1.4 cores).
+  description: "pinned worker-sweep de-compression of the q1/q2 per-byte wash (csv vs native)"
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  completion_timeout_s: 300
+  worker:
+    query_engine:
+      number_of_worker_threads: 5
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser: { uint64: TracedUINT64, int32: FastINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  generator:
+    repeat: 50
+
+_series: &format_series
+  label: "input format"
+  explicit:
+    - name: csv_optimized
+      baseline: true
+      overrides: {}
+    - name: native
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "16,32,32,16,4,256" }
+        query_config.input_parser: {}
+        generator.repeat: 75
+
+_axes_x: &w_sweep
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [5, 11, 17, 23]
+
+variants:
+  - name: q1_price_pin_wsweep
+    query: nexmark/q1_price
+    axes: { x: *w_sweep, series: *format_series }
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: line_chart }
+
+  - name: q2_filter_proj_pin_wsweep
+    query: nexmark/q2_filter_proj
+    axes: { x: *w_sweep, series: *format_series }
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: line_chart }

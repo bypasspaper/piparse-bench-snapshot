@@ -1,0 +1,209 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: ablation_stateless_B
+  description: >
+    ABLATION — STATELESS half, PASS B (rungs 5-6, inline-ON binary). Continuation of
+    ablation_stateless_A.yaml. RUN AGAINST THE INLINE-ON BUILD.
+
+    Rung 5 (r5_inline) has the SAME query/worker config as rung 4 (r4_fnattr in file A);
+    the ONLY difference is the binary (inline-ON here vs inline-OFF there). So the
+    rung4->rung5 delta, computed by merging the two run_groups, IS the build-time inline
+    contribution (cat 4b). Verified at render time: the two configs render identically.
+
+    THE LADDER continues (7 rungs / 6 bars total across A+B):
+      5 +inline   (cat4b) : identical config to rung 4, but inline-ON binary
+      6 +overload (cat5)  : overload=true -> LAZY_{INT,FLOAT,UINT}_OVERLOADS +
+                            call-free bytesEqual string-eq constant-fold
+
+    NO fast-codec rung — codec performance is NOT ablated (user ruling 2026-07-16): parsing
+    FUNCTION performance is not a contribution; being able to plug codecs in at ZERO
+    OVERHEAD is (that is what cat 4a/4b measure). Codec-vs-codec x execution-mode
+    (inlined/traced) is its own MICRO benchmark. The codec is held constant at the FAST
+    stack (EiselFloatF64 in / ZMIJF64 out, Traced/Fast ints) from rung 3 through rung 6 —
+    so the inline bar here is measured WITH the fast codecs in place, i.e. on its real
+    target and in the production configuration (the InlineTag input_parse/output_parse tags
+    fuse exactly those fast parser wrappers; cf. float-codec-ceiling: output_parse inline =
+    +14.5% float, input neutral alone, +1.6% synergy).
+
+    BUILD — THIS FILE NEEDS THE inline-ON BINARY:
+      1. testing/configurations/InlineTagConfig.yaml ->
+           enable: [lazy_overload, output_parse, input_parse]
+           disable: (empty)
+      2. RE-RUN CMAKE CONFIGURE (the generated header is written at CONFIGURE time by
+         NautilusInlining.cmake:159 via file(WRITE) — there is NO build-time dep on the
+         YAML; `ninja` alone leaves a STALE binary):
+           NES_BUILD_DIR=cmake-build-release .claude/skills/nes-build/in-docker.sh cmake -S {repo} -B {build}
+      3. Rebuild (cheap — ~24 steps, only the tagged-inline dependents):
+           NES_BUILD_DIR=cmake-build-release .claude/skills/nes-build/in-docker.sh cmake --build {build} --target nes-single-node-worker nes-cli
+      4. Verify: grep NES_INLINE_TAG cmake-build-release/generated/inline/InlineTagConfig.generated.hpp
+         -> all three must be 1.
+      5. Afterwards restore the shipped default:
+           git checkout -- testing/configurations/InlineTagConfig.yaml
+      Do NOT rebuild while a pbench run is live (fresh exec per rep).
+
+    PROTOCOL: identical to file A (v2 controlled, W16 pinned, reps=3 median, stateless
+    replay repeat=24 / q22 4). ENV: performance governor required (resets on reboot).
+    RUN: pbench run experiments/ablation_stateless_B.yaml --build-dir <repo>/cmake-build-release --detach
+  primary_metric: processing_time_s
+  higher_is_better: false
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    output_formatter: { type: CSV }
+    input_parser: {}
+    output_parser: {}
+  generator:
+    repeat: 1
+
+_int_parsers: &int_parsers
+  uint64: TracedUINT64
+  int64: TracedINT64
+  int32: FastINT32
+  int16: TracedINT16
+  uint32: TracedUINT32
+  uint16: TracedUINT16
+  bool: TracedBOOL
+
+# ── The ablation ladder, PASS B (rungs 5-6) ────────────────────────────────────
+# rung 5 == rung 4 config (file A) exactly; only the binary (inline-ON) differs.
+_ladder_B: &ladder_B
+  label: "optimization (cumulative)"
+  explicit:
+    - name: r5_inline
+      baseline: true
+      overrides:
+        query_config.source_type: File
+        query_config.input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: CSV }
+        query_config.input_parser: &fast_parsers
+          <<: *int_parsers
+          f64: EiselFloatF64
+          f32: EiselFloatF32
+        query_config.output_parser: &fast_out { f64: ZMIJF64, f32: ZMIJF32 }
+        worker.query_engine.invoke_mode_configuration: fnattr
+        overload: false
+    - name: r6_overload
+      overrides:
+        query_config.source_type: File
+        query_config.input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: CSV }
+        query_config.input_parser: *fast_parsers
+        query_config.output_parser: *fast_out
+        worker.query_engine.invoke_mode_configuration: fnattr
+        overload: true
+
+_axes_x: &w16_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [16]
+
+_y: &time_y { metric: processing_time_s, label: "Processing time (s)" }
+
+_stateless_repeat: &stateless_repeat
+  generator.repeat: 24
+
+variants:
+  - name: nx_person_projection
+    description: "SELECT id FROM person - 1 fixed col of a varsized schema"
+    query: nexmark/person_projection
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *ladder_B }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_person_star
+    description: "SELECT * FROM person - full varsized materialization"
+    query: nexmark/person_star
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *ladder_B }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_bid_ts_projection
+    description: "SELECT timestamp FROM bid - 1-of-4 strict projection"
+    query: nexmark/bid_ts_projection
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *ladder_B }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_bid_filter_eq
+    description: "SELECT * WHERE auctionId = 1000 - point filter"
+    query: nexmark/bid_filter_eq
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *ladder_B }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_q0_bid_star
+    description: "Q0: SELECT * FROM bid (passthrough)"
+    query: nexmark/bid_star
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *ladder_B }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_q1_price
+    description: "Q1: price * 908/1000 - float parse + arith + ZMIJ out (the codec query)"
+    query: nexmark/q1_price
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *ladder_B }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_q2_filter_proj
+    description: "Q2 (repo shape): auctionId,price WHERE %123 - int-parse/index bound on csv"
+    query: nexmark/q2_filter_proj
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *ladder_B }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_q2_original
+    description: "Q2 (PAPER shape): 5-way OR point selection"
+    query: nexmark/q2_original
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *ladder_B }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_q14_calc
+    description: "q14 (reduced): computed-float range filter, tunable selectivity"
+    query: nexmark/q14_calc
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *ladder_B }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_q10_datetime
+    description: "q10 (reduced): CASTFROMUNIXTS ISO-8601 reformat - numeric->string output"
+    query: nexmark/q10_datetime
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *ladder_B }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_q22_concat
+    description: "q22 (interim CONCAT): string manipulation over string-bearing bid"
+    query: nexmark/q22_concat
+    overrides: { generator.repeat: 4 }
+    axes: { x: *w16_x, series: *ladder_B }
+    y: *time_y
+    visualization: { type: grouped_bar }

@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: ablation_query_scaling_B
+  description: >
+    ABLATION SCALING STUDY — PASS B (rungs 5-7, inline-ON binary). Continuation of
+    ablation_query_scaling_A.yaml. RUN AGAINST THE INLINE-ON BUILD DIR
+    (InlineTagConfig.yaml enable: [lazy_overload, output_parse, input_parse]).
+
+    Rung 5 (r5_inline) config == rung 4 (r4_fnattr in file A); only the binary differs ->
+    the rung4->rung5 delta IS the build-time inline contribution (cat 4b).
+
+    TCP LADDER continues (7 rungs / 6 bars total):
+      5 +inline   (cat4b) : identical config to rung 4, inline-ON binary
+      6 +overload (cat5b) : overload=true -> LAZY_*_OVERLOADS + bytesEqual string-eq fold
+
+    NO fast-codec rung — codec performance is NOT ablated (user ruling 2026-07-16); the
+    contribution is ZERO-OVERHEAD pluggability (cat 4a/4b), not codec speed. Codec held
+    constant at the FAST stack (Eisel in / ZMIJ out, Traced/Fast ints) from rung 3 on, so
+    the inline bar is measured on its real target in the production configuration.
+
+    See ablation_query_scaling_A.yaml for the scaling story + full caveats (blocking
+    collapse at high N, the expected rung-3 plugin-proxy dip that rungs 4-5 recover).
+    RUN: pbench run experiments/ablation_query_scaling_B.yaml --build-dir <INLINE-ON dir> --detach
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 5
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  topology: single-node
+  duration_seconds: 60
+  worker:
+    query_engine:
+      number_of_worker_threads: 24
+      number_of_io_threads: 4
+      invoke_mode_configuration: fnattr
+    default_query_execution:
+      operator_buffer_size: 65536
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 80000
+  query_config:
+    source_type: TCP
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    output_formatter: { type: CSV }
+    input_parser: {}
+    output_parser: {}
+  generator:
+    data_file: data/nexmark/bid_6GB.csv
+    repeat: 100
+    mode: uniform
+
+_int_parsers: &int_parsers
+  uint64: TracedUINT64
+  int64: TracedINT64
+  int32: FastINT32
+  int16: TracedINT16
+  uint32: TracedUINT32
+  uint16: TracedUINT16
+  bool: TracedBOOL
+
+# ── TCP ablation ladder, PASS B (rungs 5-7) ────────────────────────────────────
+_ladder_B_tcp: &ladder_B_tcp
+  label: "optimization (cumulative)"
+  explicit:
+    - name: r5_inline
+      baseline: true
+      overrides:
+        query_config.source_type: TCP
+        query_config.input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: CSV }
+        query_config.input_parser: &fast_parsers
+          <<: *int_parsers
+          f64: EiselFloatF64
+          f32: EiselFloatF32
+        query_config.output_parser: &fast_out { f64: ZMIJF64, f32: ZMIJF32 }
+        worker.query_engine.invoke_mode_configuration: fnattr
+        overload: false
+    - name: r6_overload
+      overrides:
+        query_config.source_type: TCP
+        query_config.input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: CSV }
+        query_config.input_parser: *fast_parsers
+        query_config.output_parser: *fast_out
+        worker.query_engine.invoke_mode_configuration: fnattr
+        overload: true
+
+_scale_x: &scale_x
+  label: "Concurrent Queries"
+  parameter: num_queries
+  values: [1, 10, 50, 100, 200, 500, 1000]
+
+_tput_y: &tput_y { metric: throughput_mbps, label: "Total System Throughput (MB/s)" }
+
+variants:
+  - name: bid_star_scaling
+    description: "Scaling concurrent SELECT * (passthrough) — source/threading/async dominate"
+    query: nexmark/bid_star
+    axes: { x: *scale_x, series: *ladder_B_tcp }
+    y: *tput_y
+    visualization: { type: line_chart, x_scale: log }
+  - name: q1_price_scaling
+    description: "Scaling concurrent Q1 float codec — plugins/inline/fnattr dominate"
+    query: nexmark/q1_price
+    axes: { x: *scale_x, series: *ladder_B_tcp }
+    y: *tput_y
+    visualization: { type: line_chart, x_scale: log }

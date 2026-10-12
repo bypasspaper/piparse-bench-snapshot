@@ -1,0 +1,32 @@
+query:
+  name: nexmark_bid_json_agg
+  description: >
+    Windowed aggregation over the bid_strings stream: COUNT(auctionId) on an EVENT-TIME TUMBLING(10 SEC)
+    window keyed on the bid `timestamp` field. Event time uses the timestamp-driven watermark path (NOT the
+    ingestion-time watermark assigner, which SIGSEGVs on this branch). A no-forward, state-bound case that
+    parses the timestamp (window key) every row and closes real windows as the watermark advances. Single
+    pass (repeat=1) so the event-time replay-corruption bug does not apply. csv + json data blocks over the
+    SAME 31.3M rows for cross-input comparison (read Mrows/s).
+  sql: "SELECT start, end, COUNT(auctionId) AS total FROM bid WINDOW TUMBLING(timestamp, SIZE 10 SEC)"
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+        - { name: channel, type: VARSIZED, not_null: true }
+        - { name: url, type: VARSIZED, not_null: true }
+      data:
+        large:
+          file: large/nexmark/bid_strings_3GB.json
+          size_bytes: 5567181395
+          rows: 31300000
+        csv:
+          file: large/nexmark/bid_strings_3GB.csv
+          size_bytes: 3595281395
+          rows: 31300000
+  sink_schema:
+    - { name: bid.start, type: UINT64, not_null: true }
+    - { name: bid.end, type: UINT64, not_null: true }
+    - { name: bid.total, type: UINT64, not_null: true }

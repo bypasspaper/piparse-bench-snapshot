@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: q1_iouring_async_w1
+  description: >
+    Does inlining the float parse WRAPPERS (input_parse=Eisel + output_parse=ZMIJ, via
+    testing/configurations/InlineTagConfig.yaml enable list) help the FULL Nexmark-Q1 too, on the async
+    io_uring file source with 1 io + 1 worker thread? Q1 = SELECT ts,auctionId,bidder, price*FLOAT64(908)/
+    FLOAT64(1000) FROM bid -- real float parse (Eisel) + arithmetic + float re-serialize (ZMIJ), Monitoring
+    sink + CSV out. This is the A/B: run this SAME experiment on the inlined build (input_parse/output_parse
+    enabled) vs the non-inlined build (both disabled) and compare the two run_groups (inline is a BUILD-time
+    tag config, NOT captured in this yaml). Prior stripped price*1 seq: inlining gave +9.7% (203->222).
+
+    Source: IoUringFileAsync O_DIRECT QD16 (the async asio-io_uring file source; matches cold_iouring_async_ab).
+    1 io thread (runs the async source) + 1 worker (index+parse+arith+serialize). cold single bid_6GB pass,
+    n=3 median. fastest stack: fnattr + 131072 buffer + Eisel-in/ZMIJ-out + COMPILER + native.
+    GOTCHAS: NES_IOURING_DIRECT=1 needs 512-aligned offset/len/buffer (the source rounds the tail; if the
+    alignment invariant trips the worker dies). Do NOT force NES_IOURING_QD == pool size (open() priming
+    deadlock -- keep QD16 well under the default inflight/pool). pkill -x main pre-flight; :8080 free; no
+    generator for file sources. cold_read evicts bid_6GB (O_DIRECT ignores cache anyway).
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: true
+  completion_timeout_s: 120
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 4096
+  query_config:
+    source_type: IoUringFileAsync
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64, f64: EiselFloatF64}
+    output_formatter: {type: CSV}
+    output_parser: {f64: ZMIJF64}
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+  worker_env:
+    NES_IOURING_DIRECT: 1
+    NES_IOURING_QD: 16
+
+variants:
+  - name: q1_async_w1
+    description: "Q1 float, IoUringFileAsync O_DIRECT QD16, 1io+1worker, cold bid_6GB"
+    query: nexmark/q1_price
+    axes:
+      x:
+        label: "config"
+        explicit:
+          - name: "iouring_async_1io_1w"
+            baseline: true
+            overrides: {}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

@@ -1,0 +1,106 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: nexmark_person_star_iouring_ab
+  description: >
+    FOLLOW-UP to prof_person_star_native: the native person_star arm is PRODUCER/READ-bound (one
+    pegged IOThread, _copy_to_iter ~24% of process samples; 16 workers ~2 cores). Question (user):
+    does the io_uring file source (incl. the zero-copy/registered-buffer path) lift that read
+    ceiling? ARMS on the SAME query+data (native person_star, 1.472 GB .nes, W16): file_repeat4 =
+    the async File baseline exactly as in nexmark_native_vs_csv; file_single = File with repeat=1
+    (io_uring sources IGNORE NES_FILE_REPEAT — verified in source — so single-pass arms need a
+    single-pass File control: ~0.19s windows, ramp-inflated equally); iouring_blocking =
+    IoUringFile; iouring_async = IoUringFileAsync; iouring_async_regbuf = + NES_IOURING_REGBUF=1
+    (fixed/registered buffers — reads land in the pool buffer with no user-space copy).
+
+    EXPECT (predict-first): on a WARM page cache, buffered io_uring reads of cache-hot pages
+    complete INLINE at submission — the kernel page-cache->buffer copy runs on the submitting
+    thread, NOT spread across io-wq workers. So io_uring arms ~= file_single (maybe a few % worse
+    from uring overhead), regbuf ~neutral (it removes a user-space copy the async File source does
+    not have; the remaining copy is the kernel one). Prior evidence: async io_uring file matched
+    blocking within 0.2% (§48-49); warm sequential io_uring "never engages zero-copy". The real
+    lever for the copy is O_DIRECT (+storage faster than DRAM path) or mmap — different regime,
+    not tested here. If the user's counter-hypothesis holds (io-wq parallelizes the copy), the
+    io_uring arms should clearly beat file_single.
+
+    GOTCHAS: default_max_inflight_buffers=128 in defaults for ALL arms (io_uring private-pool
+    deadlock fix: pool must be >= 2x QD; NES_IOURING_QD left unset -> auto pool/2). Single-pass
+    windows are ~0.19s -> ramp-inflated tails, hence reps=5 and compare arms only WITHIN this
+    experiment (file_repeat4 anchors to the steady-state number, ~6933 MB/s in the main run).
+
+    RESULTS (2026-07-08, reps=5 median [min..max] MB/s, 25/25 ok):
+      iouring_async_regbuf 6339 [5971..7015]   iouring_async 6262 [6139..6682]
+      iouring_blocking     6226 [5668..7243]   file_repeat4  6169 [5972..7411]
+      file_single          6101 [5971..6297]
+    VERDICT: a WASH, prediction confirmed — the spread of MEDIANS (+3.9% top-to-bottom, io_uring
+    regbuf best) is inside the per-arm rep scatter (up to ±18%). On a WARM page cache the buffered
+    io_uring read completes inline at submission: the kernel page-cache->buffer copy stays on one
+    thread and does NOT parallelize, and regbuf can't remove it (the async File source already
+    reads directly into pool buffers — there is no extra user-space copy to eliminate). The
+    single-io-thread copy ceiling on person_star stands for ALL current file sources; breaking it
+    needs a different mechanism (mmap/TCP_ZEROCOPY-style page loaning, multiple reader threads for
+    one source, or O_DIRECT with storage faster than the DRAM copy path — different regime).
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 5
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: native
+  topology: single-node
+  completion_timeout_s: 300
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    default_max_inflight_buffers: 128
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SystemNative, string_length: "16,32,32,16,4,256" }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  generator:
+    repeat: 1
+
+variants:
+  - name: person_star_source_ab
+    description: "native person_star: File vs io_uring source variants (warm cache, W16)"
+    query: nexmark/person_star
+    axes:
+      x:
+        label: "worker threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [16]
+      series:
+        label: "source"
+        explicit:
+          - name: file_repeat4
+            baseline: true
+            overrides:
+              generator.repeat: 4
+          - name: file_single
+            overrides: {}
+          - name: iouring_blocking
+            overrides:
+              query_config.source_type: IoUringFile
+          - name: iouring_async
+            overrides:
+              query_config.source_type: IoUringFileAsync
+          - name: iouring_async_regbuf
+            overrides:
+              query_config.source_type: IoUringFileAsync
+              worker_env.NES_IOURING_REGBUF: 1
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: grouped_bar }

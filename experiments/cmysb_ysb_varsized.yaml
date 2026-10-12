@@ -1,0 +1,128 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: cmysb_ysb_varsized
+  description: >
+    VARSIZED YSB parsed-vs-native (user follow-up 2026-07-13 to cmysb_native_vs_csv: "both
+    are relevant"). The original YSB schema shape: 7 VARSIZED cols (4 uuid-36, ad_type,
+    event_type, ip) + u64 event_time, COUNT(user_id) by STRING campaign_id, filter
+    event_type=="view" (1/3 selectivity), tumbling 30s over a 2000s span (67 windows,
+    20M rows, 3.7GB per file). Smoke variants (Checksum, reps=1) gate the measured variants
+    (Monitoring, reps=3) in the same run; recorded catalog checksums exist for both queries
+    (68000,278998939 / 670000,2725304985).
+
+    THE POINT vs fixed-width ysb: the byte-footprint lever is GONE. Tight fixed-slot native
+    (37,37,37,37,9,9,8 + 8 = 182 B/row) is only 1.020x denser than the text (185.7 B/row
+    avg) because uuid text is 36 bytes in both worlds - fixed-slot native is hostile to
+    strings (the nexmark person lesson, here in mild form: padding ~= digit savings).
+    EXPECT (predict-first): with footprint ~1.02, the Mr/s ratio ~= the per-byte ratio.
+    Nexmark person rows said varsized per-byte is ~wash-to-csv-favored (0.95-0.99); here
+    the csv arm additionally must SIMD-index 8 cols and copy 7 varsized fields while native
+    reads fixed slots - if per-byte lands ~1.0-1.1 native wins only marginally in rows/s;
+    csv-favored per-byte (<1) would mean parsed execution effectively TIES native on the
+    original YSB. Single-pass windows ~0.6-1.5s at plausible 2.5-6 GB/s - long enough to
+    trust directionally (no ext file needed at first pass).
+
+    GOTCHAS: files are LF (no CRLF trap, unlike the fixed-width ysb files); catalog
+    size_bytes was the name's "3GB" not the file's 3713333331 (fixed this session, affects
+    MB/s denominators); string_length "37,37,37,37,9,9,8" consumed per VARSIZED column in
+    schema order (NativeMetaData INVARIANT fires if the list is short); slots are maxlen+1
+    (content <= N-1 NUL rule); event_type values view/click/purchase; ip is the constant
+    "1.2.3.4"; do NOT enable allow_commas_in_strings (no commas in any string col);
+    generator repeat MUST stay 1 (stateful; replay corrupts the heap, see
+    cmysb_repeat_probe); page cache ~14.7GB for all four files, evicts the ext24 pair.
+
+    RESULTS (2026-07-13, 24/24 ok, reps=3 median, spread <2%):
+    SMOKE: counts EXACTLY match recorded (68000 / 670000) on BOTH arms; checksums arm-EQUAL
+    and deterministic (274374939 / 2679744985) but differ from the systest-recorded values
+    by EXACTLY 68 x count (278998939-274374939 = 68x68000; 2725304985-2679744985 =
+    68x670000) - the known cross-harness per-row sink-materialization constant (compare
+    only within one harness); both arms certified.
+    MEASURED:              CSV MB/s  Mr/s  wall  | NAT MB/s  Mr/s  wall  | per-byte | Mr/s x
+      ysb_1k_varsized  |    8884    47.9  418ms |   9610    52.8  379ms |   1.08   |  1.10
+      ysb_10k_varsized |    8002    43.1  464ms |   8483    46.6  429ms |   1.06   |  1.08
+    READING: the density lever IS gone as predicted (footprint 1.020) - native's whole
+    ~8-10% rows/s edge is per-byte, not density. CAVEAT: 0.38-0.46s windows are still
+    sub-second and short windows flattered native by ~28% on fixed-width ysb_1k - the
+    steady-state closure lives in cmysb_ysb1k_varsized_ext (4x extended file); read the
+    final verdict THERE.
+  primary_metric: processing_time_s
+  higher_is_better: false
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 600
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser:
+      uint64: TracedUINT64
+    output_formatter: { type: CSV }
+  generator:
+    repeat: 1
+
+_series: &format_series
+  label: "input format"
+  explicit:
+    - name: csv_optimized
+      baseline: true
+      overrides: {}
+    - name: native
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "37,37,37,37,9,9,8" }
+        query_config.input_parser: {}
+
+_axes_x: &w16_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [16]
+
+_y: &time_y { metric: processing_time_s, label: "Processing time (s)" }
+
+variants:
+  - name: smoke_1k
+    description: "GATE: Checksum both arms vs recorded 68000,278998939"
+    query: yahoo/ysb_1k_varsized
+    overrides: { query_config.sink_type: Checksum }
+    repetitions: 1
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+  - name: smoke_10k
+    description: "GATE: Checksum both arms vs recorded 670000,2725304985"
+    query: yahoo/ysb_10k_varsized
+    overrides: { query_config.sink_type: Checksum }
+    repetitions: 1
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+  - name: ysb_1k_varsized
+    query: yahoo/ysb_1k_varsized
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: ysb_10k_varsized
+    query: yahoo/ysb_10k_varsized
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+    visualization: { type: grouped_bar }

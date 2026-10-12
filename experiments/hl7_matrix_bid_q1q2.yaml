@@ -1,0 +1,130 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: hl7_matrix_bid_q1q2
+  description: >
+    The 3x3 format-conversion matrix (input {SIMDCSV, SchemaJSON, SIMDHL7} x output {CSV, JSON,
+    HL7}) for the FILTER and COMPUTE queries, complementing hl7_matrix_bid's passthrough:
+      q2 (filter):  SELECT auctionId, price WHERE auctionId % 123 = 0  (~0.8% survivors ->
+                    input-bound, output format nearly irrelevant; isolates per-row locate+INT parse)
+      q1 (compute): SELECT timestamp, auctionId, bidder, price*908/1000  (every row out; the
+                    computed FLOAT64 must be SERIALIZED -- no raw-forward -> output side pays
+                    the float codec in every format)
+    Same 31.3M logical rows per arm (csv 3.60GB / json 5.57GB / hl7 5.72GB). HL7 arms disable
+    '&' subcomponent splitting (bid URLs). W1 fnattr fullopt, 128KiB buffers, warm reads,
+    Monitoring sink, n=5 median. MB/s = engine-measured on INPUT bytes.
+    RUN: cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+      experiments/hl7_matrix_bid_q1q2.yaml --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 5
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: true
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: BlockingFile
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    output_formatter: { type: CSV }
+    input_parser: { uint64: TracedUINT64, int64: TracedINT64, int32: FastINT32, int16: TracedINT16, uint32: TracedUINT32, uint16: TracedUINT16, bool: TracedBOOL, f64: EiselFloatF64, f32: EiselFloatF32 }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s, input bytes)" }
+
+_out_series: &out_series
+  label: "output"
+  explicit:
+    - name: to_csv
+      baseline: true
+      overrides: { query_config.output_formatter: { type: CSV } }
+    - name: to_json
+      overrides: { query_config.output_formatter: { type: JSON } }
+    - name: to_hl7
+      overrides: { query_config.output_formatter: { type: HL7, segment_name: BID } }
+
+variants:
+  # ── q2: filter ──────────────────────────────────────────────────────────────
+  - name: q2_csv_in
+    description: "q2 filter, SIMDCSV input -> {CSV,JSON,HL7} out"
+    query: nexmark/bidstr_iso_q2
+    overrides:
+      data_size: csv
+      query_config.input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    axes: { x: *noop_x, series: *out_series }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: q2_json_in
+    description: "q2 filter, SchemaJSON input -> {CSV,JSON,HL7} out"
+    query: nexmark/bidstr_iso_q2
+    overrides:
+      data_size: json
+      query_config.input_formatter: { type: SchemaJSON }
+    axes: { x: *noop_x, series: *out_series }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: q2_hl7_in
+    description: "q2 filter, SIMDHL7 input ('&' disabled) -> {CSV,JSON,HL7} out"
+    query: nexmark/bid_hl7_q2
+    overrides:
+      data_size: hl7
+      query_config.input_formatter: { type: SIMDHL7, subcomponent_delimiter: "" }
+    axes: { x: *noop_x, series: *out_series }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  # ── q1: compute ─────────────────────────────────────────────────────────────
+  - name: q1_csv_in
+    description: "q1 compute, SIMDCSV input -> {CSV,JSON,HL7} out"
+    query: nexmark/bidstr_iso_q1
+    overrides:
+      data_size: csv
+      query_config.input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    axes: { x: *noop_x, series: *out_series }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: q1_json_in
+    description: "q1 compute, SchemaJSON input -> {CSV,JSON,HL7} out"
+    query: nexmark/bidstr_iso_q1
+    overrides:
+      data_size: json
+      query_config.input_formatter: { type: SchemaJSON }
+    axes: { x: *noop_x, series: *out_series }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: q1_hl7_in
+    description: "q1 compute, SIMDHL7 input ('&' disabled) -> {CSV,JSON,HL7} out"
+    query: nexmark/bid_hl7_q1
+    overrides:
+      data_size: hl7
+      query_config.input_formatter: { type: SIMDHL7, subcomponent_delimiter: "" }
+    axes: { x: *noop_x, series: *out_series }
+    y: *tput_y
+    visualization: { type: grouped_bar }

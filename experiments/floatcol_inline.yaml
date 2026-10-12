@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: floatcol_inline
+  description: >
+    Does INLINING the in/out float parse proxy calls (Eisel input + ZMIJ output) into the JIT'd pipeline
+    help or hurt? The profile of price*1 showed the codec running as SEPARATE native symbols (parseWith
+    EiselFloat / parseNumberString / zmij::write) -- under `fnattr` the proxies get LLVM attributes
+    (mod_ref/will_return/no_unwind) but are NOT inlined. `global_mode: inline` inlines the NAUTILUS_TAGGED_
+    INVOKE targets into the JIT module. Compares fnattr (baseline, current fastest) vs inline.
+    Context: the ~28% engine overhead-vs-ceiling was ~38% "codec runs slower under JIT" (proxy boundary +
+    less ILP) -- inlining could close that OR bloat the JIT loop (register pressure) and regress, as it has
+    historically. This is a "see it once" measurement.
+
+    Config: the ideal source (InMemory PREFILL, zero-copy zero-I/O -- needs the takePreFilledBuffer
+    timestamp fix), sequential SequentialCSV W1, price*1 (one float parse+serialize/row), Monitoring+CSV,
+    Eisel in + ZMIJ out. generator.repeat=20 == NES_INMEM_REPEAT=20 for correct MonitoringSink accounting.
+    Baseline (fnattr, this session): 203 MB/s = 31.2 M rows/s = 72% of the isolated Eisel+ZMIJ ceiling.
+    GOTCHAS: pkill -x main pre-flight; number_of_buffers_in_global_buffer_manager>=16384 for CSV out;
+    InMemory prefill needs the sourceCreationTimestamp stamp (fixed this session) or MonitoringSink writes
+    no CSV. single-col price.csv (~6.5 B/row) -> rows/s = MB/s / 6.5e-3.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: false
+  completion_timeout_s: 180
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: {type: SequentialCSV, threading_mode: sequential}
+    input_parser: {f64: EiselFloatF64}
+    output_formatter: {type: CSV}
+    output_parser: {f64: ZMIJF64}
+  generator:
+    repeat: 20
+    mode: burst
+    rate: 1000000
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 20
+    NES_INMEM_BUFSIZE: 131072
+
+variants:
+  - name: inline_vs_fnattr
+    description: "price*1 InMemory-prefill seq: fnattr (attr only) vs inline (proxy calls inlined)"
+    query: floatcol/price_only
+    axes:
+      x:
+        label: "invoke mode"
+        parameter: worker.query_engine.invoke_mode_configuration
+        values: [fnattr, inline]
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

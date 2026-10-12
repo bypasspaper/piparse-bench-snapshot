@@ -1,0 +1,124 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: prof_file_scaling_ccx_probe
+  description: >
+    PROBE (user ask 2026-07-09): does the CCX-sharded task queue help/hurt the MANY-SOURCE file
+    scaling regime? q1, async File + parallel SIMDCSV, COMPILED, tuned 24w/6io budget (mirrors
+    source_parse_scaling_q1_tuned), N in {50, 150} concurrent queries/sources. Three series:
+    baseline_unpinned (reproduces the historical curve: 13474 @N50 / 13520 @N150),
+    pinned_single (pin_threads only), ccx_pinned (pin + ccx_aware_task_queues).
+
+    EXPECT (predict-first): the CCX optimization was built for the SINGLE-source pathology
+    (recycled ring L3-resident, poisoned by cross-CCX scanning). Here it should NOT help and
+    may mildly hurt: (a) with pinning, all 6 io threads sit on cpus 0-5 = CCX0, so ALL
+    admission traffic lands in shard 0 whose only owner-workers are the 6 SMT siblings
+    (cpus 24-29); ~70% of tasks must be stolen by remote-CCX workers, each steal paying the
+    per-call 100us dance (remote duty ~62%) -> effective capacity ~ borderline vs the ~13.5
+    GB/s demand; (b) the ring-locality benefit is structurally unavailable: 50-150 source
+    private pools = 0.4-1.2 GB working set >> any L3. PREDICTIONS: baseline ~13.5 both N;
+    pinned_single ~13-13.5 (pinning was tail-, not throughput-relevant here);
+    ccx_pinned ~= pinned_single -0-15% (delay tax, no locality win). If confirmed -> protocol
+    note: ccx_aware_task_queues targets few-source supply-bound workloads; leave OFF for
+    many-source fan-in, or future work = spread io threads across CCXs (1 io/CCX) so each
+    shard has its own feed. Steal stats via NES_TASKQUEUE_STATS confirm the mechanism
+    (expect stolen fraction ~(24-6)/24 at saturation, valveTrips=0).
+
+    GOTCHAS: inherits source_parse_scaling_q1's (pkill -x main, warm 1GB, repeat 6); medium
+    data = bid_1GB.csv (dd-preflight class); 1 rep per point like the tuned run (1-rep values
+    reproduced 3-rep medians within ~1% throughout that series).
+
+    RESULTS (2026-07-09, 6/6 ok, 1 rep; bid_1GB dd class 10.8 after re-roll):
+                          N=50      N=150
+      baseline_unpinned   13620     14037   (reproduces the historical 13474/13520 curve)
+      pinned_single       11766     11277   (-14% / -20% vs unpinned)
+      ccx_pinned          10036      9905   (-15% / -12% vs pinned_single; -26% / -29% vs base)
+    STEAL STATS (ccx arms): stolen fraction 69.3% (N=50) / 70.2% (N=150) == the predicted
+      remote-worker share ((24-6)/24 ~ 75%, minus the shard-0 SMT owners' take); valveTrips=0;
+      rescanRounds huge (16-49M) = the narrow dance loops of permanently-starved remote workers.
+    VERDICT - BOTH boundary predictions CONFIRMED:
+    (1) CCX sharding is WRONG for many-source fan-in: all 6 pinned io threads sit on CCX0 ->
+        every task lands in shard 0 with only 6 SMT owner-workers; 70% of tasks pay the steal
+        dance; no ring-locality win is available (0.4-1.2 GB of source pools >> L3). Net -12-15%
+        vs pinned single queue.
+    (2) NEW finding: plain PINNING also hurts this regime (-14/-20%): the 24w/6io budget = 30
+        threads > 24 physical cores, and pinning forces the 6 overflow workers (cpus 24-29) onto
+        the SMT siblings of the BUSY io cores (0-5), while the unpinned scheduler spreads load
+        to avoid exactly that. (The earlier "pinning is tail-only" result was at 18w/6io = 24
+        threads = fits physical cores.)
+    PROTOCOL RULE (superseded same day, see below): ccx + compact pinning = few-source only.
+
+    RE-RUN WITH THE CCX-STRIPED LAYOUT (2026-07-09/10, user design correction: io threads AND
+    workers are striped round-robin across CCXs when sharding is on -- each CCX = a cell of
+    io feed -> shard -> co-located owner workers; NES_CCX_PIN_LAYOUT=compact reverts):
+                          N=50      N=150
+      baseline_unpinned   12866     13961   (run-to-run scatter vs 13620/14037 above)
+      pinned_single       11753     10774   (contiguous pinning, unchanged - still hurts)
+      ccx_pinned STRIPED  14348     13772   (was 10036/9905 compact!)
+    VERDICT: striping FIXES many-source fan-in - ccx_pinned goes from -26/-29% vs baseline to
+    +11.5% (N=50) / -1.4% (N=50/150); the sources round-robin over striped io contexts, so each
+    CCX cell gets ~1/4 of the traffic with local owners. The user's intended design works.
+    Single-source tradeoff measured in prof_q2_wall_ccx_queues (same build): striping thins the
+    owner set at low W (W5 -20% vs single queue; W11/W23 still +12/+32%) - few-source low-W
+    tuned runs should set NES_CCX_PIN_LAYOUT=compact.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  worker:
+    query_engine:
+      number_of_worker_threads: 24
+      number_of_io_threads: 6
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV }
+    input_parser: { uint64: TracedUINT64, int32: TracedINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  worker_env:
+    NES_TASKQUEUE_STATS: 1
+  generator:
+    repeat: 6
+
+_series: &queue_series
+  label: "queue config"
+  explicit:
+    - name: baseline_unpinned
+      baseline: true
+      overrides: {}
+    - name: pinned_single
+      overrides:
+        worker.query_engine.pin_threads: true
+    - name: ccx_pinned
+      overrides:
+        worker.query_engine.pin_threads: true
+        worker.query_engine.ccx_aware_task_queues: true
+
+variants:
+  - name: q1_file_scaling_ccx
+    query: nexmark/q1_price
+    axes:
+      x:
+        label: "Concurrent Queries (= Concurrent Sources)"
+        parameter: num_queries
+        values: [50, 150]
+      series: *queue_series
+    y: { metric: throughput_mbps, label: "Aggregate System Throughput (MB/s)" }
+    visualization: { type: line_chart }

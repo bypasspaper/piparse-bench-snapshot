@@ -1,0 +1,41 @@
+query:
+  name: nexmark_q2_filter_proj
+  # The ACTUAL Nexmark Q2 as written in nes-systests/benchmark/Nexmark_with_varsized.test:
+  # projects (auctionId, price) of the ~0.8% of rows where auctionId % 123 == 0. NOT the same
+  # as nexmark/q2_filter (that one is SELECT * — full-row materialization of survivors).
+  # Filter column INT32 must be parsed on every row in the CSV arm; price (FLOAT64) only for
+  # the survivors (lazy elision), so the float codec cost is negligible here — this query is
+  # index+int-parse bound on CSV vs pure stride-read on native.
+  description: "Nexmark Q2: SELECT auctionId, price WHERE auctionId % 123 = 0"
+
+  sql: "SELECT auctionId, price FROM bid WHERE auctionId % INT32(123) = INT32(0)"
+
+  flink_sql: "SELECT auctionId, price FROM bid WHERE MOD(auctionId, 123) = 0"
+
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/nexmark/bid_6GB.csv
+          size_bytes: 6442450944
+          rows: 183991721
+        native:
+          # 183,991,721 rows x 24 B (uint64,int32,int32,float64 packed LE), see bid_ts_projection.
+          file: large/nexmark/bid_6GB.nes
+          size_bytes: 4415801304
+          rows: 183991721
+
+  sink_schema:
+    - { name: bid.auctionId, type: INT32, not_null: true }
+    - { name: bid.price, type: FLOAT64, not_null: true }
+
+  validation:
+    large: { tuples: 1511777, checksum: 1211558031 }
+    # Arm-vs-arm equality CONFIRMED post-alignment-fix (2026-07-08, worker-cli: both 1499177125
+    # in the sink-side form; systest-form value assumed == large).
+    native: { tuples: 1511777, checksum: 1211558031 }

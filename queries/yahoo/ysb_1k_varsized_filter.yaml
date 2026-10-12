@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+query:
+  name: ysb_1k_varsized_filter
+  description: >
+    STATELESS string-literal filter probe (2026-07-14): SELECT event_time WHERE
+    event_type == VARSIZED("view") - no window, no state, so the per-row filter compare
+    is a first-order cost (unlike ysb_1k_varsized, whose window/trigger path drowns it).
+    Built to A/B the lazy string-equality lowering: opaque host-ptr + nautilus::memcmp
+    proxy call vs embedConstantBytes global + call vs full bytesEqual fold (icmp
+    immediates). ~1/3 selectivity (event types view/click/purchase).
+
+  sql: "SELECT event_time FROM ysb1k WHERE event_type == VARSIZED(\"view\")"
+
+  sources:
+    - name: ysb1k
+      schema:
+        - { name: user_id, type: VARSIZED, not_null: true }
+        - { name: page_id, type: VARSIZED, not_null: true }
+        - { name: campaign_id, type: VARSIZED, not_null: true }
+        - { name: ad_id, type: VARSIZED, not_null: true }
+        - { name: ad_type, type: VARSIZED, not_null: true }
+        - { name: event_type, type: VARSIZED, not_null: true }
+        - { name: event_time, type: UINT64, not_null: true }
+        - { name: ip_address, type: VARSIZED, not_null: true }
+      data:
+        large:
+          file: large/ysb/ysb1k_with_varsized_3GB.csv
+          size_bytes: 3713333331
+          rows: 20000000
+
+  sink_schema:
+    - { name: ysb1k.event_time, type: UINT64, not_null: true }

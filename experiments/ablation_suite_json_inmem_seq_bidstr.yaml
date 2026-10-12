@@ -1,0 +1,265 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: ablation_suite_json_inmem_seq_bidstr
+  description: >
+    v7 CSV->JSON ablation ladder, VARSIZED retake -- SEQUENTIAL rungs (r1-r4, r6, r6b), W1.
+    This is the fine attribution ladder repointed onto the FROZEN PAPER FOOTING so it is directly
+    comparable to the cross-format matrix / paper workload (which the v6 ladder was NOT): the v6
+    ladder ran bid_1GB (numeric-only) + the old nexmark query set + W16/ccx-on/pin-on at r7.
+    v7 fixes all of that:
+      - dataset  : data_size=csv -> large/nexmark/bid_strings_3GB.csv (VARSIZED, 3.6GB, 31.3M rows)
+      - queries  : the 10 frozen PAPER_WORKLOAD bidstr_* queries (== the matrix csv->json cell)
+      - r7 (elsewhere): W23 + ccx_aware=false + pin_threads=false (the healthy config), already
+        re-measured via cell_csv_json_rparfix and CONFIRMED == matrix V2 r_par within +-2%
+        (geomean 0.993, run_group 20260824T163459). So the top of this ladder is anchored to the paper.
+
+    Rung map to the matrix's 3 coarse rungs:
+      r2 == matrix r_base (SequentialUncompiledCSV -> JSONUncompiled, interpreted W1)
+      r6 == matrix r_comp (SequentialCSV -> JSON, fnattr+inline+tcb, W1)
+      r7 == matrix r_par  (already done)
+    NOTE the v6 methodology choice, KEPT: every rung uses InMemory (removes the ~11 GB/s page-cache
+    read wall that BlockingFile serializes with parse on the single W1 thread). The matrix r_base/
+    r_comp used BlockingFile, so fine r2/r6 will read HIGHER than the matrix W1 numbers by the
+    documented +16..+57% (inverse to per-row compute weight; source probe ablation_src_probe_w1).
+    That is expected -- the read-wall-free ladder is the better attribution; r7 is the shared anchor.
+
+    r5 is NOT here: it needs the FASTPATH-OFF binary (ablation_r5_inmem_fpoff_bidstr.yaml) so the
+    JSON output fast-path 2x lands at r5->r6, not buried in generic inline. r7 is NOT here (W23 +
+    NES_INMEM_REPEAT=20 -> x20 correction; done via cell_csv_json_rparfix).
+
+    BINARY: FULL binary @HEAD 8217cce465 (fastpath ON, output_parse ON) -- the current
+    cmake-build-release. VERIFIED by the r7 anchor + r1 bidstr smoke (296.7 MB/s, 0 fail).
+    THROUGHPUT: NES_INMEM_REPEAT=1 => reported == true, NO x-correction.
+    GOTCHAS: prefill loads bid_strings_3GB (3.6GB) into a PRIVATE pool at registration (outside the
+    timed window) + 16384x128KB global pool ~2GB => ~6GB RAM (box has ~52GB free). pkill -x main
+    pre-flight; NEVER pkill -f (self-kill). r1/r2 interpreted run ~4-17s/rep on 3.6GB; compiled
+    rungs ~1-2s -- whole run ~30-45min.
+    RUN: cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/ablation_suite_json_inmem_seq_bidstr.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: default
+      inline_invoke_calls: false
+      trace_constant_bytes: false
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: { type: SequentialUncompiledOldCSV, threading_mode: SEQUENTIAL }
+    output_formatter: { type: JSONUncompiled }
+    input_parser: {}
+    output_parser: {}
+  generator:
+    repeat: 1
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 1
+    NES_INMEM_BUFSIZE: 131072
+
+_fast_parsers: &fast_parsers
+  uint64: TracedUINT64
+  int64: TracedINT64
+  int32: FastINT32
+  int16: TracedINT16
+  uint32: TracedUINT32
+  uint16: TracedUINT16
+  bool: TracedBOOL
+  f64: EiselFloatF64
+  f32: EiselFloatF32
+_fast_out: &fast_out { f64: ZMIJF64, f32: ZMIJF32 }
+
+_ladder: &ladder
+  label: "optimization (cumulative)"
+  explicit:
+    - name: r1_olduncompiled
+      baseline: true
+      overrides:
+        query_config.source_type: InMemory
+        query_config.input_formatter: { type: SequentialUncompiledOldCSV, threading_mode: SEQUENTIAL }
+        query_config.output_formatter: { type: JSONUncompiled }
+        query_config.input_parser: {}
+        query_config.output_parser: {}
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: default
+        worker.query_engine.inline_invoke_calls: false
+        worker.query_engine.trace_constant_bytes: false
+        overload: false
+        generator.repeat: 1
+    - name: r2_uncompiled
+      overrides:
+        query_config.source_type: InMemory
+        query_config.input_formatter: { type: SequentialUncompiledCSV, threading_mode: SEQUENTIAL }
+        query_config.output_formatter: { type: JSONUncompiled }
+        query_config.input_parser: {}
+        query_config.output_parser: {}
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: default
+        worker.query_engine.inline_invoke_calls: false
+        worker.query_engine.trace_constant_bytes: false
+        overload: false
+        generator.repeat: 1
+    - name: r3_compiled
+      overrides:
+        query_config.source_type: InMemory
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: *fast_parsers
+        query_config.output_parser: *fast_out
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: default
+        worker.query_engine.inline_invoke_calls: false
+        worker.query_engine.trace_constant_bytes: false
+        overload: false
+        generator.repeat: 1
+    # r3_eager: r3_compiled with EAGER_PARSE=ON. IDENTICAL to r3_compiled except input_formatter.eager_parse:
+    # true -> every leaf (numeric + varsized) is materialised at scan, so the output re-serialises instead of
+    # raw-forwarding. This is the "naive code generation" floor that splits the compile rung: bar(naive)=
+    # r2->r3_eager (pure compilation, eager serde), bar(lazy/passthrough)=r3_eager->r3_compiled. Default invoke
+    # / no fnattr / no inline / no tcb in BOTH arms (fnattr+inline live up in "context"), so this isolates ONLY
+    # the eager-vs-lazy flag with copy-efficiency (opaque, non-inlined) held constant.
+    - name: r3_eager
+      overrides:
+        query_config.source_type: InMemory
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false, eager_parse: true }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: *fast_parsers
+        query_config.output_parser: *fast_out
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: default
+        worker.query_engine.inline_invoke_calls: false
+        worker.query_engine.trace_constant_bytes: false
+        overload: false
+        generator.repeat: 1
+    - name: r4_fnattr
+      overrides:
+        query_config.source_type: InMemory
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: *fast_parsers
+        query_config.output_parser: *fast_out
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: fnattr
+        worker.query_engine.inline_invoke_calls: false
+        worker.query_engine.trace_constant_bytes: false
+        overload: false
+        generator.repeat: 1
+    - name: r6_tcb
+      overrides:
+        query_config.source_type: InMemory
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: *fast_parsers
+        query_config.output_parser: *fast_out
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: fnattr
+        worker.query_engine.inline_invoke_calls: true
+        worker.query_engine.trace_constant_bytes: true
+        overload: false
+        generator.repeat: 1
+    - name: r6b_overload
+      overrides:
+        query_config.source_type: InMemory
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: *fast_parsers
+        query_config.output_parser: *fast_out
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: fnattr
+        worker.query_engine.inline_invoke_calls: true
+        worker.query_engine.trace_constant_bytes: true
+        overload: true
+        generator.repeat: 1
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s)" }
+
+variants:
+  - name: q0
+    description: "Q0: SELECT * FROM bid (varsized passthrough)"
+    query: nexmark/matrix/bidstr_q0
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: qproject
+    description: "SELECT price FROM bid (single-col projection)"
+    query: nexmark/matrix/bidstr_qproject
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: qroute
+    description: "Q_route: content-based routing projection"
+    query: nexmark/matrix/bidstr_qroute
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: q1
+    description: "Q1: price * 908/1000 (float arith + ZMIJ out)"
+    query: nexmark/matrix/bidstr_q1
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: q2og
+    description: "Q2 (PAPER shape): 5-way OR point selection"
+    query: nexmark/matrix/bidstr_q2og
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: q2mod
+    description: "Q2 (mod shape): auctionId %123 filter"
+    query: nexmark/matrix/bidstr_q2mod
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: q10
+    description: "q10: CASTFROMUNIXTS reformat (civil_from_days, in-tree)"
+    query: nexmark/matrix/bidstr_q10
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: q14
+    description: "q14: computed-float range filter"
+    query: nexmark/matrix/bidstr_q14
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: q22
+    description: "q22: CONCAT string manipulation"
+    query: nexmark/matrix/bidstr_q22
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: qex
+    description: "Q_ex: HOSP working example (channel-eq + 2-id-OR + price<thresh -> CONCAT alert)"
+    query: nexmark/matrix/bidstr_qex
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }

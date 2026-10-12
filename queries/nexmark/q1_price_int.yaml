@@ -1,0 +1,30 @@
+query:
+  name: nexmark_q1_price_int
+  description: >
+    Nexmark-Q1 but price typed as INT64 (the bid price column is integer-valued anyway) and parsed by the
+    non-traced FAST int parser (FastINT64, wraps fast_float::from_chars for ints, input_parse-tagged proxy).
+    SELECT ts, auctionId, bidder, price*INT64(908)/INT64(1000) -- same shape as q1_price but integer parse +
+    integer arithmetic + integer output (DefaultOutputParser, output_parse-tagged). Used to A/B inlining the
+    INT parser (vs the float q1 where inlining Eisel+ZMIJ gave +16%); IIRC int-parse inlining historically
+    did NOT help. The *INT64(908)/INT64(1000) arithmetic defeats passthrough elision so the parse runs.
+
+  sql: "SELECT timestamp, auctionId, bidder, price * INT64(908) / INT64(1000) as price FROM bid"
+
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: INT64, not_null: true }
+      data:
+        large:
+          file: large/nexmark/bid_6GB.csv
+          size_bytes: 6442450944
+          rows: 183991721
+
+  sink_schema:
+    - { name: bid.timestamp, type: UINT64, not_null: true }
+    - { name: bid.auctionId, type: INT32, not_null: true }
+    - { name: bid.bidder, type: INT32, not_null: true }
+    - { name: price, type: INT64, not_null: true }

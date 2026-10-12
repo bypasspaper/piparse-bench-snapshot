@@ -1,0 +1,64 @@
+experiment:
+  name: iouring_q1_privpool
+  description: >
+    Can the parse-heavy float query reach the disk ceiling with the io_uring source + all optimizations?
+    Nexmark Q1 (price*908/1000, EiselFloatF64 in + ZMIJF64 out -- float parse AND re-serialize per tuple),
+    cold O_DIRECT IoUringFile, with the per-source PRIVATE pool (default_max_inflight_buffers=256 -> QD
+    auto-derived = 64) + regbuf (global_buffer_alignment 512 + NES_IOURING_REGBUF) and the DEFAULT global pool
+    (private pool makes cold reads independent of it). Q1 is WORKER/compute-bound (§33: cold io_uring Q1 scaled
+    W1 0.71 -> W8 4.97 -> W16 6.17, below the 7.0 device cap), so sweep workers HIGH (8/16/24/32) to see if more
+    compute closes the gap to the ~7.0 cold NVMe ceiling or whether float parse+arith+ZMIJ output caps it first.
+    bid_6GB (integers parse fine as FLOAT64), single cold pass, n=3 median. Compare to §33 (pool 4096, no
+    private pool/regbuf): does the source-local pool + regbuf lift the high-W numbers toward 7.0?
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: true
+  completion_timeout_s: 180
+  worker:
+    default_max_inflight_buffers: 256
+    global_buffer_alignment: 512
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+  query_config:
+    source_type: IoUringFile
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64, f64: EiselFloatF64}
+    output_formatter: {type: CSV}
+    output_parser: {f64: ZMIJF64}
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+  worker_env:
+    NES_IOURING_DIRECT: 1
+    NES_IOURING_REGBUF: 1
+
+variants:
+  - name: iouring_q1_privpool
+    description: "cold O_DIRECT io_uring Q1 (float), private pool + regbuf, worker sweep"
+    query: nexmark/q1_price
+    axes:
+      x:
+        label: "worker threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [8, 16, 24, 32]
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: line_chart}

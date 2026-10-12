@@ -1,0 +1,81 @@
+experiment:
+  name: iouring_pool_sweep
+  description: >
+    Map the §40 pool-size effect: cold O_DIRECT IoUringFile passthrough throughput vs global pool size
+    (number_of_buffers_in_global_buffer_manager), for baseline (non-fixed) AND regbuf (registered fixed
+    buffers), to find (a) the throughput cliff as the pool grows and (b) the pool-size region where the regbuf
+    producer-CPU lever actually helps. §40 endpoints: pool 4096 -> baseline 5.77 / regbuf 6.76; pool 32768
+    (default) -> both ~3.3 (regbuf no help). Hypothesis: small pools (reused many times in one cold pass ->
+    pages stay faulted/warm) are fast and producer-bound (regbuf helps); large pools are fault/cache-bound
+    (regbuf irrelevant). 128 KiB buffers, pinning OFF, single-pass cold O_DIRECT QD64, W4/IO1, n=3 median.
+    Pool x buffer-size = footprint: 2048=256MB 4096=512MB 8192=1GB 16384=2GB 32768=4GB. regbuf points set
+    global_buffer_alignment: 512 (+ NES_IOURING_REGBUF=1); without it regbuf falls back to plain reads.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: true
+  completion_timeout_s: 120
+  worker:
+    query_engine:
+      number_of_worker_threads: 4
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 4096
+  query_config:
+    source_type: IoUringFile
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64}
+    output_formatter: {type: CSV}
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+  worker_env:
+    NES_IOURING_DIRECT: 1
+    NES_IOURING_QD: 64
+    NES_IOURING_REGBUF: 0
+
+variants:
+  - name: baseline
+    description: "non-fixed reads, sweep pool size"
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "pool buffers"
+        parameter: worker.number_of_buffers_in_global_buffer_manager
+        values: [2048, 4096, 8192, 16384, 32768]
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: line_chart, x_scale: log}
+  - name: regbuf
+    description: "registered fixed buffers (global_buffer_alignment 512), sweep pool size"
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "pool buffers"
+        explicit:
+          - name: "2048"
+            overrides: {"worker.number_of_buffers_in_global_buffer_manager": 2048, "worker.global_buffer_alignment": 512, "worker_env.NES_IOURING_REGBUF": 1}
+          - name: "4096"
+            overrides: {"worker.number_of_buffers_in_global_buffer_manager": 4096, "worker.global_buffer_alignment": 512, "worker_env.NES_IOURING_REGBUF": 1}
+          - name: "8192"
+            overrides: {"worker.number_of_buffers_in_global_buffer_manager": 8192, "worker.global_buffer_alignment": 512, "worker_env.NES_IOURING_REGBUF": 1}
+          - name: "16384"
+            overrides: {"worker.number_of_buffers_in_global_buffer_manager": 16384, "worker.global_buffer_alignment": 512, "worker_env.NES_IOURING_REGBUF": 1}
+          - name: "32768"
+            overrides: {"worker.number_of_buffers_in_global_buffer_manager": 32768, "worker.global_buffer_alignment": 512, "worker_env.NES_IOURING_REGBUF": 1}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: line_chart, x_scale: log}

@@ -1,0 +1,77 @@
+experiment:
+  name: cold_iouring_q1_worker_sweep
+  description: >
+    Cold io_uring O_DIRECT worker sweep for the FLOAT query (Nexmark Q1: price*908/1000),
+    with the best float parsers: EiselFloatF64 (input) + ZMIJF64 (output, Ryu shortest-form),
+    output_format=CSV (the float is parsed AND re-serialized -> Q1 is float-OUTPUT-bound and
+    COMPUTE-heavy). source_type IoUringFile, NES_IOURING_DIRECT=1 / QD=64, cold (mincore-evicted)
+    single 6.44 GB pass, pool 4096, IO=1. Sweep number_of_worker_threads 1..16, median n=3.
+
+    CONTRAST with the passthrough cold sweep (iouring_worker_sweep), which SATURATED at W=3 (~5.9,
+    source-thread-bound): Q1 has real per-tuple compute (float parse + arithmetic + float output
+    serialization), so it should SCALE with workers and stay COMPUTE-bound well past W=3.
+    PREDICTION (cf §21j warm File q1: W1 0.72 / W4 2.67 / W8 5.15 / W16 6.02):
+    - low-mid W: compute-bound, so cold ~= warm (the source supplies faster than compute consumes).
+    - high W (W8-16): approaches the cold io_uring source ceiling ~5.9 GB/s -> caps there (slightly
+      below warm's ~6.0). So expect ~0.7 / 1.4 / 2.7 / 5.1 / 5.9 across W=1/2/4/8/16, knee where
+      compute throughput meets the 5.9 source cap.
+    If it scales linearly to W16 without flattening, compute is still the limit (source has headroom);
+    if it flattens ~5.9 at W8-16, the single-producer source cap is reached (same wall as passthrough).
+
+    GOTCHAS: q1 reads price as FLOAT64 from bid_6GB (EiselFloatF64 parses it). cold_read requires
+    repeat 1. W1 cold is slow (~9 s/pass at ~0.7 GB/s) -> completion_timeout 120 s. Sandbox OFF (:8080).
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: true
+  completion_timeout_s: 120
+  worker:
+    query_engine:
+      number_of_worker_threads: 4
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 4096
+  query_config:
+    source_type: IoUringFile
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser:
+      uint64: TracedUINT64
+      int32: TracedINT32
+      int64: TracedINT64
+      f64: EiselFloatF64
+    output_formatter: {type: CSV}
+    output_parser:
+      f64: ZMIJF64
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+  worker_env:
+    NES_IOURING_DIRECT: 1
+    NES_IOURING_QD: 64
+
+variants:
+  - name: cold_iouring_q1_worker_sweep
+    description: "cold O_DIRECT IoUringFile, Nexmark Q1 float (Eisel in / ZMIJ out), sweep workers"
+    query: nexmark/q1_price
+    axes:
+      x:
+        label: "number_of_worker_threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [1, 2, 4, 8, 16]
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: line_chart}

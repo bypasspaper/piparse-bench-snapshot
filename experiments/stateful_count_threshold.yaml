@@ -1,0 +1,81 @@
+experiment:
+  name: stateful_count_threshold
+  description: >
+    §15 (a): pin the buffer-COUNT threshold for stateful windowed joins at HEAD.
+    Fix operator_buffer_size=4096 (4 KiB), sweep number_of_buffers_in_global_buffer_manager.
+    q3 (auction JOIN person, 1.1M out) succeeded at 2M and FAILED at 1M (constant-bytes
+    sweep, §21b) -> threshold in (1M, 2M]. q8 (person JOIN auction, 11M out) succeeded
+    at 2M. File, single pass, W=4, slice_cache on, HASH_JOIN (optimizer default for
+    equi-joins). Goal: minimum workable count per query + how it scales with output
+    cardinality. Companion: HANDOVER §21/§21b.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+
+  worker:
+    query_engine:
+      number_of_worker_threads: 4
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+    default_query_execution:
+      operator_buffer_size: 4096
+      execution_mode: COMPILER
+      slice_cache:
+        enable_slice_cache: true
+    # number_of_buffers_in_global_buffer_manager is the X axis.
+
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter:
+      type: SIMDCSV
+    input_parser:
+      uint64: TracedUINT64
+      int32: TracedINT32
+      int64: TracedINT64
+      f64: EiselFloatF64
+    output_formatter:
+      type: CSV
+
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: q3_count
+    description: "q3 auction JOIN person: count threshold @ 4 KiB"
+    query: nexmark/q3_join
+    axes:
+      x:
+        label: "buffer count (x 4 KiB)"
+        parameter: worker.number_of_buffers_in_global_buffer_manager
+        values: [2000000, 1800000, 1600000, 1400000, 1200000, 1000000]
+    y:
+      metric: throughput_mbps
+      label: "Throughput (MB/s)"
+    visualization:
+      type: line_chart
+
+  - name: q8_count
+    description: "q8 person JOIN auction: count threshold @ 4 KiB"
+    query: nexmark/q8_join
+    axes:
+      x:
+        label: "buffer count (x 4 KiB)"
+        parameter: worker.number_of_buffers_in_global_buffer_manager
+        values: [2000000, 1500000, 1000000, 750000, 500000]
+    y:
+      metric: throughput_mbps
+      label: "Throughput (MB/s)"
+    visualization:
+      type: line_chart

@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+# Fig2 PREDICATE sweep (2026-09-28): SELECT * FROM t WHERE c0 < 8000 over a MIXED N=8-column row: c0 INT32 uniform
+# [0,1e6) (predicate column -> lazy INT overload compares raw digits with overload: true) + 7 FLOAT64 (.6f) payload
+# columns. Selectivity 0.8% (= NEXMark q2). csv->json. Data nm8.csv (199999999 B, 2406206 rows) / nm8_x10.csv (Flink).
+query:
+  name: multicol_pred_n8
+  description: "Fig2 predicate point: SELECT * WHERE c0 < 8000 over 1 INT32 + 7 FLOAT64 columns (csv->json, 0.8% sel)."
+  sql: "SELECT * FROM t WHERE c0 < INT32(8000)"
+  flink_sql: "SELECT * FROM t WHERE c0 < 8000"
+  sources:
+    - name: t
+      schema:
+        - { name: c0, type: INT32, not_null: true }
+        - { name: c1, type: FLOAT64, not_null: true }
+        - { name: c2, type: FLOAT64, not_null: true }
+        - { name: c3, type: FLOAT64, not_null: true }
+        - { name: c4, type: FLOAT64, not_null: true }
+        - { name: c5, type: FLOAT64, not_null: true }
+        - { name: c6, type: FLOAT64, not_null: true }
+        - { name: c7, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/multicol/nm8.csv
+          size_bytes: 199999999
+          rows: 2406206
+        xlarge:
+          file: large/multicol/nm8_x10.csv
+          size_bytes: 1999999990
+          rows: 24062060
+  sink_schema:
+    - { name: t.c0, type: INT32, not_null: true }
+    - { name: t.c1, type: FLOAT64, not_null: true }
+    - { name: t.c2, type: FLOAT64, not_null: true }
+    - { name: t.c3, type: FLOAT64, not_null: true }
+    - { name: t.c4, type: FLOAT64, not_null: true }
+    - { name: t.c5, type: FLOAT64, not_null: true }
+    - { name: t.c6, type: FLOAT64, not_null: true }
+    - { name: t.c7, type: FLOAT64, not_null: true }

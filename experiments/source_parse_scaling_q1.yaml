@@ -1,0 +1,101 @@
+experiment:
+  name: source_parse_scaling_q1
+  description: >
+    PART 3 of the "interpreted parsing in the source thread" session (2026-07-06). Same
+    harness as source_parse_scaling (READ ITS HEADER FIRST -- all structure, gotchas and
+    the thread-budget reasoning apply verbatim), but the workload is Nexmark Q1
+    (nexmark/q1_price: SELECT timestamp, auctionId, bidder, price*908/1000 -- FLOAT64
+    arithmetic, ALL 4 columns in the output). Differences vs the 2-of-4 projection run:
+      - The async/lazy advantage SHRINKS on the input side (price must be parsed in both
+        arms; timestamp/auctionId/bidder can still be lazily elided/byte-copied by the
+        compiled path but must be FORMATTED into the 4-col CSV output either way).
+      - The OUTPUT side doubles (4 cols incl the recomputed float vs 2 cols) -> more worker
+        work in BOTH arms; the blocking arm's workers-only downstream gets heavier relative
+        to its fixed ~0.45-0.5 GB/s/thread interpreted source ceiling.
+    PRIOR ANCHOR: q1 fastest-known per-thread rate (async 1io+1w, full inline) = 823 MB/s.
+
+    PREDICTIONS (write before running):
+      - N=1: async well above blocking (multiple workers parallelize q1's parse+output;
+        blocking pinned at its single interpreted source thread ~0.4-0.5 GB/s).
+      - Blocking aggregate ~ N x per-thread rate until ~N=24-50, then oversubscription
+        plateau/decline like the projection run -- possibly at a LOWER aggregate than the
+        projection run because workers steal more CPU for the 4-col output.
+      - Async ceiling LOWER than the projection run (double output work on the same 24
+        workers). The async-vs-blocking gap at N>=50 should be SMALLER than projection's if
+        output (shared cost) dominates, LARGER if lazy input elision still dominates.
+
+    RESULTS (2026-07-06, reps=3):
+      async_compiled:      N=1/10/50/100 = 5031 / 11822 / 12331 / 12601 MB/s -- only ~4-7%
+        below the projection run (12601 vs 13230 at N=100): the doubled output work is
+        largely absorbed (DRAM shadow). BUT the TAIL comes back: p99 5.5 / 12.3 ms at
+        N=50/100 (vs 0.7 / 1.3 in the projection run) -- the old passthrough run's ~12 ms
+        N=100 tail was the 4-col output volume, not a harness artifact; the projection run's
+        tight tail was its small 2-col output.
+      blocking_uncompiled: N=1/10/50/100 = 423 / 4713 / 7814 / 6876 MB/s. Same shape as
+        projection but LOWER plateau (7.8 vs 9.0 GB/s at N=50, -13%) and STEEPER N=100
+        decline (-12% vs -9%): the heavier 4-col output steals more worker CPU from the
+        oversubscribed source threads. Latency worse still: p50 16.6 / 20.9 ms, p99 22 / 28
+        ms at N=50/100.
+      GAP verdict: LARGER than projection at scale (1.58x / 1.83x at N=50/100 vs 1.45x /
+        1.6x) -- the "output is a shared cost" effect did NOT close the gap; lazy input
+        elision + the blocking arm's higher sensitivity to worker-CPU pressure dominate.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 600
+  worker:
+    query_engine:
+      number_of_worker_threads: 24
+      number_of_io_threads: 4
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+  query_config:
+    sink_type: Monitoring
+  generator:
+    repeat: 6
+
+variants:
+  - name: parse_thread_model_q1
+    description: "Nexmark Q1 (price*0.908, 4-col out): async compiled+lazy vs blocking uncompiled sequential"
+    query: nexmark/q1_price
+    axes:
+      x:
+        label: "Concurrent Queries (= Concurrent Sources)"
+        parameter: num_queries
+        values: [1, 10, 50, 100]
+      series:
+        label: "Ingestion + parse model"
+        explicit:
+          - name: async_compiled
+            baseline: true
+            overrides:
+              query_config.source_type: File
+              query_config.input_formatter: { type: SIMDCSV }
+              query_config.input_parser: { uint64: TracedUINT64, int32: TracedINT32, f64: EiselFloatF64 }
+              query_config.output_formatter: { type: CSV }
+              query_config.output_parser: { f64: ZMIJF64 }
+          - name: blocking_uncompiled
+            overrides:
+              query_config.source_type: BlockingFile
+              query_config.input_formatter: { type: SequentialUncompiledCSV, threading_mode: sequential }
+              query_config.output_formatter: { type: CSVUncompiled }
+    y:
+      metric: throughput_mbps
+      label: "Aggregate System Throughput (MB/s)"
+    visualization:
+      type: line_chart
+      x_scale: log

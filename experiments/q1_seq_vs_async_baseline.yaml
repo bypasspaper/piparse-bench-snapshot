@@ -1,0 +1,118 @@
+experiment:
+  name: q1_seq_vs_async_baseline
+  description: >
+    BASELINE ("before") for the sequential-CSV-formatter rewrite. Establishes the current
+    single-thread Nexmark-Q1 throughput/latency of the TWO source-execution models we are comparing,
+    BEFORE we erase and rebuild the sequential formatter.
+
+    THE COMPARISON (the paper axis for this sub-project):
+    - async  = File source + SIMDCSV (parallel formatter). The source io-thread READS raw buffers and
+      hands them to the worker pool; a worker PARSES on a DIFFERENT core. Branchless SIMD structured
+      indexing (two-phase index->parse, simdjson-style), parse JIT-compiled over the FieldOffsets array.
+    - blocking+sequential = BlockingFile source + SequentialCSV + threading_mode=sequential. The source
+      thread emits SourceReturnType::Execute and the scan/index/parse pipeline runs INLINE on the source
+      thread (DefaultPEC, 1 thread), in-order, no SequenceShredder. Data stays L1/L2-hot on one thread.
+
+    WHY W=1: we are isolating SINGLE-THREAD formatter cost. async at W=1 = 1 io-read thread + 1 worker
+    parse thread (2 threads, cross-core handoff); blocking+seq = 1 source thread does read+parse (cache
+    -hot). That thread-count asymmetry IS the architectural difference under test, not a confound.
+
+    WHAT "CURRENT SequentialCSV" IS (the thing being measured here, then thrown away): the OLD naive
+    scalar formatter -- per-tuple std::string_view::find() for newlines then find() for commas (a DOUBLE
+    scan). Microbench (csv-indexer-benchmark, 1 core AVX2, 64 MiB, 5 cols): scalar quote-aware (its
+    default path) = 1.29 GB/s; scalar find = 2.01; SIMDCSV structured indexInto = 1.99; SIMDCSV raw
+    flat-band scan = 5.64. So structured FieldOffsets EMISSION (per-tuple grouping + field-count
+    validation), NOT the scan, caps the index phase at ~2 GB/s. The rewrite (step 2) closes that gap
+    while KEEPING branchless SIMD indexing + two-phase (do NOT fuse parse into the scan -- that would
+    reintroduce per-field branches and kill the branchless SIMD throughput; two-phase is SOTA and is
+    what enables the compiled parse).
+
+    PLAN: (1) this baseline. (2) ERASE SequentialCSVInputFormatIndexer entirely, rebuild from scratch as
+    a SIMDCSV-derived sequential variant (same branchless SIMD structured indexer, minus the parallel
+    SequenceShredder; in-order aligned buffers + spanning-tuple accumulator). (3) single-thread perf tune.
+    Re-run THIS experiment after each step -> the "after" curve.
+
+    Q1 = SELECT timestamp, auctionId, bidder, price * FLOAT64(908)/FLOAT64(1000) AS price FROM bid.
+    price is FLOAT64 -> genuine float INPUT parse (EiselFloatF64, fastest) + float OUTPUT (ZMIJF64).
+    Unlike bid_passthrough (parse-elided), Q1 actually parses the price field -> exercises the formatter.
+
+    CONFIG: fastest known stack (SIMDCSV + fnattr inlining + 131072 buffer + Eisel-in/ZMIJ-out + COMPILER
+    + native). WARM page cache (no cold_read), data_size=small (bid_653M ~684 MB), repeat 10 for a steady
+    MonitoringSink window (~6.8 GB total, ~3-4 s at ~2 GB/s). W=1, IO=1.
+
+    EXPECTED (predict-before-measure): both arms limited by the ~2 GB/s single-thread index/parse cap
+    seen in the microbench, likely ~1.5-2.5 GB/s. Hypotheses to check: (H1) blocking+seq >= async
+    single-thread due to cache locality (read+parse same thread, no cross-core buffer handoff);
+    (H2) OR async >= blocking+seq because SIMDCSV branchless indexing (1.99) beats the naive scalar
+    find/quote-aware (1.29) the current SequentialCSV uses -- i.e. the naive formatter's index cost
+    dominates and the rewrite is exactly what closes it. If H2, the "after" (SIMD sequential) should
+    jump toward/past async AND keep the cache-locality edge.
+
+    GOTCHAS:
+    - Sequential formatter REQUIRES a blocking source (dedicated thread). BlockingFile, not File.
+    - Run sandbox OFF (spawns worker, binds :8080). `pkill -x main` pre-flight (worker comm = main);
+      verify :8080 free (a stale worker silently serves -> wrong numbers). NEVER pkill -f with a
+      self-matching pattern.
+    - WARM: the first rep populates the page cache; all reps read warm. Median of repetitions.
+    - This measures the CURRENT (soon-erased) SequentialCSV. Keep the YAML as the canonical before/after
+      harness across the rewrite; only the formatter implementation changes underneath it.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium   # bid_1GB.csv, 4-field (matches q1 schema; small/bid_653M is a 5-field variant)
+  topology: single-node
+  completion_timeout_s: 120
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 4096
+  query_config:
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser:
+      uint64: TracedUINT64
+      int32: TracedINT32
+      int64: TracedINT64
+      f64: EiselFloatF64
+    output_formatter: {type: CSV}
+    output_parser:
+      f64: ZMIJF64
+  generator:
+    repeat: 10
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: q1_seq_vs_async_baseline
+    description: "Q1 single-thread: async File+SIMDCSV vs blocking BlockingFile+SequentialCSV(sequential)"
+    query: nexmark/q1_price
+    axes:
+      x:
+        label: "source execution model"
+        explicit:
+          - name: "async_File_SIMDCSV"
+            baseline: true
+            overrides:
+              query_config.source_type: File
+              query_config.input_formatter.type: SIMDCSV
+          - name: "blocking_SequentialCSV"
+            overrides:
+              query_config.source_type: BlockingFile
+              query_config.input_formatter.type: SequentialCSV
+              query_config.input_formatter.threading_mode: sequential
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

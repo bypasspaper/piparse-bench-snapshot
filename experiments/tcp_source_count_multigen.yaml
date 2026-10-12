@@ -1,0 +1,91 @@
+experiment:
+  name: tcp_source_count_multigen
+  description: >
+    TCP source-count scaling with INDEPENDENT generators (generator.independent_per_query:
+    true -> one generator process per concurrent query, each on its own port). The
+    shared-generator sweep (tcp_source_count.yaml) peaked at 14.4 GB/s @ N=4 (= rung-2a
+    loopback ceiling) and DROPPED to 10 @ N=8 -- suspected to be the single generator
+    process capping/contending, not the engine. This uncaps the producer side to find
+    the real engine aggregate ingestion ceiling.
+
+    Also sweeps worker threads W={8,16}: passthrough is IO/ingestion-bound (parse elided
+    via output_format=CSV), so FEWER workers should free cores for the N generator
+    processes + io threads and reduce oversubscription. IO=8 (recv capacity for many
+    sources). Compare against tcp_source_count.yaml (shared, W=16, IO=4).
+
+    GOTCHAS (read before running):
+    - ⚠️ RAM: each independent generator loads the WHOLE file into memory before binding.
+      N generators x bid_6GB(6 GB) = N x 6 GB. N=8 -> ~48 GB on a 64 GB box (worker pool
+      512 MB + engine on top). Do NOT exceed N=8 here, or generators OOM (the runner will
+      report generator/worker death). For higher N use a smaller data file.
+    - Core budget (24c/48t): N generators (~1 send thread each) + IO=8 + W workers. W=16,
+      IO=8, N=8 gen = ~32 active threads; W=8 leaves more headroom -> the point of the W sweep.
+    - Aggregate = sum of N per-query MonitoringSink throughputs; passthrough recycles
+      buffers so the 512 MB stateless-optimum pool is correct.
+    - repeat 4 (steady). Each query streams 6.44 GB x 4 to its own generator's 1 client.
+
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 2
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+
+  worker:
+    query_engine:
+      number_of_worker_threads: 16         # overridden per series
+      number_of_io_threads: 8
+      invoke_mode_configuration: fnattr
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 4096
+
+  query_config:
+    source_type: TCP
+    sink_type: Monitoring
+    input_formatter:
+      type: SIMDCSV
+    input_parser:
+      uint64: TracedUINT64
+      int32: TracedINT32
+      int64: TracedINT64
+    output_formatter:
+      type: CSV
+
+  generator:
+    repeat: 4
+    mode: burst
+    rate: 1000000
+    independent_per_query: true            # one generator process per concurrent query
+
+variants:
+  - name: multigen
+    description: "aggregate ingestion vs source count, independent generators, W={8,16}"
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "Concurrent TCP sources (independent generators)"
+        parameter: num_queries
+        values: [2, 4, 8]
+      series:
+        label: "Worker threads"
+        explicit:
+          - name: W16
+            baseline: true
+            overrides:
+              worker.query_engine.number_of_worker_threads: 16
+          - name: W8
+            overrides:
+              worker.query_engine.number_of_worker_threads: 8
+    y:
+      metric: throughput_mbps
+      label: "Aggregate Throughput (MB/s)"
+    visualization:
+      type: line_chart

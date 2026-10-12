@@ -1,0 +1,150 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: hoisting_selectivity
+  description: >
+    Parse-hoisting microbenchmark: q_route (SELECT * FROM bid WHERE channel == "TARGET") over a
+    synthetic selectivity sweep (0/1/5/10/20/50/80/100% of rows match), CSV->JSON, InMemory prefill,
+    W1. Passthrough is DISABLED on the output so both arms genuinely parse the numeric leaves
+    (FastUINT64 + EiselFloatF64, opaque proxies; ZMIJF64 out) -- we measure PARSE HOISTING, not
+    passthrough elimination. Two arms:
+      * eager (without LazyValue): INPUT_FORMATTER.EAGER_PARSE=true, invoke_mode=default (opaque) ->
+        every row's numerics are parsed at scan, upstream of the filter.
+      * lazy  (with LazyValue):    EAGER_PARSE off, invoke_mode=fnattr -> the parse is deferred to the
+        use site (JSON serialize), which sits inside the taken filter branch, so only matching rows parse.
+    Expectation: lazy throughput scales inversely with selectivity (cheap when few rows match), eager is
+    ~flat (always parses all); the two converge at 100%. Correctness (byte-identical output) was proven
+    separately via nes-systests/formatter/HoistingQRoute + qroute_{lazy,eager} IR runs.
+    RUN: cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/hoisting_selectivity.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 5
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: default
+      inline_invoke_calls: false
+      trace_constant_bytes: false
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+    output_formatter: { type: JSON, disable_passthrough: true }
+    input_parser: { uint64: FastUINT64, f64: EiselFloatF64 }
+    output_parser: { f64: ZMIJF64 }
+  generator:
+    repeat: 5
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 5
+    NES_INMEM_BUFSIZE: 131072
+
+_arms: &arms
+  label: "arm"
+  explicit:
+    - name: eager_without_lazyvalue
+      baseline: true
+      overrides:
+        query_config.source_type: InMemory
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false, eager_parse: true }
+        query_config.output_formatter: { type: JSON, disable_passthrough: true }
+        query_config.input_parser: { uint64: FastUINT64, f64: EiselFloatF64 }
+        query_config.output_parser: { f64: ZMIJF64 }
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: default
+        worker.query_engine.inline_invoke_calls: false
+        worker.query_engine.trace_constant_bytes: false
+        overload: false
+        generator.repeat: 5
+    - name: lazy_with_lazyvalue
+      overrides:
+        query_config.source_type: InMemory
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON, disable_passthrough: true }
+        query_config.input_parser: { uint64: FastUINT64, f64: EiselFloatF64 }
+        query_config.output_parser: { f64: ZMIJF64 }
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: fnattr
+        worker.query_engine.inline_invoke_calls: false
+        worker.query_engine.trace_constant_bytes: false
+        overload: false
+        generator.repeat: 5
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s)" }
+
+variants:
+  - name: sel_000
+    description: "0% selectivity (no row matches)"
+    query: hoisting/bid_sel000
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: sel_001
+    description: "1% selectivity"
+    query: hoisting/bid_sel001
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: sel_005
+    description: "5% selectivity"
+    query: hoisting/bid_sel005
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: sel_010
+    description: "10% selectivity"
+    query: hoisting/bid_sel010
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: sel_020
+    description: "20% selectivity (matches real bid_strings google)"
+    query: hoisting/bid_sel020
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: sel_050
+    description: "50% selectivity"
+    query: hoisting/bid_sel050
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: sel_080
+    description: "80% selectivity"
+    query: hoisting/bid_sel080
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: sel_100
+    description: "100% selectivity (all rows match)"
+    query: hoisting/bid_sel100
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }

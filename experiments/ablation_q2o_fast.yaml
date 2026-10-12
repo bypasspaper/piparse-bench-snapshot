@@ -1,0 +1,219 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: ablation_q2o_fast
+  description: >
+    FAST single-query probe of the ladder on nexmark/q2_original (paper Q2: 5-way OR point
+    selection, auctionId == 1007|1020|2001|2019|1087, INT32). This is THE OVERLOAD query, so
+    the ladder is REFINED vs ablation_q14_fast: overload is isolated at W1 (r6b) BEFORE scale-out,
+    because r7 alone bundles overload with parallelism and cannot attribute it (the ladder LAW:
+    measure a compute knob while compute-bound, not past the scale-out ceiling).
+
+    RUNGS (r1-r7 run on the CURRENT binary; r8 = InlineTagConfig +input_parse rebuild, NOT here):
+      r1 olduncompiled : SequentialUncompiledOldCSV  (scalar find indexer, interpreted)
+      r2 uncompiled    : SequentialUncompiledCSV     (SIMD band indexer, interpreted)
+      r3 compiled      : SequentialCSV, all JIT knobs OFF
+      r4 +fnattr       : invoke_mode_configuration -> fnattr
+      r5 +inline       : inline_invoke_calls -> true
+      r6 +tcb          : trace_constant_bytes -> true
+      r6b +overload    : overload -> true, STILL W1  <-- the isolated overload lever
+      r7 parallel      : File + SIMDCSV PARALLEL, W16 (pure scale-out on top of overload)
+
+    EXPECTED on q2_original (state up front):
+      - r6 (tcb): FLAT. auctionId is INT32; the INT overload uses constantEq's own
+        [[gnu::always_inline]] renderConstantDigits helper, NOT bytesEqual, and there is no VARSIZED
+        literal -> trace_constant_bytes touches nothing here (same inertness as q14, cross-checked
+        on an INT-eq query instead of float-arith).
+      - r6b (overload): THE BIG BAR. constantEq compares raw field bytes against the rendered
+        constant, so the filtered-out rows skip the INT parse entirely (lazy). Handover saw ~5.80x
+        for overload on q2_original. This rung finally attributes it, at W1.
+      - r3-r5 (compiled/fnattr/inline): the current binary has input_parse DISABLED (shipped
+        default), so the 5 identical attributed auctionId parses are GVN-merged to ONE (the
+        26.88s->9.18s win). r8 (input_parse ENABLED, needs a rebuild) would RE-BREAK that and is the
+        documented -2.9x regression -- deliberately not in this fast pass.
+
+    METRIC: throughput_mbps (repeat differs per rung; repeat-invariant). 3 reps, median.
+    DATA: medium (bid_1GB, ~1.09 GB). Per-rung repeat for ~2-7 s windows:
+      r1-r6b (W1): repeat 5  -> ~5.4 GB/run (slow compiled baseline ~700 MB/s -> ~8 s;
+                   fast overload rung ~2-3 GB/s -> ~2 s, above the sub-second trap)
+      r7  (W16)  : repeat 40 -> ~44 GB/run
+
+    PORT 9099 (8080 held). Governor performance. Sink Monitoring.
+    RUN: cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/ablation_q2o_fast.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099 --detach
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: default
+      inline_invoke_calls: false
+      trace_constant_bytes: false
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: BlockingFile
+    sink_type: Monitoring
+    input_formatter: { type: SequentialUncompiledOldCSV, threading_mode: SEQUENTIAL }
+    output_formatter: { type: JSONUncompiled }
+    input_parser: {}
+    output_parser: {}
+  generator:
+    repeat: 5
+
+_fast_parsers: &fast_parsers
+  uint64: TracedUINT64
+  int64: TracedINT64
+  int32: FastINT32
+  int16: TracedINT16
+  uint32: TracedUINT32
+  uint16: TracedUINT16
+  bool: TracedBOOL
+  f64: EiselFloatF64
+  f32: EiselFloatF32
+_fast_out: &fast_out { f64: ZMIJF64, f32: ZMIJF32 }
+
+_ladder_q2o: &ladder_q2o
+  label: "optimization (cumulative)"
+  explicit:
+    - name: r1_olduncompiled
+      baseline: true
+      overrides:
+        query_config.source_type: BlockingFile
+        query_config.input_formatter: { type: SequentialUncompiledOldCSV, threading_mode: SEQUENTIAL }
+        query_config.output_formatter: { type: JSONUncompiled }
+        query_config.input_parser: {}
+        query_config.output_parser: {}
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: default
+        worker.query_engine.inline_invoke_calls: false
+        worker.query_engine.trace_constant_bytes: false
+        overload: false
+        generator.repeat: 5
+    - name: r2_uncompiled
+      overrides:
+        query_config.source_type: BlockingFile
+        query_config.input_formatter: { type: SequentialUncompiledCSV, threading_mode: SEQUENTIAL }
+        query_config.output_formatter: { type: JSONUncompiled }
+        query_config.input_parser: {}
+        query_config.output_parser: {}
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: default
+        worker.query_engine.inline_invoke_calls: false
+        worker.query_engine.trace_constant_bytes: false
+        overload: false
+        generator.repeat: 5
+    - name: r3_compiled
+      overrides:
+        query_config.source_type: BlockingFile
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: *fast_parsers
+        query_config.output_parser: *fast_out
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: default
+        worker.query_engine.inline_invoke_calls: false
+        worker.query_engine.trace_constant_bytes: false
+        overload: false
+        generator.repeat: 5
+    - name: r4_fnattr
+      overrides:
+        query_config.source_type: BlockingFile
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: *fast_parsers
+        query_config.output_parser: *fast_out
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: fnattr
+        worker.query_engine.inline_invoke_calls: false
+        worker.query_engine.trace_constant_bytes: false
+        overload: false
+        generator.repeat: 5
+    - name: r5_inline
+      overrides:
+        query_config.source_type: BlockingFile
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: *fast_parsers
+        query_config.output_parser: *fast_out
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: fnattr
+        worker.query_engine.inline_invoke_calls: true
+        worker.query_engine.trace_constant_bytes: false
+        overload: false
+        generator.repeat: 5
+    - name: r6_tcb
+      overrides:
+        query_config.source_type: BlockingFile
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: *fast_parsers
+        query_config.output_parser: *fast_out
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: fnattr
+        worker.query_engine.inline_invoke_calls: true
+        worker.query_engine.trace_constant_bytes: true
+        overload: false
+        generator.repeat: 5
+    - name: r6b_overload
+      overrides:
+        query_config.source_type: BlockingFile
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: *fast_parsers
+        query_config.output_parser: *fast_out
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: fnattr
+        worker.query_engine.inline_invoke_calls: true
+        worker.query_engine.trace_constant_bytes: true
+        overload: true
+        generator.repeat: 5
+    - name: r7_parallel
+      overrides:
+        query_config.source_type: File
+        query_config.input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: *fast_parsers
+        query_config.output_parser: *fast_out
+        worker.query_engine.number_of_worker_threads: 16
+        worker.query_engine.ccx_aware_task_queues: true
+        worker.query_engine.invoke_mode_configuration: fnattr
+        worker.query_engine.inline_invoke_calls: true
+        worker.query_engine.trace_constant_bytes: true
+        overload: true
+        generator.repeat: 40
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s)" }
+
+variants:
+  - name: nx_q2_original
+    description: "Q2 (PAPER shape): 5-way OR point selection on auctionId (INT32)"
+    query: nexmark/q2_original
+    axes: { x: *noop_x, series: *ladder_q2o }
+    y: *tput_y
+    visualization: { type: grouped_bar }

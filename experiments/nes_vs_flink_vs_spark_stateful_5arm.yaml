@@ -1,0 +1,237 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: nes_vs_flink_vs_spark_stateful_5arm
+  description: '5-ARM records/s head-to-head (stateful tier: ysb_1k_varsized, q8_join,
+    cm_q2). Arms: NES-Native (SystemNative .nes, NO parsing), NES-SIMD (compiled),
+    NES-Naive (SequentialUncompiledOldCSV scalar-find INTERPRETED = ablation r1, single-thread),
+    Flink, Spark. repeat=1 ALWAYS (event-time windows). Native string_length per query:
+    ysb 37,37,37,37,9,9,8 / person 16,32,32,16,4,256 / cm none. Metric throughput_mrows_s.
+    10 reps. SMOKE native+naive per query BEFORE full run (cm BOOLEAN + naive empty-parser
+    = SIGABRT risk; q8 join + interpreted = untested).'
+  primary_metric: throughput_mrows_s
+  higher_is_better: true
+  repetitions: 10
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  worker:
+    query_engine:
+      number_of_worker_threads: 23
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter:
+      type: SIMDCSV
+      allow_commas_in_strings: false
+    input_parser:
+      uint64: TracedUINT64
+      int64: TracedINT64
+      int32: FastINT32
+      int16: TracedINT16
+      uint32: TracedUINT32
+      uint16: TracedUINT16
+      f64: EiselFloatF64
+      f32: EiselFloatF32
+      bool: TracedBOOL
+    output_formatter:
+      type: JSON
+    output_parser:
+      f64: ZMIJF64
+      f32: ZMIJF32
+  generator:
+    repeat: 1
+  worker_env:
+    NES_MMAP_POPULATE: '1'
+_series_engines:
+  label: engine
+  explicit:
+  - name: NebulaStream
+    baseline: true
+    overrides:
+      query_config.source_type: MmapFile
+  - name: Flink
+    system: flink
+    overrides:
+      mode: flink
+      flink_execution_mode: streaming
+      flink_output_format: json_blackhole
+  - name: Spark
+    system: spark
+    overrides:
+      mode: spark
+      spark_output_format: json_void
+      spark_single_reader: true
+_axes_x: &id001
+  label: worker threads
+  parameter: worker.query_engine.number_of_worker_threads
+  values:
+  - 23
+_y:
+  metric: throughput_mbps
+  label: Throughput (MB/s, csv input bytes)
+_stateful_pool: &id002
+  worker.default_query_execution.operator_buffer_size: 4096
+  worker.number_of_buffers_in_global_buffer_manager: 2000000
+variants:
+- name: ysb_1k_varsized
+  description: YSB varsized 1k, tumble 30s count per campaign (input-bound pole)
+  query: yahoo/ysb_1k_varsized
+  overrides:
+    data_size: xlarge
+  axes:
+    x: *id001
+    series:
+      label: engine
+      explicit:
+      - name: NES-Native
+        baseline: true
+        overrides:
+          query_config.source_type: MmapFile
+          data_size: xlarge_native
+          query_config.input_formatter:
+            type: SystemNative
+            string_length: 37,37,37,37,9,9,8
+      - name: NES-SIMD
+        overrides:
+          query_config.source_type: MmapFile
+      - name: NES-Naive
+        overrides:
+          worker.query_engine.number_of_worker_threads: 1
+          query_config.source_type: BlockingFile
+          query_config.input_formatter:
+            type: SequentialUncompiledOldCSV
+            threading_mode: sequential
+          query_config.output_formatter:
+            type: JSONUncompiled
+          query_config.input_parser: {}
+          query_config.output_parser: {}
+      - name: Flink
+        system: flink
+        overrides:
+          mode: flink
+          flink_execution_mode: streaming
+          flink_output_format: json_blackhole
+      - name: Spark
+        system: spark
+        overrides:
+          mode: spark
+          spark_output_format: json_void
+          spark_single_reader: true
+  y:
+    metric: throughput_mrows_s
+    label: Throughput (records/s)
+  visualization:
+    type: grouped_bar
+- name: q8_join
+  description: 'Nexmark Q8: person JOIN auction, tumble 10s (state-dominated pole)'
+  query: nexmark/q8_join
+  overrides: *id002
+  axes:
+    x: *id001
+    series:
+      label: engine
+      explicit:
+      - name: NES-Native
+        baseline: true
+        overrides:
+          query_config.source_type: MmapFile
+          data_size: native
+          query_config.input_formatter:
+            type: SystemNative
+            string_length: 16,32,32,16,4,256
+      - name: NES-SIMD
+        overrides:
+          query_config.source_type: MmapFile
+      - name: NES-Naive
+        overrides:
+          worker.query_engine.number_of_worker_threads: 1
+          query_config.source_type: BlockingFile
+          query_config.input_formatter:
+            type: SequentialUncompiledOldCSV
+            threading_mode: sequential
+          query_config.output_formatter:
+            type: JSONUncompiled
+          query_config.input_parser: {}
+          query_config.output_parser: {}
+      - name: Flink
+        system: flink
+        overrides:
+          mode: flink
+          flink_execution_mode: streaming
+          flink_output_format: json_blackhole
+      - name: Spark
+        system: spark
+        overrides:
+          mode: spark
+          spark_output_format: json_void
+          spark_single_reader: true
+  y:
+    metric: throughput_mrows_s
+    label: Throughput (records/s)
+  visualization:
+    type: grouped_bar
+- name: cm_q2
+  description: 'ClusterMonitoring Q2: sliding 60s/1s SUM(cpu) by jobId, eventType=3
+    (middle)'
+  query: cluster_monitoring/q2_original
+  axes:
+    x: *id001
+    series:
+      label: engine
+      explicit:
+      - name: NES-Native
+        baseline: true
+        overrides:
+          query_config.source_type: MmapFile
+          data_size: native
+          query_config.input_formatter:
+            type: SystemNative
+            string_length: '16'
+      - name: NES-SIMD
+        overrides:
+          query_config.source_type: MmapFile
+      - name: NES-Naive
+        overrides:
+          worker.query_engine.number_of_worker_threads: 1
+          query_config.source_type: BlockingFile
+          query_config.input_formatter:
+            type: SequentialUncompiledOldCSV
+            threading_mode: sequential
+          query_config.output_formatter:
+            type: JSONUncompiled
+          query_config.input_parser: {}
+          query_config.output_parser: {}
+      - name: Flink
+        system: flink
+        overrides:
+          mode: flink
+          flink_execution_mode: streaming
+          flink_output_format: json_blackhole
+      - name: Spark
+        system: spark
+        overrides:
+          mode: spark
+          spark_output_format: json_void
+          spark_single_reader: true
+  y:
+    metric: throughput_mrows_s
+    label: Throughput (records/s)
+  visualization:
+    type: grouped_bar

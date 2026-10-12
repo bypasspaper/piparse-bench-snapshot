@@ -1,0 +1,375 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: all_queries_benchmark
+  description: >
+    THE FULL QUERY MATRIX (created 2026-07-13, user request; NOT yet run as one unit -
+    per-suite numbers live in the authoritative source experiments listed per section
+    below): every nexmark, ClusterMonitoring, YSB (fixed-width + varsized) and Smart Grid
+    query, csv_optimized vs native input arms, under the v2 controlled protocol (W16
+    pinned + CCX-sharded admission queue, io=1, fnattr, 128KiB buffers, warm reads,
+    reps=3 median). Designed to GROW - to add a query: one variant block + pick (or add)
+    the right series anchor for its native data + string_length.
+
+    INVENTORY (25 variants x 2 arms x 3 reps = 150 runs, several MINUTES-long ones):
+    nexmark x14 (source: nexmark_native_vs_csv_v2 + nexmark_native_native_v3; the three
+    2026-07-13 stateless additions q2_original/q14_calc/q10_datetime come from
+    nexmark_new_stateless - paper-Q2 5-way OR, computed-float range filter, and
+    CASTFROMUNIXTS reformatting projection), CM x1
+    (cmysb_native_vs_csv; the 1MB lightsaber subset is EXCLUDED by user call 2026-07-13 -
+    fixed-cost dominated, no benchmark value), YSB fixed x2 + varsized x2 (cmysb_* +
+    cmysb_ysb1k_ext + cmysb_ysb_varsized), Smart Grid x3 (smartgrid_native_vs_csv +
+    sg1_granularity_ab), Linear Road x2 + Manufacturing x1 (lrbmanu_native_vs_csv:
+    LRB on the x200 tiling - the seed is 557 KILOBYTES over 519s, the "560K" filename is
+    KB not MB; manufacturing runs its real 1.43GB/14.8-day stream single-pass).
+
+    PROTOCOL RULES (all learned the hard way; per-suite yamls hold the full stories):
+    - generator.repeat: DEFAULT 1. Only STATELESS queries may set repeat>1 (the nexmark
+      scans use 24 for steady windows). NES_FILE_REPEAT>1 into ANY event-time window
+      corrupts the heap (cmysb_repeat_probe: SIGSEGV/malloc-corruption) - steady state
+      for stateful queries comes from extended files with forward-shifted timestamps
+      (ysb ext24/ext4, smartgrid x120), never replay.
+    - dd-CLASS RULE: csv and .nes are DIFFERENT FILES and roll page-cache classes
+      independently (+-2 GB/s). Any per-byte claim finer than ~10% needs same-session dd
+      ceilings on BOTH files immediately pre-run (v2 protocol); rows/s-vs-footprint is
+      the class-robust comparison.
+    - stateful pool for the nexmark joins q5/q8/q8v only (4KiB x 2M: join state is
+      buffer-COUNT-bound); window aggregations run fine on the default 16384 x 128KiB.
+    - input parsers: full fast-stack superset below; unused type keys are inert.
+      bool MUST be TracedBOOL (DefaultBOOL __emutls-SIGABRTs release workers on any
+      non-passthrough query with a BOOLEAN column - cm_q2_original).
+    - string_length is REQUIRED by SystemNative even for no-varsized schemas (one dummy
+      value serves); varsized schemas need the exact per-VARSIZED-column slot list in
+      schema order (person "16,32,32,16,4,256", ysb varsized "37,37,37,37,9,9,8").
+    - sg3's SQL shape is LOAD-BEARING (outlier predicate in the ON -> NL join, alignment
+      via the 1s tumbling join window, start kept UNRENAMED on both sides) - two engine
+      bugs otherwise: frontend alias misbind, worker bad_optional_access. See
+      queries/smartgrid/sg3_outlier_join.yaml.
+    - CRLF trap: fixed-width ysb + smartgrid (and lightsaber) seeds ship CRLF; catalogs
+      point at _lf copies. Do not "fix" back to the originals.
+    - EXPECTED SHAPE of results (session 2026-07-13 law): per-byte engine cost csv ~=
+      native; rows/s ratio ~= byte footprint when input-bound (nexmark scans, ysb_1k);
+      parity when state-bound (CM, ysb_10k, all smart grid; sg1/sg3's trigger path is
+      lock-bound at W16 and cheap ingestion HURTS there); the only large text costs are
+      codec-bound queries with native output too (q1 native->native 2.07x).
+  primary_metric: processing_time_s
+  higher_is_better: false
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    # Fast-stack superset: unused type keys are inert; int32 is FastINT32 per the nexmark
+    # convention (throws on malformed - caught the auction CRLF trap), bool MUST be TracedBOOL.
+    input_parser:
+      uint64: TracedUINT64
+      int64: TracedINT64
+      int32: FastINT32
+      int16: TracedINT16
+      uint32: TracedUINT32
+      uint16: TracedUINT16
+      f64: EiselFloatF64
+      f32: EiselFloatF32
+      bool: TracedBOOL
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+
+# ── Series anchors: one per (native data key x string_length) combination ──────────────
+# csv_optimized is always the catalog default file for the variant's data_size.
+
+_series_nexmark: &nexmark_series          # nexmark: large -> native, person slot list
+  label: "input format"
+  explicit:
+    - name: csv_optimized
+      baseline: true
+      overrides: {}
+    - name: native
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "16,32,32,16,4,256" }
+        query_config.input_parser: {}
+
+_series_large_native: &large_native_series  # numeric schemas: large -> native
+  label: "input format"
+  explicit:
+    - name: csv_optimized
+      baseline: true
+      overrides: {}
+    - name: native
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "16" }
+        query_config.input_parser: {}
+
+_series_xlarge_native: &xlarge_native_series  # numeric schemas: xlarge -> xlarge_native
+  label: "input format"
+  explicit:
+    - name: csv_optimized
+      baseline: true
+      overrides: {}
+    - name: native
+      overrides:
+        data_size: xlarge_native
+        query_config.input_formatter: { type: SystemNative, string_length: "16" }
+        query_config.input_parser: {}
+
+_series_bid_strings: &bid_strings_series  # string-bearing bid (q22): large -> native, slots 13,73
+  label: "input format"
+  explicit:
+    - name: csv_optimized
+      baseline: true
+      overrides: {}
+    - name: native
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "13,73" }
+        query_config.input_parser: {}
+
+_series_varsized_large: &varsized_large_series  # ysb varsized: large -> native
+  label: "input format"
+  explicit:
+    - name: csv_optimized
+      baseline: true
+      overrides: {}
+    - name: native
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "37,37,37,37,9,9,8" }
+        query_config.input_parser: {}
+
+_series_varsized_xlarge: &varsized_xlarge_series  # ysb varsized: xlarge -> xlarge_native
+  label: "input format"
+  explicit:
+    - name: csv_optimized
+      baseline: true
+      overrides: {}
+    - name: native
+      overrides:
+        data_size: xlarge_native
+        query_config.input_formatter: { type: SystemNative, string_length: "37,37,37,37,9,9,8" }
+        query_config.input_parser: {}
+
+_axes_x: &w16_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [16]
+
+_y: &time_y { metric: processing_time_s, label: "Processing time (s)" }
+
+# Stateless nexmark scans: steady windows via replay (SAFE here - no window state).
+_stateless_repeat: &stateless_repeat
+  generator.repeat: 24
+
+# Nexmark joins: replay forbidden (event time wraps) + buffer-count-bound join state.
+_stateful_pool: &stateful_pool
+  generator.repeat: 1
+  worker.default_query_execution.operator_buffer_size: 4096
+  worker.number_of_buffers_in_global_buffer_manager: 2000000
+
+variants:
+  # ── Nexmark (source of truth: nexmark_native_vs_csv_v2 / nexmark_native_native_v3) ──
+  - name: nx_person_projection
+    description: "SELECT id FROM person - 1 fixed col of a varsized schema"
+    query: nexmark/person_projection
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *nexmark_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_person_star
+    description: "SELECT * FROM person - full varsized materialization (csv arm elided)"
+    query: nexmark/person_star
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *nexmark_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_bid_ts_projection
+    description: "SELECT timestamp FROM bid - 1-of-4 strict projection"
+    query: nexmark/bid_ts_projection
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *nexmark_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_bid_filter_eq
+    description: "SELECT * WHERE auctionId = 1000 - point filter"
+    query: nexmark/bid_filter_eq
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *nexmark_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_q0_bid_star
+    description: "Q0: SELECT * FROM bid (csv arm passthrough-elided)"
+    query: nexmark/bid_star
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *nexmark_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_q1_price
+    description: "Q1: price * 908/1000 - float parse + arith + ZMIJ out (the codec query)"
+    query: nexmark/q1_price
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *nexmark_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_q2_filter_proj
+    description: "Q2 (repo shape): auctionId,price WHERE %123 - int-parse/index bound on csv"
+    query: nexmark/q2_filter_proj
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *nexmark_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_q2_original
+    description: "Q2 (PAPER shape): 5-way OR point selection - what a user actually writes"
+    query: nexmark/q2_original
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *nexmark_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_q14_calc
+    description: "q14 (reduced): computed-float range filter, tunable selectivity"
+    query: nexmark/q14_calc
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *nexmark_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_q10_datetime
+    description: "q10 (reduced): CASTFROMUNIXTS ISO-8601 reformat - numeric->string output"
+    query: nexmark/q10_datetime
+    overrides: *stateless_repeat
+    axes: { x: *w16_x, series: *nexmark_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_q22_concat
+    description: "q22 (interim CONCAT): string manipulation over string-bearing bid (SPLIT_INDEX pending)"
+    query: nexmark/q22_concat
+    overrides: { generator.repeat: 4 }
+    axes: { x: *w16_x, series: *bid_strings_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_q5_window_join
+    description: "Q5: sliding-window agg + self-join (repeat=1, stateful pool)"
+    query: nexmark/q5_window_join
+    overrides: *stateful_pool
+    axes: { x: *w16_x, series: *nexmark_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_q8_join
+    description: "Q8: person JOIN auction (varsized build side; repeat=1, stateful pool)"
+    query: nexmark/q8_join
+    overrides: *stateful_pool
+    axes: { x: *w16_x, series: *nexmark_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: nx_q8_variant
+    description: "Q8 variant: bid JOIN auction, 182M output rows (repeat=1, stateful pool)"
+    query: nexmark/q8_variant
+    overrides: *stateful_pool
+    axes: { x: *w16_x, series: *nexmark_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  # ── ClusterMonitoring (source of truth: cmysb_native_vs_csv) ────────────────────────
+  - name: cm_q2_original
+    description: "CM Q2 on the 1.53GB google trace: sliding 60s/1s SUM(cpu) by jobId"
+    query: cluster_monitoring/q2_original
+    axes: { x: *w16_x, series: *large_native_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  # ── YSB fixed-width (source of truth: cmysb_native_vs_csv + cmysb_ysb1k_ext) ────────
+  - name: ysb_1k
+    description: "YSB 1k campaigns on the 24x forward-shifted 120M-row stream (steady windows)"
+    query: yahoo/ysb_1k
+    overrides: { data_size: xlarge }
+    axes: { x: *w16_x, series: *xlarge_native_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: ysb_10k
+    description: "YSB 10k campaigns, single-pass 0.5GB (state-bound; sub-second window caveat)"
+    query: yahoo/ysb_10k
+    axes: { x: *w16_x, series: *large_native_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  # ── YSB varsized (source of truth: cmysb_ysb_varsized + cmysb_ysb1k_varsized_ext) ───
+  - name: ysb_1k_varsized
+    description: "varsized YSB 1k on the 4x forward-shifted 80M-row stream (steady windows)"
+    query: yahoo/ysb_1k_varsized
+    overrides: { data_size: xlarge }
+    axes: { x: *w16_x, series: *varsized_xlarge_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: ysb_10k_varsized
+    description: "varsized YSB 10k, single-pass 3.7GB"
+    query: yahoo/ysb_10k_varsized
+    axes: { x: *w16_x, series: *varsized_large_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  # ── Linear Road + Manufacturing (source of truth: lrbmanu_native_vs_csv) ────────────
+  - name: lrb_q1
+    description: "LRB Q1: AVG(speed) 5min/1s + HAVING over nested projection, x200 tiling"
+    query: lrb/q1_avg_speed
+    overrides: { data_size: xlarge }
+    axes: { x: *w16_x, series: *xlarge_native_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: lrb_q2
+    description: "LRB Q2: COUNT per vehicle 30s/1s (1499 vehicles x posDiv), x200 tiling"
+    query: lrb/q2_vehicle_count
+    overrides: { data_size: xlarge }
+    axes: { x: *w16_x, series: *xlarge_native_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: mfg_multi_agg
+    description: "Manufacturing: keyless 5-agg 1min/1s, real 1.43GB/14.8-day stream"
+    query: manufacturing/window_multi_agg
+    axes: { x: *w16_x, series: *large_native_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  # ── Smart Grid (source of truth: smartgrid_native_vs_csv + sg1_granularity_ab) ──────
+  - name: sg1_global
+    description: "SG1 global AVG 1h/1s on the x120 tiling (trigger-path lock-bound at W16)"
+    query: smartgrid/sg1_global_avg
+    overrides: { data_size: xlarge }
+    axes: { x: *w16_x, series: *xlarge_native_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: sg2_plug
+    description: "SG2 per-plug AVG 128s/1s on the x120 tiling"
+    query: smartgrid/sg2_plug_avg
+    overrides: { data_size: xlarge }
+    axes: { x: *w16_x, series: *xlarge_native_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: sg3_outlier
+    description: "SG3 DEBS outlier NL-join 1h/1s on the x120 tiling (shape load-bearing!)"
+    query: smartgrid/sg3_outlier_join
+    overrides: { data_size: xlarge }
+    axes: { x: *w16_x, series: *xlarge_native_series }
+    y: *time_y
+    visualization: { type: grouped_bar }

@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: Apache-2.0
+# GENERATED for the 16-cell input x output matrix (session 2026-08-04b). Q_ex HOSP working example; A/B = the two hottest auctionIds (measured), 220 matched rows of 31.3M (alerts ultra-rare; hot path = the filter by construction; 0.1-1 pct unreachable with 2 id-eq on this flat id distribution).
+# Schema family bidstr; junk leaves not_null (interpreted rung has no NULL coercion).
+query:
+  name: matrix_bidstr_qex
+  description: "Q_ex HOSP working example; A/B = the two hottest auctionIds (measured), 220 matched rows of 31.3M (alerts ultra-rare; hot path = the filter by construction; 0.1-1 pct unreachable with 2 id-eq on this flat id distribution)"
+  sql: |
+    SELECT CONCAT(CONCAT(CONCAT(VARSIZED("Detected low price ("), price), VARSIZED(") [google] for auction ")), auctionId) AS alert, timestamp AS rowcount FROM bid WHERE channel == VARSIZED("google") AND (auctionId == INT32(885300) OR auctionId == INT32(213300)) AND price < FLOAT64(1000000.0)
+  flink_sql: |
+    SELECT CONCAT('Detected low price (', CAST(price AS STRING), ') [google] for auction ', CAST(auctionId AS STRING)) AS alert, `timestamp` AS rowcount FROM bid WHERE channel = 'google' AND (auctionId = 885300 OR auctionId = 213300) AND price < CAST(1000000.0 AS DOUBLE)
+  spark_sql: |
+    SELECT CONCAT('Detected low price (', CAST(price AS STRING), ') [google] for auction ', CAST(auctionId AS STRING)) AS alert, `timestamp` AS rowcount FROM bid WHERE channel = 'google' AND (auctionId = 885300 OR auctionId = 213300) AND price < CAST(1000000.0 AS DOUBLE)
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+        - { name: channel, type: VARSIZED, not_null: true }
+        - { name: url, type: VARSIZED, not_null: true }
+      data:
+        csv:
+          file: large/nexmark/bid_strings_3GB.csv
+          size_bytes: 3595281395
+          rows: 31300000
+        json:
+          file: large/nexmark/bid_strings_3GB.json
+          size_bytes: 5567181395
+          rows: 31300000
+        native:
+          file: large/nexmark/bid_strings_3GB.nes
+          size_bytes: 3443000000
+          rows: 31300000
+  sink_schema:
+    - { name: alert, type: VARSIZED, not_null: true }
+    - { name: rowcount, type: UINT64, not_null: true }

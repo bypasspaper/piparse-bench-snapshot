@@ -1,0 +1,101 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: flink_native_input_smoke
+  description: >
+    SMOKE (2026-07-14): NES-native (.nes) input for Flink via the custom nes-native format
+    (flink-ext/pbench-flink-ext.jar) - completing the 4-cell csv|native -> native|json matrix.
+    The format reads fixed-width packed-LE rows in chunks and serves them as reused flyweight
+    RowData views: field access = one little-endian load (no parsing, no casting; uint
+    zero-extends are single ANDs; uint64 reinterpreted as BIGINT); the stream is chunked into
+    buffers at row boundaries purely for framing.
+    FAIRNESS MODEL (user call 2026-07-14): native must behave LIKE TEXT - one sequential
+    stream, one reader (Flink local files = one split). That is the default arm
+    (filesystem + format=nes-native). The bid_star_split_probe variant is a separately-labeled
+    CAPABILITY PROBE (nes-native-file connector, 64 MiB byte-range splits, parallel ingestion
+    of one file - possible only because rows are fixed-width): NOT a comparison arm vs
+    single-split text.
+    CORRECTNESS (2026-07-14): COUNT + SUM(timestamp/auctionId/bidder) IDENTICAL csv vs native
+    on all 183,991,721 bid_6GB rows; 3-row probe round-trips exact values incl. NUL-padded
+    strings; split-probe json output BYTE-COUNT-IDENTICAL to sequential (14,798,172,534 B).
+    Compare arms on throughput_mrows_s - BYTES differ (csv 6442 MB vs nes 4416 MB,
+    density 0.69x). NOTE reps>=2: rep 1 may pay cold page cache on the 4.4G .nes file.
+    EXPECTED (2026-07-14, p=8 configured; fair arms are single-split so effectively 1 thread):
+    bid_star csv->native 110 MB/s (3.1 Mrows/s, parse bound), csv->json 63 (1.8),
+    native->native 1215 (50.6), native->json 49 (2.1); q1 native->native 636 (26.5),
+    native->json 48 (2.0). Split probe: native->native 6058 (252.4, 5.0x), native->json
+    331 (13.8, 6.7x). LAWS: single-thread reader = 19.8 ns/row total (raw dd read 2.1 +
+    Flink per-record emission floor ~17.7; csv parse = 313 ns/row = 15.8x); JSON encode
+    ~480-540 ns/row/thread REGARDLESS of input (csv->json looks like +220 only because csv
+    parsing runs on the fetcher thread, overlapping serialization on the task thread); q1
+    Calc +18 ns/row single-thread.
+    GOTCHA: catalog `native` entries exist only at bid_6GB scale (both bid_star and q1_price);
+    a build-dir wipe removes the .nes files (regenerate via csv_to_binary.py, see catalog).
+  primary_metric: throughput_mrows_s
+  higher_is_better: true
+  repetitions: 2
+  aggregation: median
+
+defaults:
+  system: flink
+  mode: flink
+  build: native
+  data_size: large
+  topology: single-node
+  completion_timeout_s: 900
+  flink_execution_mode: streaming
+  worker:
+    query_engine:
+      number_of_worker_threads: 8
+
+_y: &rows_y { metric: throughput_mrows_s, label: "Throughput (Mrows/s)" }
+
+variants:
+  - name: bid_star_matrix
+    description: "FAIR arms, SELECT * bid_6GB: input (csv|native) x output (none|json), both single-stream"
+    query: nexmark/bid_star
+    axes:
+      x:
+        label: "query"
+        explicit:
+          - { name: bid_star, overrides: {} }
+      series:
+        label: "arm"
+        explicit:
+          - { name: csv_to_native, baseline: true, overrides: {} }
+          - { name: csv_to_json, overrides: { flink_output_format: json_blackhole } }
+          - { name: native_to_native, overrides: { data_size: native } }
+          - { name: native_to_json, overrides: { data_size: native, flink_output_format: json_blackhole } }
+    y: *rows_y
+    visualization: { type: grouped_bar }
+
+  - name: q1_native_arms
+    description: "FAIR arms, q1 (float-math Calc) on sequential native input"
+    query: nexmark/q1_price
+    axes:
+      x:
+        label: "query"
+        explicit:
+          - { name: q1_price, overrides: {} }
+      series:
+        label: "arm"
+        explicit:
+          - { name: native_to_native, baseline: true, overrides: { data_size: native } }
+          - { name: native_to_json, overrides: { data_size: native, flink_output_format: json_blackhole } }
+    y: *rows_y
+    visualization: { type: grouped_bar }
+
+  - name: bid_star_split_probe
+    description: "CAPABILITY PROBE (not a text-comparison arm): parallel ingestion of one .nes file via 64MiB byte-range splits"
+    query: nexmark/bid_star
+    axes:
+      x:
+        label: "query"
+        explicit:
+          - { name: bid_star, overrides: {} }
+      series:
+        label: "arm"
+        explicit:
+          - { name: native_to_native_split, baseline: true, overrides: { data_size: native, flink_native_split_size: 64mb } }
+          - { name: native_to_json_split, overrides: { data_size: native, flink_output_format: json_blackhole, flink_native_split_size: 64mb } }
+    y: *rows_y
+    visualization: { type: grouped_bar }

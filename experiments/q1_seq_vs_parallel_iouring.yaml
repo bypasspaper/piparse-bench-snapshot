@@ -1,0 +1,118 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: q1_seq_vs_parallel_iouring
+  description: >
+    Sequential vs parallel EXECUTION MODEL on Nexmark-Q1 (float parse), with the READ held constant
+    (same IoUringFile O_DIRECT deep-QD source on BOTH arms) so the ONLY variable is where index+parse run.
+
+    THE TWO ARMS (both W1, both IoUringFile O_DIRECT + regbuf + QD64):
+    - sequential = SequentialCSV + threading_mode=sequential. 1 THREAD total. The source thread emits
+      SourceReturnType::Execute and read->index->parse->output-format runs INLINE on it (DefaultPEC, no
+      SequenceShredder). Zero-copy: the deep-QD prefilled 128 KiB buffers are consumed IN PLACE by the
+      formatter's spanning accumulator (commit 1fc327b08d). Data stays L1/L2-hot on the one thread.
+    - parallel = SIMDCSV (parallel formatter). 2 THREADS: the io/source thread READS raw buffers and
+      hands them to a SINGLE worker that PARSES on a DIFFERENT core (cross-core buffer handoff). W1 = the
+      minimal parallel config -> isolates pure execution-model cost at the smallest thread asymmetry
+      (1-thread sequential vs 2-thread parallel), no worker scaling.
+
+    WHY Q1 (float): SELECT ts, auctionId, bidder, price*FLOAT64(908)/FLOAT64(1000) FROM bid. price is
+    FLOAT64 -> a genuine float INPUT parse (EiselFloatF64, fastest) AND, because the sink is Monitoring
+    but the OUTPUT formatter is CSV, a float OUTPUT re-serialize (ZMIJF64) per tuple -- the "double parse".
+    CRUCIAL for the companion profile: EiselFloatF64 (in) and ZMIJF64 (out) are NOT JIT-traced, so they
+    appear as REAL SYMBOLS in the call tree (unlike the int fields, which JIT-inline into opaque blocks).
+    That is what lets us read off whether the float parse/serialize actually dominates the sequential
+    thread, or whether index / io_uring / arithmetic / sink does. (Constant is 908/1000=0.908, not the
+    canonical Nexmark 89/100=0.89 -- irrelevant to parse cost: still one float mul+div per row.)
+
+    CONFIG: fastest known stack (fnattr inlining + 131072 buffer + Eisel-in / ZMIJ-out + COMPILER +
+    native). Monitoring sink + CSV output formatter (double parse). large bid_6GB, single COLD pass
+    (~6 s per arm at q1's ~1 GB/s) -- long enough to double as the perf window for the sequential-arm
+    call-tree profile that follows this experiment.
+
+    EXPECTED (predict-before-measure): both ~1 GB/s (q1 float is heavier than the int workload where
+    seq=1110 / parallel-1io+1w=1184 MB/s). H1: parallel W1 >= sequential W1 because the read is offloaded
+    to the io thread and index+parse get a whole core (int passthrough showed parallel ~+7% over seq).
+    H2: sequential could close the gap or win because zero-copy keeps the buffer L1/L2-hot on one thread
+    (no cross-core handoff) AND the float parse/arith is CPU-heavy enough that the extra parallel core
+    mostly hides the (already deep-QD-hidden) read -- little left to overlap. Call-tree (next step)
+    adjudicates: if EiselFloatF64+ZMIJF64 dominate the sequential thread, the wall is float (de)serialize,
+    not read/index, and a second core buys little -> H2.
+
+    GOTCHAS:
+    - Sequential formatter REQUIRES a dedicated-thread blocking source. IoUringFile qualifies (its deep-QD
+      O_DIRECT reads are consumed in place by the sequential accumulator). File (async) does NOT.
+    - pbench validation merges defaults+variant overrides only, NOT per-axis-arm overrides -> the base
+      config (defaults) must itself validate: source_type=IoUringFile + input_formatter=SIMDCSV is a valid
+      PARALLEL combo; the sequential ARM overrides the formatter. Do not set SequentialCSV in defaults.
+    - default_max_inflight_buffers=128 (>= 2*QD64) or open() priming deadlocks (0 buffers, parse=0, 120s
+      timeout). global_buffer_alignment=512 required for O_DIRECT + regbuf.
+    - Run sandbox OFF (spawns worker, binds :8080). `pkill -x main` pre-flight (worker comm=main); verify
+      :8080 free -- a stale worker silently serves wrong numbers. NEVER pkill -f with a self-matching pattern.
+    - IoUringFile is O_DIRECT (bypasses page cache) -> "cold" every pass regardless; cold_read just drops
+      caches for cleanliness. Single pass (repeat 1); the deep queue keeps the window steady for perf.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large        # bid_6GB.csv, 4-field (matches q1 schema)
+  topology: single-node
+  cold_read: true
+  completion_timeout_s: 120
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    global_buffer_alignment: 512
+    number_of_buffers_in_global_buffer_manager: 2048
+    default_max_inflight_buffers: 128
+  query_config:
+    source_type: IoUringFile   # base for validation; both arms use IoUringFile (only the formatter differs)
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}   # base = valid PARALLEL combo; sequential arm overrides
+    input_parser:
+      uint64: TracedUINT64
+      int32: TracedINT32
+      int64: TracedINT64
+      f64: EiselFloatF64
+    output_formatter: {type: CSV}
+    output_parser:
+      f64: ZMIJF64
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+  worker_env:
+    NES_IOURING_DIRECT: 1
+    NES_IOURING_QD: 64
+    NES_IOURING_REGBUF: 1
+
+variants:
+  - name: q1_seq_vs_parallel_iouring
+    description: "Q1 (float) W1: IoUringFile sequential (1 thread, inline) vs IoUringFile parallel (io+1 worker)"
+    query: nexmark/q1_price
+    axes:
+      x:
+        label: "execution model"
+        explicit:
+          - name: "parallel_SIMDCSV_1io+1w"
+            baseline: true
+            overrides:
+              query_config.input_formatter.type: SIMDCSV
+          - name: "sequential_SequentialCSV_1thread"
+            overrides:
+              query_config.input_formatter.type: SequentialCSV
+              query_config.input_formatter.threading_mode: sequential
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

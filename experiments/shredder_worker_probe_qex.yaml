@@ -1,0 +1,103 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: shredder_worker_probe_qex
+  description: >
+    figW REPEAT WITH q_ex (2026-10-05): the spanning-tuple worker sweep (12 KB rows = ~3 raw buffers @4 KiB,
+    deep queue, LOCK_FREE vs LOCKING) run with the figQ query (q_ex, the HOSP working example) instead of
+    SELECT id, to tie the shredder figure (figW) to the serde-matrix figure (figQ). Data = bid_strings rows with
+    the url padded to 12,000 chars (formatter/bidstr_qex_12k, 12,040 B/row, 2.94 spans). The q_ex arm carries
+    figQ's parser block + JSON output (= the figQ optimised arm on spanning data); the SELECT id variant is
+    figW re-taken on the SAME (Sep-3, b5d757c9f6) binary in the same session — figW itself ran 2026-08-31 on a
+    binary without the VARSIZED-equality (eqImpl) fix that q_ex needs. EXPECT the two variants to overlay:
+    both read only the first ~40 B of every row, the 12 KB string is never materialised, single pipeline,
+    ~0 output -> identical buffer/span rates at the shredder -> e2e LF/LK ~1.37 @W24 (figW 4.39 vs 3.21 GB/s),
+    LF p50 ~45 us vs LK ~10 ms. Contrast figQ at 128 KiB MmapFile: LF/LK 0.99-1.08 (shredder off the critical
+    path) -> same query, two buffer regimes.
+    RUN: cd ~/work/piparse-bench && pkill -9 -x main; PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/shredder_worker_probe_qex.yaml --build-dir ~/work/nebulastream-public/cmake-build-release \
+           --worker-port 9099 --detach
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 6
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  worker:
+    query_engine:
+      number_of_worker_threads: 24
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      pin_threads: false
+      ccx_aware_task_queues: false
+      admission_queue_size: 32768
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 8192
+    dump_compilation_result: NONE
+    default_max_inflight_buffers: 8192
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false }
+    output_formatter: { type: CSV }
+    input_parser: {}
+    output_parser: {}
+  generator:
+    repeat: 8
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 8
+    NES_INMEM_BUFSIZE: 4096
+    NES_SOURCE_EMIT_BATCH: 32
+    NES_LOG_LEVEL: WARNING
+    NES_TASKQUEUE_STATS: 1
+_wk_x: &wk_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: ["1", "2", "4", "8", "12", "16", "20", "24"]
+_span_series: &span_series
+  label: "shredder"
+  explicit:
+    - name: lock_free
+      baseline: true
+      overrides:
+        query_config.input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false, sequence_shredder_mode: LOCK_FREE }
+    - name: locking
+      overrides:
+        query_config.input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false, sequence_shredder_mode: LOCKING }
+_qex_parsers: &qex_parsers
+  query_config.input_parser:
+    uint64: TracedUINT64
+    int64: TracedINT64
+    int32: FastINT32
+    int16: TracedINT16
+    uint32: TracedUINT32
+    uint16: TracedUINT16
+    f64: EiselFloatF64
+    f32: EiselFloatF32
+    bool: TracedBOOL
+  query_config.output_formatter: { type: JSON }
+  query_config.output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+variants:
+  - name: qex_12k_span3
+    description: "q_ex (figQ SQL + parsers + JSON out) on 12 KB url-padded bid rows, ~3 spans @4KiB"
+    query: formatter/bidstr_qex_12k
+    overrides: *qex_parsers
+    axes: { x: *wk_x, series: *span_series }
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: line_chart }
+  - name: selid_12k_span3
+    description: "figW re-take: SELECT id on (id, 12 KB string), ~3 spans @4KiB, same binary/session"
+    query: formatter/bigstr_id_pass_12k
+    axes: { x: *wk_x, series: *span_series }
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: line_chart }

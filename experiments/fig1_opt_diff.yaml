@@ -1,0 +1,81 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: fig1_opt_diff
+  description: >
+    Fig1 TEASER cross-check by KNOB DIFFERENCING (2026-09-25): for each teaser query, optimised arm LAZY (default:
+    passthrough + lazy parse) vs EAGER (INPUT_FORMATTER.eager_parse=true: every field materialised at scan and
+    re-serialised at output -- i.e. the serde the lazy path removes). The eager/lazy throughput ratio must agree
+    with the profile-attributed share of removable serde (parse+format) on the lazy arm: if the profile says
+    the lazy arm spends X% on remaining serde and the eager arm is r x slower, then the eager arm's serde share
+    predicted from the lazy profile is (X + (r-1)*100)/r %. Disagreement => the attribution is wrong.
+    THIRD series lazy_csvout (2026-09-25, after the q0 profile showed the passthrough copies are INLINED into the
+    opaque JIT block together with the JSON key/framing writes, libc memcpy ~0%): csv->CSV lazy = whole-row coalesced
+    memmove + tuple delimiter (pure copy, no per-field keys). json_lazy - csv_lazy ~= JSON per-field framing cost
+    (serialize); csv_lazy - index - engine ~= raw copy cost (process). Bounds the copy-vs-framing split of the JIT block.
+    Same binary/config as fig1_opt_prof_*.yaml (compiled SequentialCSV, fnattr, fast codecs, JSON, InMemory W1).
+    repeat per variant chosen for >=5 s windows on the lazy arm; YSB single pass (repeat=1, replay corrupts
+    event-time windows). generator.repeat and NES_INMEM_REPEAT MUST match.
+  primary_metric: throughput_mrows_s
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  cold_read: false
+  completion_timeout_s: 900
+  overload: false
+  worker:
+    query_engine: {number_of_worker_threads: 1, number_of_io_threads: 1, invoke_mode_configuration: fnattr, pin_threads: false, admission_queue_size: 1024}
+    default_query_execution: {operator_buffer_size: 131072, execution_mode: COMPILER}
+    number_of_buffers_in_global_buffer_manager: 16384
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: {type: SequentialCSV, threading_mode: sequential}
+    input_parser: {uint64: TracedUINT64, int64: TracedINT64, int32: FastINT32, int16: TracedINT16, uint32: TracedUINT32, uint16: TracedUINT16, bool: TracedBOOL, f64: EiselFloatF64, f32: EiselFloatF32}
+    output_formatter: {type: JSON}
+    output_parser: {f64: ZMIJF64, f32: ZMIJF32}
+  generator: {repeat: 10, mode: burst, rate: 1000000}
+  worker_env: {NES_INMEM_PREFILL: '1', NES_INMEM_REPEAT: '10', NES_INMEM_BUFSIZE: '131072'}
+_knobs: &knobs
+  label: "parse mode"
+  explicit:
+    - name: lazy
+      baseline: true
+      overrides: {}
+    - name: eager
+      overrides:
+        query_config.input_formatter: {type: SequentialCSV, threading_mode: sequential, eager_parse: true}
+    - name: lazy_csvout
+      overrides:
+        query_config.output_formatter: {type: CSV}
+_x: &x {label: config, explicit: [{name: opt, baseline: true, overrides: {}}]}
+_y: &y {metric: throughput_mrows_s, label: "records/s"}
+variants:
+  - name: q0
+    description: "q0 SELECT * (bid_1GB, repeat 10)"
+    query: nexmark/bid_star
+    axes: {x: *x, series: *knobs}
+    y: *y
+    visualization: {type: grouped_bar}
+  - name: q2mod
+    description: "q2 filter (bid_1GB, repeat 10)"
+    query: nexmark/q2_filter
+    axes: {x: *x, series: *knobs}
+    y: *y
+    visualization: {type: grouped_bar}
+  - name: ysb
+    description: "YSB windowed count (large 20M rows, SINGLE PASS)"
+    query: yahoo/ysb_1k_varsized
+    overrides:
+      data_size: large
+      generator.repeat: 1
+      worker_env.NES_INMEM_REPEAT: '1'
+    axes: {x: *x, series: *knobs}
+    y: *y
+    visualization: {type: grouped_bar}

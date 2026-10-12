@@ -1,0 +1,76 @@
+experiment:
+  name: rung2b_rebaseline
+  description: >
+    Re-baseline rung-2b (bid_6GB passthrough -> MonitoringSink) with the FIXED
+    blocking TCP generator at the established optimum (W=4, pool 4096 x 128 KiB =
+    512 MB). The original rung-2b headline (~2.3-2.5 GB/s) was GENERATOR-limited
+    (the old async generator under-fed the worker under backpressure). Sweep
+    generator.repeat {1 (strict single-pass rung-2b), 4 (steady-state)} x source
+    {TCP, File}. Fastest stack: SIMDCSV + Traced{UINT64,INT32,INT64} + EiselFloatF64
+    + fnattr + output_format=CSV (lazy passthrough). 3 reps, median. Companion
+    HANDOVER §18/§20.3; supersedes the RESULTS.md rung-2b table.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+
+  worker:
+    query_engine:
+      number_of_worker_threads: 4
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+    default_query_execution:
+      operator_buffer_size: 131072          # 128 KiB (passthrough optimum)
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 4096   # 512 MB optimum
+
+  query_config:
+    source_type: TCP
+    sink_type: Monitoring
+    input_formatter:
+      type: SIMDCSV
+    input_parser:
+      uint64: TracedUINT64
+      int32: TracedINT32
+      int64: TracedINT64
+      f64: EiselFloatF64
+    output_formatter:
+      type: CSV
+
+  generator:
+    repeat: 4
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: rung2b
+    description: "bid passthrough, source x repeat, W=4 @ 512 MB, blocking generator"
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "generator.repeat (1=single-pass, 4=steady)"
+        parameter: generator.repeat
+        values: [1, 4]
+      series:
+        label: "Source"
+        explicit:
+          - name: TCP
+            baseline: true
+            overrides:
+              query_config.source_type: TCP
+          - name: File
+            overrides:
+              query_config.source_type: File
+    y:
+      metric: throughput_mbps
+      label: "Throughput (MB/s)"
+    visualization:
+      type: bar_chart

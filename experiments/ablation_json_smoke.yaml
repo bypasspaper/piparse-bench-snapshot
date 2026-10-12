@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: ablation_json_smoke
+  description: >
+    Smoke the UNTESTED JSONUncompiled output path (r1/r2 uncompiled rungs → NATIVE + legacy JSON
+    sink) before committing the full suite. q14 medium, r1+r2 only, 1 rep. PASS = both report a
+    throughput (path works); FAILED = fix before the suite. MonitoringSink maps legacy JSON →
+    JSONFormat (MonitoringSink.cpp:89), so the sink side is fine; this checks the uncompiled INPUT
+    formatter → materialized buffer → JSON-legacy sink end to end.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 600
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: BlockingFile
+    sink_type: Monitoring
+    input_formatter: { type: SequentialUncompiledOldCSV, threading_mode: SEQUENTIAL }
+    output_formatter: { type: JSONUncompiled }
+    input_parser: {}
+    output_parser: {}
+  generator:
+    repeat: 1
+
+_arms: &arms
+  label: "rung"
+  explicit:
+    - name: r1_olduncompiled
+      baseline: true
+      overrides:
+        query_config.input_formatter: { type: SequentialUncompiledOldCSV, threading_mode: SEQUENTIAL }
+        query_config.output_formatter: { type: JSONUncompiled }
+    - name: r2_uncompiled
+      overrides:
+        query_config.input_formatter: { type: SequentialUncompiledCSV, threading_mode: SEQUENTIAL }
+        query_config.output_formatter: { type: JSONUncompiled }
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+
+variants:
+  - name: nx_q14_calc
+    description: "q14 r1/r2 JSONUncompiled smoke"
+    query: nexmark/q14_calc
+    axes: { x: *noop_x, series: *arms }
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: grouped_bar }

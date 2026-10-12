@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: floatcol_price_only
+  description: >
+    Engine analogue of the isolated Eisel/ZMIJ ceiling microbench: SELECT price FROM p over a SINGLE
+    FLOAT64 column (the exact prices.txt data), so the engine does parse-one-float + serialize-one-float
+    per row and NOTHING else -- the *908/1000 arithmetic and the 3 int-field parses of q1 are stripped.
+    Compare the resulting rows/s to the isolated chained ceiling (43.5 M/s) to see how close the engine
+    gets when reduced to just the float codec.
+
+    Config: sequential SequentialCSV, W1, warm BlockingFile + NES_FILE_REPEAT (repeat=60 -> ~4.7 GB steady
+    window; IoUringFile can't be used -- it ignores NES_FILE_REPEAT so it would single-pass 78 MB in ~0.1s).
+    Monitoring sink + CSV output + EiselFloatF64 in + ZMIJF64 out (same codec as the isolated harness).
+
+    CRITICAL CAVEAT -- ELISION: a plain passthrough SELECT price may byte-COPY the field (lazy elision)
+    rather than parse+serialize. If so this measures a byte-copy, NOT the codec, and rows/s will be far
+    ABOVE the codec ceiling (a tell). MUST profile (Eisel/ZMIJ symbols present?) before trusting. If
+    elided, a minimal forcing op (e.g. price*FLOAT64(1)) is required -- documented as a follow-up.
+
+    GOTCHAS: warm (cold_read false) so repeat replays from page cache; sequential needs a dedicated-thread
+    blocking source (BlockingFile); pkill -x main pre-flight, :8080 free. Throughput here is single-column
+    MB/s (tiny 6.5 B/row) -- read it as rows/s = MB/s / 6.5e-3, comparable to the isolated Mval/s.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: false
+  completion_timeout_s: 180
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 2048
+  query_config:
+    source_type: BlockingFile
+    sink_type: Monitoring
+    input_formatter: {type: SequentialCSV, threading_mode: sequential}
+    input_parser: {f64: EiselFloatF64}
+    output_formatter: {type: CSV}
+    output_parser: {f64: ZMIJF64}
+  generator:
+    repeat: 60
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: price_only
+    description: "SELECT price (1 FLOAT64 col), seq, warm x60 -- engine parse+serialize of one float/row"
+    query: floatcol/price_only
+    axes:
+      x:
+        label: "query"
+        explicit:
+          - name: "select_price"
+            baseline: true
+            overrides: {}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

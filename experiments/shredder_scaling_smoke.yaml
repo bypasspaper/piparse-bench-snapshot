@@ -1,0 +1,91 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: shredder_scaling_smoke
+  description: >
+    SMOKE for the e2e shredder-scaling figure. Gating question: does the LOCK_FREE-vs-LOCKING
+    (naive-locking) difference survive the full e2e path (InMemory source + admission queue +
+    Monitoring sink), and does bypass approach no-serde as threads grow? bid passthrough
+    (SELECT 4 int fields), InMemory prefill, output NATIVE for ALL arms (isolates the input
+    formatter). Small 4KiB buffers to make the SequenceShredder a visible share. 3 arms x
+    threads{1,8,24}. y = throughput; convert to rows/s in post (CSV 34.8 B/row vs native 24 B/row).
+    RUN: cd ~/work/piparse-bench && pkill -x main; PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/shredder_scaling_smoke.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1200
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 8
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: false
+      pin_threads: false
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false }
+    output_formatter: { type: NATIVE }
+    input_parser:
+      uint64: TracedUINT64
+      int64: TracedINT64
+      int32: FastINT32
+    output_parser: {}
+  generator:
+    repeat: 1
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 10
+    NES_INMEM_BUFSIZE: 4096
+
+variants:
+  - name: shredder_arms
+    description: "bypass LOCK_FREE / bypass LOCKING / no-serde, x=threads, 4KiB buffers"
+    query: nexmark/bid_pass_scaling
+    axes:
+      x:
+        label: "worker threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [1, 8, 24]
+      series:
+        label: "arm"
+        explicit:
+          - name: bypass_lockfree
+            baseline: true
+            overrides:
+              data_size: csv
+              query_config.input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false, sequence_shredder_mode: LOCK_FREE }
+          - name: bypass_locking
+            overrides:
+              data_size: csv
+              query_config.input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false, sequence_shredder_mode: LOCKING }
+          - name: no_serde
+            overrides:
+              data_size: native
+              query_config.input_formatter: { type: SystemNative, string_length: "1" }
+              query_config.input_parser: {}
+    y:
+      metric: throughput_mbps
+      label: "Throughput (MB/s)"
+    visualization:
+      type: line_chart

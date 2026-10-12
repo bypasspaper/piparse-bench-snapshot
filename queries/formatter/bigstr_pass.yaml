@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# One large VARSIZED string per row (~80 KB) -> every tuple spans ~2.4 buffers at 32 KiB.
+# Cheap index (1 field, no internal delimiters; middle buffers have NO delimiter -> the hard
+# findSpanningTupleWithoutDelimiter shredder path), so LOCK_FREE vs LOCKING isolates the
+# SequenceShredder coordination cost WITHOUT the per-buffer overhead of tiny buffers.
+query:
+  name: bigstr_pass
+  description: "Large-string passthrough: SELECT s FROM src. Stresses the shredder via spanning, not small buffers."
+  sql: "SELECT s FROM src"
+  sources:
+    - name: src
+      schema:
+        - { name: s, type: VARSIZED, not_null: true }
+      data:
+        csv:
+          file: large/formatter/bigstr_80k_500m.csv
+          size_bytes: 524246553
+          rows: 6553
+  sink_schema:
+    - { name: src.s, type: VARSIZED, not_null: true }

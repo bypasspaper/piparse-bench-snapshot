@@ -1,0 +1,74 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: bigstr_batch_bufsweep
+  description: >
+    Source-emit BATCHING across BUFFER SIZE on the VARSIZED workload (bigstr_id_pass, SELECT id, 80 KB rows
+    -> spanning). Companion to bid_batch_bufsweep (numeric). x = input buffer size {4,16,64 K}; series =
+    NES_SOURCE_EMIT_BATCH {1, 32}. Single-source InMem prefill, W24, LOCK_FREE. Confirms batching's lift
+    fades as buffers grow (emitter-bound -> worker-bound) for varsized too; compare absolute vs numeric.
+    NB: on bigstr, bigger buffers ALSO reduce spanning (80 KB row spans fewer buffers), so this axis mixes
+    buffer-count with span-count -- read alongside the numeric grid which isolates buffer-count.
+    RUN: cd ~/work/piparse-bench && pkill -x main; PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/bigstr_batch_bufsweep.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 2
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  worker:
+    query_engine:
+      number_of_worker_threads: 24
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      pin_threads: false
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 262144
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 200000
+    dump_compilation_result: NONE
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false, sequence_shredder_mode: LOCK_FREE }
+    output_formatter: { type: CSV }
+    input_parser: {}
+    output_parser: {}
+  generator:
+    repeat: 40
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 40
+    NES_LOG_LEVEL: WARNING
+    NES_TASKQUEUE_STATS: 1
+variants:
+  - name: bigstrbatch
+    query: formatter/bigstr_id_pass
+    axes:
+      x:
+        label: "input buffer size (bytes)"
+        parameter: worker_env.NES_INMEM_BUFSIZE
+        values: ["4096", "16384", "65536"]
+      series:
+        label: "source emit batch"
+        explicit:
+          - name: batch1
+            baseline: true
+            overrides:
+              worker_env.NES_SOURCE_EMIT_BATCH: "1"
+          - name: batch32
+            overrides:
+              worker_env.NES_SOURCE_EMIT_BATCH: "32"
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: line_chart }

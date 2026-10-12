@@ -1,0 +1,125 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: csv_serial_regression
+  description: >
+    CSV-SERIALIZATION regression check for the lazy-VARSIZED rope generalization
+    (commits f7f9b13b98 "lazy VARSIZED rope" + 210c68df1a "generalize the rope behind VarVal ops",
+    which are the only two commits since 29e213ba09 that touched CSVOutputFormatter.cpp +
+    TupleBufferRef.cpp). Run this experiment TWICE against the SAME build dir, swapping the worker+cli
+    binaries between a pre-rope baseline (built at 29e213ba09) and the current tip (d444109fb4). Compare
+    median throughput_mbps per variant; a tip value below baseline beyond noise = a regression.
+
+    All variants: single-node/fused, W1, SequentialCSV in -> CSV out, r6 fullopt (FastINT32/EiselF64/ZMIJ),
+    bid_strings_3GB (3.6GB / 31.3M rows), port 9099, governor performance, n=5 median.
+
+      P  bid_strings_passthrough  SELECT auctionId,bidder,price,channel,url  -> the ORDINARY varsized
+         passthrough path (the common case every csv->csv query hits). PRIMARY regression probe: on tip
+         the lazy varsized fields route through writeEachChunk->writeVarsizedSpan; on baseline through
+         the old writeVarsized. No CONCAT.
+      A  concat_alert             CONCAT(const, channel[VARSIZED])   2-span rope, string operand
+      B  concat_alert_int         CONCAT(const, auctionId[INT32])    2-span rope, int operand (forwarded)
+      C  concat_alert_nested_str  CONCAT(CONCAT(const,channel),const) flattened 3-span rope
+      D  concat_alert_nested_int  CONCAT(CONCAT(const,auctionId),const) flattened 3-span rope
+
+    NOTE: on the baseline binary, CONCAT materialises then writes (double copy), so A-D on tip should be
+    >= baseline (the rope win). The pure regression question is variant P (no rope algorithmic win, just
+    the changed write helper). GOTCHA: bid_strings_3GB lives in the build dir's testdata, so run with
+    --build-dir. Binaries are swapped OUTSIDE pbench (cp into {build}/nes-single-node-worker/ and
+    {build}/nes-frontend/apps/); pbench never rebuilds because the experiment branch == current branch.
+    RUN (per binary):
+      cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+        experiments/csv_serial_regression.yaml \
+        --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 5
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: true
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: BlockingFile
+    sink_type: Monitoring
+    input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+    output_formatter: { type: CSV }
+    input_parser: { uint64: TracedUINT64, int64: TracedINT64, int32: FastINT32, int16: TracedINT16, uint32: TracedUINT32, uint16: TracedUINT16, bool: TracedBOOL, f64: EiselFloatF64, f32: EiselFloatF32 }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s)" }
+
+_cell: &cell
+  label: "config"
+  explicit:
+    - name: r6_fullopt_w1
+      baseline: true
+      overrides:
+        query_config.source_type: BlockingFile
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: CSV }
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: fnattr
+        worker.query_engine.inline_invoke_calls: true
+        worker.query_engine.trace_constant_bytes: true
+        overload: false
+        generator.repeat: 1
+
+variants:
+  - name: P_passthrough_varsized
+    description: "P: SELECT auctionId,bidder,price,channel,url -> CSV (ordinary varsized passthrough; PRIMARY regression probe)"
+    query: nexmark/bid_strings_passthrough
+    axes: { x: *noop_x, series: *cell }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: A_2span_string
+    description: "A: CONCAT(const, channel[VARSIZED]) -> CSV (2-span rope, string)"
+    query: nexmark/concat_alert
+    axes: { x: *noop_x, series: *cell }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: B_2span_int
+    description: "B: CONCAT(const, auctionId[INT32]) -> CSV (2-span rope, forwarded int)"
+    query: nexmark/concat_alert_int
+    axes: { x: *noop_x, series: *cell }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: C_3span_string
+    description: "C: CONCAT(CONCAT(const, channel[VARSIZED]), const) -> CSV (flattened 3-span rope)"
+    query: nexmark/concat_alert_nested_string
+    axes: { x: *noop_x, series: *cell }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: D_3span_int
+    description: "D: CONCAT(CONCAT(const, auctionId[INT32]), const) -> CSV (flattened 3-span rope)"
+    query: nexmark/concat_alert_nested_int
+    axes: { x: *noop_x, series: *cell }
+    y: *tput_y
+    visualization: { type: grouped_bar }

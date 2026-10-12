@@ -1,0 +1,37 @@
+query:
+  name: nexmark_bid_passthrough
+  description: >
+    Full-projection passthrough over the Nexmark bid stream (4 integer fields).
+    This is the exact rung-2b query: SELECT timestamp, auctionId, bidder, price.
+    Schema matches bid_6GB.csv on disk (price is an INTEGER, not a float) so the
+    lazy CSV passthrough fast-path (parse elided, byte-copy) is exercised.
+
+  sql: "SELECT timestamp, auctionId, bidder, price FROM bid"
+
+  # Flink-dialect equivalent (`timestamp` is reserved → backtick). Full passthrough projection;
+  # NES elides the parse (byte-copy) on this, Flink always parses CSV — the comparison is the
+  # ingest→sink methodology, not equal per-row work.
+  flink_sql: "SELECT `timestamp`, auctionId, bidder, price FROM bid"
+
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: INT64, not_null: true }
+      data:
+        medium:
+          file: large/nexmark/bid_1GB.csv
+          size_bytes: 1089194961
+          rows: 31300000
+        large:
+          file: large/nexmark/bid_6GB.csv
+          size_bytes: 6442450944
+          rows: 183991721
+
+  sink_schema:
+    - { name: bid.timestamp, type: UINT64, not_null: true }
+    - { name: bid.auctionId, type: INT32, not_null: true }
+    - { name: bid.bidder, type: INT32, not_null: true }
+    - { name: bid.price, type: INT64, not_null: true }

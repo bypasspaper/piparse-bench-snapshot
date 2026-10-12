@@ -1,0 +1,97 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: json_input_isolation_smoke
+  description: >
+    CORRECTNESS GATE for json_input_isolation. Checksum sink (legacy CSV -> forces full field
+    materialisation), reps=1, all 3 input arms x 3 queries. GATE: the row COUNT must be identical
+    across json/csv/native for each query (all process the same 31.3M logical rows -> same q2
+    survivor count, same q1/pass count = 31.3M). Checksums are only arm-informative where floats
+    format identically; the primary gate here is COUNT equality (wiring proof). Note: q2/q1 CONSUME
+    their numeric fields (filter/arith) so they materialise+validate (no raw-forward); pass forwards
+    auctionId/bidder/price but the bid_strings data is clean, so fused raw-forward stays byte-safe.
+    This uses Checksum (NOT the NATIVE-output Monitoring of the measured run) ONLY to get a count.
+    RUN: cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+      experiments/json_input_isolation_smoke.yaml --build-dir ~/work/nebulastream-public/cmake-build-release \
+      --worker-port 9099
+  primary_metric: processing_time_s
+  higher_is_better: false
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: json
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: true
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: BlockingFile
+    sink_type: Checksum
+    input_formatter: { type: JSON }
+    output_formatter: { type: CSV }
+    input_parser: { uint64: TracedUINT64, int64: TracedINT64, int32: FastINT32, int16: TracedINT16, uint32: TracedUINT32, uint16: TracedUINT16, bool: TracedBOOL, f64: EiselFloatF64, f32: EiselFloatF32 }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+_time_y: &time_y { metric: processing_time_s, label: "Processing time (s)" }
+
+_fmt_series: &fmt_series
+  label: "input"
+  explicit:
+    - name: json
+      baseline: true
+      overrides:
+        data_size: json
+        query_config.input_formatter: { type: JSON }
+    - name: csv
+      overrides:
+        data_size: csv
+        query_config.input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    - name: native
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "13,73" }
+
+variants:
+  - name: q2
+    description: "Q2 count-equality gate"
+    query: nexmark/bidstr_iso_q2
+    axes: { x: *noop_x, series: *fmt_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: q1
+    description: "Q1 count-equality gate"
+    query: nexmark/bidstr_iso_q1
+    axes: { x: *noop_x, series: *fmt_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: pass
+    description: "passthrough count-equality gate"
+    query: nexmark/bidstr_iso_pass
+    axes: { x: *noop_x, series: *fmt_series }
+    y: *time_y
+    visualization: { type: grouped_bar }

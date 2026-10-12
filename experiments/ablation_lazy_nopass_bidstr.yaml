@@ -1,0 +1,195 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: ablation_lazy_nopass_bidstr
+  description: >
+    LAZY-WITHOUT-PASSTHROUGH RUNG (2026-10-05): r3_lazy_nopass = compiled + lazy values (parse at the use site),
+    overload OFF, passthrough OFF on both sides (output JSON disable_passthrough: numerics parsed + ZMIJ re-serialised,
+    whole-record fast path declined; input assume_clean_strings:false: VARSIZED loses JSON_ESCAPED -> escape-scan
+    path instead of verbatim forwarding), paper parser block, default invoke / no fnattr / inline / tcb, W1 InMemory.
+    Anchors re-taken in the same session: r3_eager_all (work-equal compiled parse-all, from ablation_eager_all_bidstr)
+    and r3_compiled (v7 r3 = lazy + passthrough). Factors: lazy code generation = r3_lazy_nopass / r3_eager_all
+    (parse only used fields, where used; output still re-serialises); passthrough = r3_compiled / r3_lazy_nopass.
+    Known artifact: no fnattr at this footing -> lazy re-parses auctionId 5x on q2og (r4 recovers). 90 runs.
+    RUN: cd ~/work/piparse-bench && pkill -9 -x main; PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/ablation_lazy_nopass_bidstr.yaml --build-dir ~/work/nebulastream-public/cmake-build-release \
+           --worker-port 9099 --detach
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: default
+      inline_invoke_calls: false
+      trace_constant_bytes: false
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: { type: SequentialUncompiledOldCSV, threading_mode: SEQUENTIAL }
+    output_formatter: { type: JSONUncompiled }
+    input_parser: {}
+    output_parser: {}
+  generator:
+    repeat: 1
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 1
+    NES_INMEM_BUFSIZE: 131072
+
+_fast_parsers: &fast_parsers
+  uint64: TracedUINT64
+  int64: TracedINT64
+  int32: FastINT32
+  int16: TracedINT16
+  uint32: TracedUINT32
+  uint16: TracedUINT16
+  bool: TracedBOOL
+  f64: EiselFloatF64
+  f32: EiselFloatF32
+_fast_out: &fast_out { f64: ZMIJF64, f32: ZMIJF32 }
+
+_fast_all_invoke: &fast_all_invoke
+  uint64: FastUINT64
+  int64: FastINT64
+  int32: FastINT32
+  int16: FastINT16
+  uint32: FastUINT32
+  uint16: FastUINT16
+  bool: TracedBOOL
+  f64: EiselFloatF64
+  f32: EiselFloatF32
+
+_ladder: &ladder
+  label: "rung"
+  explicit:
+    - name: r3_eager_all
+      baseline: true
+      overrides:
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false, eager_parse: true }
+        query_config.input_parser: *fast_all_invoke
+        query_config.output_formatter: { type: JSON }
+        worker_env.NES_EAGER_COPY_VARSIZED: '1'
+        query_config.source_type: InMemory
+        query_config.output_parser: *fast_out
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: default
+        worker.query_engine.inline_invoke_calls: false
+        worker.query_engine.trace_constant_bytes: false
+        overload: false
+        generator.repeat: 1
+    - name: r3_lazy_nopass
+      overrides:
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false, assume_clean_strings: false }
+        query_config.input_parser: *fast_parsers
+        query_config.output_formatter: { type: JSON, disable_passthrough: true }
+        query_config.source_type: InMemory
+        query_config.output_parser: *fast_out
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: default
+        worker.query_engine.inline_invoke_calls: false
+        worker.query_engine.trace_constant_bytes: false
+        overload: false
+        generator.repeat: 1
+    - name: r3_compiled
+      overrides:
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.input_parser: *fast_parsers
+        query_config.output_formatter: { type: JSON }
+        query_config.source_type: InMemory
+        query_config.output_parser: *fast_out
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: default
+        worker.query_engine.inline_invoke_calls: false
+        worker.query_engine.trace_constant_bytes: false
+        overload: false
+        generator.repeat: 1
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s)" }
+
+variants:
+  - name: q0
+    description: "Q0: SELECT * FROM bid (varsized passthrough)"
+    query: nexmark/matrix/bidstr_q0
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: qproject
+    description: "SELECT price FROM bid (single-col projection)"
+    query: nexmark/matrix/bidstr_qproject
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: qroute
+    description: "Q_route: content-based routing projection"
+    query: nexmark/matrix/bidstr_qroute
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: q1
+    description: "Q1: price * 908/1000 (float arith + ZMIJ out)"
+    query: nexmark/matrix/bidstr_q1
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: q2og
+    description: "Q2 (PAPER shape): 5-way OR point selection"
+    query: nexmark/matrix/bidstr_q2og
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: q2mod
+    description: "Q2 (mod shape): auctionId %123 filter"
+    query: nexmark/matrix/bidstr_q2mod
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: q10
+    description: "q10: CASTFROMUNIXTS reformat (civil_from_days, in-tree)"
+    query: nexmark/matrix/bidstr_q10
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: q14
+    description: "q14: computed-float range filter"
+    query: nexmark/matrix/bidstr_q14
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: q22
+    description: "q22: CONCAT string manipulation"
+    query: nexmark/matrix/bidstr_q22
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: qex
+    description: "Q_ex: HOSP working example (channel-eq + 2-id-OR + price<thresh -> CONCAT alert)"
+    query: nexmark/matrix/bidstr_qex
+    axes: { x: *noop_x, series: *ladder }
+    y: *tput_y
+    visualization: { type: grouped_bar }

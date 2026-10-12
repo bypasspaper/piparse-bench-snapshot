@@ -1,0 +1,33 @@
+query:
+  name: nexmark_concat_alert_nested_int
+  description: "Alert-string use case, INTEGER variant: CONCAT(constant-literal, INT32 column) -> JSON. Sibling of concat_alert (which concats a VARSIZED column). Probes whether an INT column's raw text is FORWARDED into the rope with NO parse and NO re-serialise (the generalized lazy-VARSIZED rope). Compare its throughput to concat_alert to see whether forwarding an int is as cheap as forwarding a string."
+
+  # Same shape as concat_alert but the runtime operand is auctionId (INT32) instead of the
+  # channel (VARSIZED). Same 22-char constant prefix so only the forwarded operand differs.
+  # After the rope generalization, CONCAT accepts any operand type: auctionId is read lazily
+  # from CSV as raw digits and those digits flow straight into the rope -> the JSON output,
+  # never parsed to an int32 and never re-serialised. IR-verified: 0 arena allocs, 0 int-parse,
+  # 0 int->text serialize.
+  sql: |
+    SELECT auctionId, bidder, price, CONCAT(CONCAT(VARSIZED("alert: bid on auction "), auctionId), VARSIZED(" -- END")) AS alert FROM bid
+
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+        - { name: channel, type: VARSIZED, not_null: true }
+        - { name: url, type: VARSIZED, not_null: true }
+      data:
+        large:
+          file: large/nexmark/bid_strings_3GB.csv
+          size_bytes: 3595281395
+          rows: 31300000
+
+  sink_schema:
+    - { name: bid.auctionId, type: INT32, not_null: true }
+    - { name: bid.bidder, type: INT32, not_null: true }
+    - { name: bid.price, type: FLOAT64, not_null: true }
+    - { name: alert, type: VARSIZED, not_null: true }

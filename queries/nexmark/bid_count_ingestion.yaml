@@ -1,0 +1,35 @@
+query:
+  name: nexmark_bid_count_ingestion
+  description: >
+    Global (ungrouped) COUNT over the Nexmark bid stream on an INGESTION-TIME
+    tumbling window: SELECT start, end, COUNT(auctionId) FROM bid WINDOW
+    TUMBLING(SIZE 10 SEC) — no timestamp field in the window spec means the SQL
+    parser attaches IngestionTime (AntlrSQLQueryPlanCreator.cpp:588). This is
+    the count-loop-collapse study query: with ingestion time NO field value is
+    needed per tuple (COUNT's lift executes the input function but discards the
+    value; lazyVals should elide the parse), so the per-tuple loop body is
+    ideally just count += 1 against a constant hashmap slot — collapsible to
+    count += numTuples if LLVM can see through the proxy calls. Window is 10 s
+    so a single-pass run (~2 s) closes ZERO windows before EoS; the single
+    result row is emitted by the EoS flush. Schema matches bid_6GB.csv
+    (4 integer fields, price is INT64 not float).
+
+  sql: "SELECT start, end, COUNT(auctionId) AS cnt FROM bid WINDOW TUMBLING(SIZE 10 SEC)"
+
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: INT64, not_null: true }
+      data:
+        large:
+          file: large/nexmark/bid_6GB.csv
+          size_bytes: 6442450944
+          rows: 183991721
+
+  sink_schema:
+    - { name: bid.start, type: UINT64, not_null: true }
+    - { name: bid.end, type: UINT64, not_null: true }
+    - { name: bid.cnt, type: UINT64, not_null: true }

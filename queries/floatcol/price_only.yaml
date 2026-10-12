@@ -1,0 +1,25 @@
+query:
+  name: floatcol_price_only
+  description: >
+    Single FLOAT64 column, projected straight through: SELECT price FROM p. The dataset is EXACTLY the
+    price column extracted for the isolated Eisel/ZMIJ ceiling microbench (scratchpad/prices.txt copied to
+    large/floatcol/price.csv) -- 12M integer-valued floats, ~6.5 B/row. Purpose: strip the engine query
+    down to what the isolated harness does (parse one float + serialize one float, no arithmetic, no other
+    field parses) so the e2e number is comparable to the codec ceiling.
+
+    ELISION (measured 2026-07-04): a pure passthrough `SELECT price` ELIDES -- it byte-copies the field
+    (1177 MB/s = 181 M rows/s, 4x the 43.5 M/s codec ceiling => no parse/serialize). To actually exercise
+    Eisel+ZMIJ the projection must be a non-identity expression. `price * FLOAT64(1)` is the MINIMAL
+    forcing op: one multiply (vs q1's mul+div), and x1 keeps values integer-valued so ZMIJ emits the same
+    short form as the isolated harness -- closer to the isolated parse+write than q1's *908/1000 was.
+  sql: "SELECT price * FLOAT64(1) AS price FROM p"
+  sources:
+    - name: p
+      schema:
+        - { name: price, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/floatcol/price.csv
+          size_bytes: 78000585
+  sink_schema:
+    - { name: price, type: FLOAT64, not_null: true }

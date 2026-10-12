@@ -1,0 +1,82 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: json_schemajson_output_csvref_smoke
+  description: >
+    CORRECTNESS GATE for the CSV-input reference arms of json_schemajson_output_matrix_csvref. Confirms the
+    .csv file encodes the IDENTICAL 31.3M logical rows as the .json (so the csv-vs-json Mrows/s comparison is
+    fair). Checksum sink (value-based, format-independent), reps=1, two csv arms x {passthrough, star}. GATE:
+    csv checksums MUST equal the json-side values proven earlier -- passthrough 269477267979, star
+    292200231721 (count 31300000).
+    RUN: cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+      experiments/json_schemajson_output_csvref_smoke.yaml \
+      --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: processing_time_s
+  higher_is_better: false
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: true
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: BlockingFile
+    sink_type: Checksum
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    output_formatter: { type: CSV }
+    input_parser: { uint64: TracedUINT64, int64: TracedINT64, int32: FastINT32, int16: TracedINT16, uint32: TracedUINT32, uint16: TracedUINT16, bool: TracedBOOL, f64: EiselFloatF64, f32: EiselFloatF32 }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+_time_y: &time_y { metric: processing_time_s, label: "Processing time (s)" }
+
+_fmt_series: &fmt_series
+  label: "arm"
+  explicit:
+    - name: csv_c2c
+      baseline: true
+      overrides:
+        query_config.input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: CSV }
+    - name: csv_c2j
+      overrides:
+        query_config.input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON }
+
+variants:
+  - name: passthrough
+    query: nexmark/bid_json_passthrough
+    axes: { x: *noop_x, series: *fmt_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: star
+    query: nexmark/bid_json_star
+    axes: { x: *noop_x, series: *fmt_series }
+    y: *time_y
+    visualization: { type: grouped_bar }

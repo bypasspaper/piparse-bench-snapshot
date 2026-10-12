@@ -1,0 +1,3 @@
+# InvokeConfig for the NES query engine (read by --worker.query_engine.invoke_mode_configuration).
+# The worker parses `global_mode` / `global_fn_attr`; see nes-query-engine/interface/InvokeConfiguration.cpp.
+global_mode: inline  # "default", "fnattr", or "inline"

@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: probe_ccx_cells
+  description: >
+    Cell-balance probes (user ask): q1 async file, ccx striped. Run A: 4io+20w, 4 sources =
+    1 source + 1 io + 5 owner workers per CCX (all physical, no SMT). Run B: 8io+16w,
+    8 sources = 2 sources + 2 io + 4 owners per CCX. EXPECT: A ~13.5-14.5 GB/s (plateau-bound,
+    20w capacity 16.4 exceeds the ~14 aggregate plateau), B ~12.5-13.2 (worker-bound,
+    16w x 0.82 GB/s q1 parse). Stolen ~0 both (symmetric cells).
+
+    RESULTS (2026-07-10, 1 rep): A = 15315 MB/s (NEW HIGH for the q1 file-scaling study;
+    historical tuned peak 13940 @24w/6io, unpinned baselines 12.9-14.0 -- the ~14 GB/s
+    "plateau" was not a hard DRAM wall), stolen 2.6%, ran at 93% of the 20w parse capacity.
+    B = 12623, exactly worker-capacity-bound (16w x ~0.79 GB/s), stolen 0.74%. valveTrips 0
+    both. VERDICT: matched source-to-cell layouts (1 src + 1 io + 5 owners per CCX, no SMT)
+    BEAT the unpinned scheduler by ~10%. NEXT: hold W=20 and raise N (8/12) to find where
+    cell balance breaks; raise W past 20 with enough sources to find the real DRAM wall.
+
+    PASSTHROUGH COUNTERPART (2026-07-10, same two layouts, query nexmark/bid_passthrough =
+    SELECT all 4 fields, lazy-elided, workers ~idle): A = 28461 MB/s (4 io copy threads x ~7.1),
+    B = 40382 MB/s (8 copy threads x ~5.0) -- near the historical per-CCX sharded record
+    (~43 GB/s, §21r) and proof the cell layout scales the SUPPLY side too: with parse out of
+    the way, doubling the io threads per cell nearly doubles aggregate (28.5 -> 40.4, DRAM
+    territory). Stolen: A 6.1% (20 workers mostly idle, more dance traffic), B 0.24%;
+    valveTrips 0 both. Contrast with q1 on the same layouts (15315 / 12623): q1 is
+    worker-parse-bound, passthrough is io-copy/DRAM-bound -- the cell layout serves both.
+
+    16 SOURCES on 8io+16w (2026-07-10): 28118 MB/s = -30% vs B's 40382 -- prediction "flat"
+    REFUTED, and NOT the queue (stolen ~1%, valveTrips 0, shards balanced). Mechanism =
+    per-io-thread source MULTIPLEXING: 1 src/io -> ~5.0 GB/s per io thread; 2 src/io -> ~3.5
+    (interleaving two streams breaks the sequential copy rhythm / doubles the io thread's ring
+    working set). Retroactive insight: the historical many-source plateau (~13-14 GB/s at
+    4-6 io threads serving 10-1000 sources) was ~3.5 GB/s per multiplexed io thread all along
+    -- the plateau is the MULTIPLEXED copy rate x io-thread count, not DRAM. Aggregate supply
+    maximizes at 1 source per io thread (B: 8x5.0=40).
+
+    MUX FOLLOW-UPS (2026-07-10): 16 src on 12io+12w = 29032 (NOT the predicted 45-52; ~= the
+    8io point!) and 32 src on 8io+16w = 20302. Adding io threads does NOT lift the 16-source
+    cap -> the limiter is SOURCE-COUNT-dependent, refuting pure stream-interleaving. RING
+    WORKING-SET hypothesis: rings = 8 MB/source; 8 src = 64 MB (fits the 4x32 MB L3 -> 40
+    GB/s), 16 src = 128 MB == total L3 (boundary -> ~28), 32 src = 256 MB (DRAM-resident
+    rings -> ~20; every copy pays DRAM write + read-back). Discriminator RUN (2026-07-10): 16 src, 8io+16w,
+    default_max_inflight_buffers=32 (rings 16 x 4 MB = 64 MB, back inside total L3) =
+    42685 MB/s -- CONFIRMED, and the study's new HIGH (beats the 8-src 40.4; == the
+    historical per-CCX record ~43). Per-io copy at 2 src/io = 5.3 GB/s: there is NO stream-
+    interleaving penalty once rings fit L3 -- the entire "multiplexing penalty" was ring
+    spill. Queue silent (stolen 0.1%, valveTrips 0). SUPPLY LAW: aggregate warm supply ==
+    (io copy rate ~5-7 GB/s per thread) x io_threads, PROVIDED sum(source rings) <= total L3;
+    size default_max_inflight_buffers ~ L3_total / (num_sources x buffer_size), respecting
+    the io_uring >=2xQD floor. The historical ~13-14 GB/s plateau = spilled rings + too few
+    io threads, not DRAM.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  worker:
+    query_engine:
+      number_of_worker_threads: 20
+      number_of_io_threads: 4
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV }
+    input_parser: { uint64: TracedUINT64, int32: TracedINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  worker_env:
+    NES_TASKQUEUE_STATS: 1
+  generator:
+    repeat: 6
+
+variants:
+  - name: cellA_4src_4io20w
+    query: nexmark/q1_price
+    axes:
+      x:
+        label: "Concurrent Queries (= Concurrent Sources)"
+        parameter: num_queries
+        values: [4]
+    y: { metric: throughput_mbps, label: "Aggregate System Throughput (MB/s)" }
+    visualization: { type: bar_chart }
+
+  - name: cellB_8src_8io16w
+    query: nexmark/q1_price
+    overrides:
+      worker.query_engine.number_of_io_threads: 8
+      worker.query_engine.number_of_worker_threads: 16
+    axes:
+      x:
+        label: "Concurrent Queries (= Concurrent Sources)"
+        parameter: num_queries
+        values: [8]
+    y: { metric: throughput_mbps, label: "Aggregate System Throughput (MB/s)" }
+    visualization: { type: bar_chart }

@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0
+# Fig2 REPEAT ON FLINK (2026-09-03): rows/s vs MB/s across N=1..10 FLOAT64 columns, Apache Flink
+# csv->json (Flink's own csv format -> json_blackhole = Flink's own JsonRowDataSerializationSchema
+# into a void sink), parallelism 1 (= NES W1). Datasets = the Fig2 nf{N}.csv files concatenated
+# 10x (2 GB each, same bytes/row 10.9..108.9) so a run is ~30-90 s of JVM time instead of ~5 s
+# (JIT warm-up would dominate 200 MB). Compare with NES Fig2 (fast compiled SequentialCSV, 200 MB,
+# InMemory prefill W1): ~/Notes/nebulastream/benchmark/fig1_fig2_motivation_2026-08-19.md.
+# EXPECTATION (stated before running): Flink has a large fixed per-row cost, so MB/s will RISE
+# with N (per-row overhead amortized) rather than stay flat as in NES; rows/s still falls with N.
+experiment:
+  name: fig2_flink_fieldsweep
+  description: 'Fig2-on-Flink: csv->json rows/s vs MB/s over N=1..10 FLOAT64 columns, parallelism 1, 2 GB files, 3 reps'
+  primary_metric: throughput_mrows_s
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+defaults:
+  system: flink
+  mode: flink
+  build: native
+  data_size: xlarge
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  flink_execution_mode: streaming
+  flink_output_format: json_blackhole
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+  generator:
+    repeat: 1
+variants:
+  - name: fieldsweep
+    description: 'Flink csv->json across N=1..10 fields'
+    queries: [multicol/allf_n1, multicol/allf_n2, multicol/allf_n3, multicol/allf_n4, multicol/allf_n5, multicol/allf_n6, multicol/allf_n7, multicol/allf_n8, multicol/allf_n9, multicol/allf_n10]
+    axes:
+      x: {label: source fields N, explicit: [{name: flink_p1, baseline: true, overrides: {}}]}
+    y: {metric: throughput_mrows_s, label: records/s}
+    visualization: {type: bar_chart}

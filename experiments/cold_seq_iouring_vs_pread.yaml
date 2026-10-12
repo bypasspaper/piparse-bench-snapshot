@@ -1,0 +1,93 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: cold_seq_iouring_vs_pread
+  description: >
+    THE payoff measurement (session 2026-07-03): does the ZERO-COPY sequential io_uring path beat the
+    buffered pread sequential path on COLD reads? Both are the SEQUENTIAL (inline, single-thread) execution
+    model with SequentialCSV; the ONLY difference is the read:
+      - BlockingFile_pread_seq = buffered ::read (QD1). One page-cache->buffer copy per 128 KiB; on cold
+        data the single thread STALLS on each read (read->format->read serial). Baseline (post-pread
+        commit bbfdcc2d11): passthrough 1452, int 834 MB/s (n=3).
+      - IoUringFile_seq = deep-QD O_DIRECT + regbuf, buffers consumed IN PLACE (zero copy, verified by
+        profile: no __memmove / no _copy_to_iter; index+parse in place on DataSrc). QD64 prefetch hides
+        the cold read latency behind inline formatting.
+    Correctness already proven: byte-identical Checksum vs the async File reference (183991721,335920996194).
+
+    PREDICTION: IoUringFile_seq >= BlockingFile_pread_seq on BOTH workloads, by MORE on passthrough (read
+    is ~17% of the pread DataSrc thread there) than on int (~11%). The win = deep-QD hiding the cold read
+    stall + dropping the page-cache copy. If they tie, the sequential thread was already read-latency-hidden
+    by the OS readahead (buffered pread) and the deep queue adds nothing -- then the parse/index is the wall.
+
+    W1/IO1, O_DIRECT+regbuf+QD64, inflight128, cold single bid_6GB pass, n=3 median. SequentialCSV inline
+    (renderer emits threading_mode: SEQUENTIAL). No stray workers; :8080 free.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: true
+  completion_timeout_s: 120
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    global_buffer_alignment: 512
+    number_of_buffers_in_global_buffer_manager: 2048
+    default_max_inflight_buffers: 128
+  query_config:
+    source_type: BlockingFile   # base for validation; each arm overrides (BlockingFile / IoUringFile)
+    sink_type: Monitoring
+    input_formatter: {type: SequentialCSV, threading_mode: sequential}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64}
+    output_formatter: {type: CSV}
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+  worker_env:
+    NES_IOURING_DIRECT: 1
+    NES_IOURING_QD: 64
+    NES_IOURING_REGBUF: 1
+
+variants:
+  - name: passthrough
+    description: "COLD bid_6GB passthrough (read+index), SequentialCSV -- BlockingFile pread vs IoUringFile deep-QD"
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "source"
+        explicit:
+          - name: "BlockingFile_pread_seq"
+            baseline: true
+            overrides: {query_config.source_type: BlockingFile}
+          - name: "IoUringFile_seq"
+            overrides: {query_config.source_type: IoUringFile}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}
+
+  - name: int_parse
+    description: "COLD bid_6GB int SELECT* NATIVE (parse-bound), SequentialCSV -- BlockingFile pread vs IoUringFile"
+    query: nexmark/bid_star_int
+    axes:
+      x:
+        label: "source"
+        explicit:
+          - name: "BlockingFile_pread_seq"
+            baseline: true
+            overrides: {query_config.source_type: BlockingFile, query_config.output_formatter.type: NATIVE}
+          - name: "IoUringFile_seq"
+            overrides: {query_config.source_type: IoUringFile, query_config.output_formatter.type: NATIVE}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+# serde-micro MIXED f2i: TOINT64 cast on K=4 FLOAT64 columns -> INT64 output.
+# Reuses the pure-panel floatk4 datasets; needs the TOINT64 function plugin in the binary.
+query:
+  name: serde_micro_f2ik4
+  description: "serde micro mixed: float64 in -> INT64 out (expensive float parse, cheap int serialize), K=4"
+  sql: |
+    SELECT TOINT64(c0) AS c0, TOINT64(c1) AS c1, TOINT64(c2) AS c2, TOINT64(c3) AS c3 FROM src
+  sources:
+    - name: src
+      schema:
+        - { name: c0, type: FLOAT64, not_null: true }
+        - { name: c1, type: FLOAT64, not_null: true }
+        - { name: c2, type: FLOAT64, not_null: true }
+        - { name: c3, type: FLOAT64, not_null: true }
+      data:
+        csv:
+          file: large/serde_micro/floatk4.csv
+          size_bytes: 103109490
+          rows: 2000000
+        native:
+          file: large/serde_micro/floatk4.nes
+          size_bytes: 64000000
+          rows: 2000000
+  sink_schema:
+    - { name: c0, type: INT64, not_null: true }
+    - { name: c1, type: INT64, not_null: true }
+    - { name: c2, type: INT64, not_null: true }
+    - { name: c3, type: INT64, not_null: true }

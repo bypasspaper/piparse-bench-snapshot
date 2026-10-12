@@ -1,0 +1,61 @@
+experiment:
+  name: engine_tcp_deadlock_probe
+  description: >
+    Fast reproduction of the buffer-pool stall: tiny 128 MB pool (1024 x 128 KiB)
+    so a single 6 GB passthrough overruns the pool within ~128 MB and stalls in
+    ~0.1s. Used to gdb the stuck worker and find the real buffer retainer. NOT a
+    perf measurement — expect it to hang until completion_timeout_s.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  completion_timeout_s: 120
+
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 65536
+
+  query_config:
+    source_type: TCP
+    sink_type: Monitoring
+    input_formatter:
+      type: SIMDCSV
+    input_parser:
+      uint64: TracedUINT64
+      int32: TracedINT32
+      int64: TracedINT64
+    output_formatter:
+      type: CSV
+
+  generator:
+    repeat: 4
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: deadlock_probe
+    description: "128 MB pool, 6 GB passthrough -> stalls fast"
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "Worker Threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [16]
+    y:
+      metric: throughput_mbps
+      label: "Throughput (MB/s)"
+    visualization:
+      type: bar_chart

@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: Apache-2.0
+query:
+  name: nexmark_bid_xml_q1
+  description: >
+    Nexmark Q1 (currency-conversion compute) over the packed-XML bid dataset -- the XML twin of
+    bidstr_iso_q1 (SELECT timestamp, auctionId, bidder, price*908/1000; every row out, the
+    computed FLOAT64 must be SERIALIZED by the output formatter -- no raw-forward). Same 31.3M
+    logical rows; XML footprint 5.66GB (+72 B/row tag glue). Schema covers ALL 29 leaves;
+    parsed by the HL7 indexer configured for XML -- see bid_xml_passthrough.yaml for the leaf
+    layout and the config.
+  sql: "SELECT timestamp, auctionId, bidder, price * FLOAT64(908) / FLOAT64(1000) as price FROM bid"
+  sources:
+    - name: bid
+      schema:
+        - { name: x01, type: VARSIZED }
+        - { name: x02, type: VARSIZED }
+        - { name: x03, type: VARSIZED }
+        - { name: x04, type: VARSIZED }
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: x05, type: VARSIZED }
+        - { name: x06, type: VARSIZED }
+        - { name: x07, type: VARSIZED }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: x08, type: VARSIZED }
+        - { name: x09, type: VARSIZED }
+        - { name: x10, type: VARSIZED }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: x11, type: VARSIZED }
+        - { name: x12, type: VARSIZED }
+        - { name: x13, type: VARSIZED }
+        - { name: price, type: FLOAT64, not_null: true }
+        - { name: x14, type: VARSIZED }
+        - { name: x15, type: VARSIZED }
+        - { name: x16, type: VARSIZED }
+        - { name: channel, type: VARSIZED, not_null: true }
+        - { name: x17, type: VARSIZED }
+        - { name: x18, type: VARSIZED }
+        - { name: x19, type: VARSIZED }
+        - { name: url, type: VARSIZED, not_null: true }
+        - { name: x20, type: VARSIZED }
+        - { name: x21, type: VARSIZED }
+        - { name: x22, type: VARSIZED }
+        - { name: x23, type: VARSIZED }
+      data:
+        xml:
+          file: large/nexmark/bid_strings_3GB.xml
+          size_bytes: 5661081395
+          rows: 31300000
+  sink_schema:
+    - { name: bid.timestamp, type: UINT64, not_null: true }
+    - { name: bid.auctionId, type: INT32, not_null: true }
+    - { name: bid.bidder, type: INT32, not_null: true }
+    ## the computed column ('... as price') is NOT source-qualified in the output schema
+    - { name: price, type: FLOAT64, not_null: true }

@@ -1,0 +1,82 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: cold_iouring_async_confirm
+  description: >
+    Confirm the ASYNC io_uring file source (IoUringFileAsync) actually works on the CURRENT
+    Jul-2 binary (session 2026-07-03). Motivation: the BLOCKING source (IoUringFile) deadlocks
+    on this recipe -- 0 buffers emitted, DIAG parse calls=0, 120s timeout -- at both W16/small-pool
+    AND the known-good W4/pool2048. All static checks pass (config, binary symbols, regbuf commit
+    26f3c397b9, file resolves, OS-level O_DIRECT works via dd). The blocking + async source .cpp
+    are nearly line-identical; the divergence is the runner integration (AsyncSourceRunner vs
+    BlockingSourceRunner) + open-priming (blocking spins on getBufferWithTimeout with a noStop
+    token; async co_awaits acquireBuffer). This run establishes whether async is a VALID working
+    reference before diffing the two paths to find the blocking bug.
+
+    Single arm, SAME recipe as the blocking control (cold_iouring_w4_control): O_DIRECT + REGBUF +
+    align512 + QD64, W4/IO1, pool 2048, SIMDCSV, cold bid_6GB passthrough. n=1 for a fast
+    works-or-hangs verdict (a real 3-rep throughput sweep follows only if this works).
+
+    PREDICTION: async emits output at ~5-6.8 GB/s (handover memory: async matched blocking within
+    0.2% on the ~Jun29 binary). If it ALSO hangs (0 output/120s), the bug is SHARED (open-priming
+    / pool / regbuf), not blocking-specific -- chase that. If it works, the blocking runner's
+    backpressure-wait or noStop open-priming is the suspect.
+
+    GOTCHAS:
+    - source_type: IoUringFileAsync (async plugin; honors the SAME NES_IOURING_* env as blocking).
+    - cold_read evicts bid_6GB before the rep; generator.repeat=1, single 6.44 GB pass; NO generator.
+    - O_DIRECT+REGBUF need 512-alignment (global_buffer_alignment:512); a fallback warning in
+      worker.log => throughput collapses to buffered (~2 GB/s), still emits (distinguishes from hang).
+    - Sandbox OFF (binds :8080); verify :8080 free + no stray worker/main first.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: true
+  completion_timeout_s: 120
+  worker:
+    query_engine:
+      number_of_worker_threads: 4
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    global_buffer_alignment: 512
+    number_of_buffers_in_global_buffer_manager: 2048
+  query_config:
+    source_type: IoUringFileAsync
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64}
+    output_formatter: {type: CSV}
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+  worker_env:
+    NES_IOURING_DIRECT: 1
+    NES_IOURING_QD: 64
+    NES_IOURING_REGBUF: 1
+
+variants:
+  - name: cold_iouring_async_confirm
+    description: "COLD bid_6GB passthrough, W4/IO1, IoUringFileAsync O_DIRECT+REGBUF QD64, pool 2048 -- works-or-hangs"
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "config"
+        explicit:
+          - name: "async W4 pool2048"
+            baseline: true
+            overrides: {}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

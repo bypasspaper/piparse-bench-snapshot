@@ -1,0 +1,76 @@
+query:
+  name: sg3_outlier_join
+  description: "Smart Grid SG3 (LightSaber/DEBS14 outlier): plugs whose 1h avg load exceeds the global 1h avg (windowed self-join + post-join filter)"
+
+  # SHAPE IS LOAD-BEARING (2026-07-13 bisect, probes A-E in the session log):
+  # (1) The window alignment comes from the JOIN WINDOW, not the ON: window starts are
+  #     1s-spaced, so TUMBLING(start, 1 SEC) buckets pair exactly one local row-set with
+  #     one global row - the outlier condition lives in the ON and routes to the NL join
+  #     (GreaterThan is not in DecideJoinTypesRule's hash-join list).
+  # (2) BOTH sides must keep `start` selected under its original name: the join lowering
+  #     (TimestampField::getTimestampLeftAndRight) resolves the join window's time field
+  #     on each input schema with an unguarded optional -> renaming or dropping start on
+  #     either side crashes the WORKER with bad_optional_access at registration (ENGINE
+  #     BUG, should be a frontend error).
+  # (3) Do not alias window fields inside an aggregation SELECT: `AVG(value) AS
+  #     avg_global, start AS gstart` misbinds - the frontend emits [START, END,
+  #     GSTART:FLOAT64] and avg_global vanishes (CannotInferSchema; second frontend BUG).
+  sql: |
+    SELECT start, end, plugId, householdId, houseId, avg_local, avg_global
+    FROM (SELECT plugId, householdId, houseId, AVG(value) AS avg_local, start, end
+    FROM smartGrid
+    GROUP BY (plugId, householdId, houseId)
+    WINDOW SLIDING(creationTS, SIZE 1 HOUR, ADVANCE BY 1 SEC))
+    INNER JOIN (SELECT AVG(value) AS avg_global, start
+    FROM smartGrid
+    WINDOW SLIDING(creationTS, SIZE 1 HOUR, ADVANCE BY 1 SEC))
+    ON avg_local > avg_global
+    WINDOW TUMBLING(start, SIZE 1 SEC)
+
+  flink_sql: |
+    SELECT CAST(TIMESTAMPDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', CAST(l.ws AS TIMESTAMP(3))) AS BIGINT) * 1000 AS `start`, CAST(TIMESTAMPDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', CAST(l.we AS TIMESTAMP(3))) AS BIGINT) * 1000 AS `end`, l.plugId, l.householdId, l.houseId, l.avg_local, g.avg_global
+    FROM (SELECT window_start AS ws, window_end AS we, plugId, householdId, houseId,
+    AVG(CAST(`value` AS DOUBLE)) AS avg_local
+    FROM TABLE(HOP(TABLE smartGrid, DESCRIPTOR(`__rt`), INTERVAL '1' SECOND, INTERVAL '1' HOUR))
+    GROUP BY window_start, window_end, plugId, householdId, houseId) l
+    INNER JOIN (SELECT window_start AS ws, AVG(CAST(`value` AS DOUBLE)) AS avg_global
+    FROM TABLE(HOP(TABLE smartGrid, DESCRIPTOR(`__rt`), INTERVAL '1' SECOND, INTERVAL '1' HOUR))
+    GROUP BY window_start, window_end) g
+    ON l.ws = g.ws AND l.avg_local > g.avg_global
+
+  sources:
+    - name: smartGrid
+      flink_rowtime: { column: creationTS, delay: "0.001 SECOND" }
+      schema:
+        - { name: creationTS, type: UINT64, not_null: true }
+        - { name: value, type: FLOAT32, not_null: true }
+        - { name: property, type: FLOAT32, not_null: true }
+        - { name: plugId, type: INT16, not_null: true }
+        - { name: householdId, type: INT16, not_null: true }
+        - { name: houseId, type: INT16, not_null: true }
+      data:
+        large:
+          file: large/smartgrid/smartgrid-data_974K.csv
+          size_bytes: 963766
+          rows: 33627
+        native:
+          file: large/smartgrid/smartgrid-data_974K.nes
+          size_bytes: 739794
+          rows: 33627
+        xlarge:
+          file: large/smartgrid/smartgrid_ext120_115M.csv
+          size_bytes: 115651920
+          rows: 4035240
+        xlarge_native:
+          file: large/smartgrid/smartgrid_ext120_115M.nes
+          size_bytes: 88775280
+          rows: 4035240
+
+  sink_schema:
+    - { name: smartGridsmartGrid.start, type: UINT64, not_null: true }
+    - { name: smartGridsmartGrid.end, type: UINT64, not_null: true }
+    - { name: smartGrid.plugId, type: INT16, not_null: true }
+    - { name: smartGrid.householdId, type: INT16, not_null: true }
+    - { name: smartGrid.houseId, type: INT16, not_null: true }
+    - { name: smartGrid.avg_local, type: FLOAT64, not_null: true }
+    - { name: smartGrid.avg_global, type: FLOAT64, not_null: true }

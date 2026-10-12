@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+query:
+  name: multicol_projK_k2
+  description: >
+    ACCESS-sweep on the fixed 10-FLOAT64-col dataset (nf10.csv): project+parse the first 2 of 10
+    fields (cI*FLOAT64(1) forces parse+serialize). All 10 delimiters INDEXED. COMPILED parses only
+    the 2 accessed (projection pushdown); UNCOMPILED parses all 10 regardless. csv->json.
+  sql: "SELECT c0 * FLOAT64(1) AS c0, c1 * FLOAT64(1) AS c1 FROM t"
+  sources:
+    - name: t
+      schema:
+        - { name: c0, type: FLOAT64, not_null: true }
+        - { name: c1, type: FLOAT64, not_null: true }
+        - { name: c2, type: FLOAT64, not_null: true }
+        - { name: c3, type: FLOAT64, not_null: true }
+        - { name: c4, type: FLOAT64, not_null: true }
+        - { name: c5, type: FLOAT64, not_null: true }
+        - { name: c6, type: FLOAT64, not_null: true }
+        - { name: c7, type: FLOAT64, not_null: true }
+        - { name: c8, type: FLOAT64, not_null: true }
+        - { name: c9, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/multicol/nf10.csv
+          size_bytes: 200000013
+          rows: 1836532
+  sink_schema:
+    - { name: c0, type: FLOAT64, not_null: true }
+    - { name: c1, type: FLOAT64, not_null: true }

@@ -1,0 +1,214 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: nexmark_native_vs_csv_v2
+  description: >
+    RE-BASELINE of nexmark_native_vs_csv under the controlled protocol (user call 2026-07-09).
+    SUPERSEDES the 2026-07-08 W16 table for interpretation: that run was UNPINNED (up to ~1.8x
+    io-thread placement scatter), used repeat=4 (~0.5 s windows, short-window inflation - e.g.
+    person_projection native read "9.27 GB/s" vs ~6.1 steady) and did not control the per-file
+    page-cache class (bimodal ~9 vs ~13-15 GB/s dd, re-rolls on every eviction). Its
+    csv-vs-native RATIOS were the artifact stack, not format cost.
+
+    THE THREE CHANGES vs v1 (all validated in this session's probes):
+    (1) pin_threads=true + ccx_aware_task_queues=true (the CCX-sharded admission queue,
+        commit 66a2be7424): W16 spans CCX0-2 but no longer degrades supply - q2 flat-in-W
+        (+45% vs single queue at W23), q1 overflow carried by delayed stealing (+8-16%).
+        io=cpu0, workers=cpus1-16.
+    (2) repeat=24 for the 7 stateless queries (~15-40 s steady windows; honest wall-span
+        throughput); stateful q5/q8/q8v stay repeat=1 (event-time wraps backward on replay)
+        with the many-small-buffers stateful pool (2M x 4 KiB; state is buffer-COUNT-bound).
+    (3) dd-preflight of all six data files immediately before the run, slow-class rolls
+        rewritten; per-file ceilings recorded below so supply-bound rows read as
+        %-of-own-ceiling. Ratios of raw GB/s across files carry the page-roll confound
+        (+-15% within the fast class) - normalize per file.
+
+    METRICS: two-metric/two-ratio convention (GB/s of own input bytes = per-byte engine
+    efficiency; Mrows/s = format-invariant outcome; quotient of the ratios = byte-footprint
+    ratio 1.459 bid / 0.599 person).
+
+    EXPECT (predict-first, from the pinned probes): person rows = per-byte WASH at ~78-81% of
+    own-file dd ceiling, Mr/s ratio == footprint (0.599); bid scans both arms near the supply
+    wall (~80% of bid ceiling), Mr/s gap ~= 1.459 footprint; q1 = genuine per-row codec parity
+    (38.8 vs 36.4 ns/row, ZMIJ output dominates both arms) -> per-byte ~wash; q2/filters: the
+    only rows where a REAL per-byte CSV cost (index+parse forced by the predicate) may stay
+    visible, W16 supply-compression permitting; joins ~unchanged (Amdahl, state-bound).
+    CAVEAT: at W16 supply still compresses per-row differences on the cheap bid scans; the
+    W1/W5 honest-cost numbers live in prof_q1_q2_pin_wsweep and the overload A/B.
+
+    GOTCHAS carried from v1: CRLF (q8 catalog uses auction_707MB_lf.csv), elision checksums,
+    do NOT port to mode:systest (native retention bug), stray-worker preflight (pkill -x main,
+    never -f), NES_FILE_REPEAT only for stateless.
+
+    DD CEILINGS THIS RUN (2026-07-09, taskset -c 2, warm, measured immediately pre-launch after
+    rewrites; values wobble ~+-10% between consecutive measurements - the ~14 GB total working
+    set makes the class partially dynamic): bid_6GB.csv 12.1 / bid_6GB.nes 12.3 (well-matched,
+    bid rows directly comparable) / person_840MB.csv 13.8 / person_840MB.nes 11.7 (csv-favored
+    1.18x - fold into person per-byte reads!) / auction_707MB_lf.csv 13.5 / auction_707MB.nes
+    14.3. bid pair resisted rolling above ~12 (three attempts; large files roll lower on this
+    box today).
+
+    RESULTS (2026-07-09, 60/60 ok, reps=3 median, W16 pinned + CCX-sharded queue; GB/s = own
+    input bytes; %ceil = GB/s / own file's dd ceiling above; ratios NAT/CSV):
+      query             | CSV GB/s %ceil | NAT GB/s %ceil | GB/s x | CSV Mr/s NAT Mr/s Mr/s x
+      person_projection |  10.91   79%   |  10.76   92%*  |  0.99  |   49.5     29.2   0.59
+      person_star       |  10.88   79%   |  10.29   88%*  |  0.95  |   49.4     28.0   0.57
+      bid_ts_projection |   9.06   75%   |   9.48   77%   |  1.05  |  258.7    394.8   1.53
+      bid_filter_eq     |   9.24   76%   |  10.26   83%   |  1.11  |  264.0    427.6   1.62
+      q0_bid_star       |   9.33   77%   |   6.20   50%   |  0.66  |  266.3    258.2   0.97
+      q1_price          |   6.81   56%   |   6.15   50%   |  0.90  |  194.5    256.1   1.32
+      q2_filter_proj    |   9.32   77%   |  10.10   82%   |  1.08  |  266.0    420.8   1.58
+      q5_window_join    |   0.63    -    |   0.64    -    |  1.02  |   18.0     26.7   1.48
+      q8_join           |   0.34    -    |   0.38    -    |  1.13  |    3.4      3.2   0.94
+      q8_variant        |   0.18    -    |   0.14    -    |  0.79  |    4.9      5.7   1.16
+      (* person nes ceiling measured 11.7 immediately pre-launch but 14.7 minutes earlier -
+       the %ceil for that file carries the wobble; read as "at the wall".)
+    READING (the controlled-format story, supersedes the 2026-07-08 v1 interpretation):
+    (1) PERSON ANOMALIES GONE: 0.99/0.95 per byte (v1 said 1.28 and 0.85 - both artifacts).
+        Person = pure encoding density: Mr/s ratio 0.57-0.59 == the 0.599 footprint.
+    (2) INPUT-side CSV tax at W16, honestly measured: only 1.05-1.11x on the parse-forced bid
+        rows (ts/filter/q2) - small but real; Mr/s outcomes 1.53-1.62 are ~footprint x that.
+    (3) The BIG per-byte gaps are OUTPUT-side, not input: q0_bid_star native 0.66x (csv arm
+        passthrough-ELIDES while native ZMIJ-formats 258 Mr/s x ~35B of CSV output ~= 9 GB/s of
+        serialization) and q8_variant 0.79x (182M-row output serialize). Both are the "native
+        pays the sink serialization" asymmetry the user already plans to remove with native
+        OUTPUT - these rows should flip when a native-out arm exists.
+    (4) q1 = codec parity confirmed at scale: 0.90x per byte, both arms output-serialize-bound
+        near their overflow ceilings (csv 6.81 == its W11 sharded peak - W16 holds it, no decay).
+    (5) PROTOCOL VALIDATED: csv scans now run 9.1-10.9 GB/s at W16 (v1: 5.8-8.1) at 75-79% of
+        own-file ceilings; the supply-band compression that flattened v1's ratios is largely
+        gone, and W16-with-sharding shows no worker-count degradation anywhere (person rows ==
+        their W5-pinned values).
+    (6) Joins unchanged (state/Amdahl-bound; format ~irrelevant).
+  primary_metric: processing_time_s
+  higher_is_better: false
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  completion_timeout_s: 600
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser: { uint64: TracedUINT64, int32: FastINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  generator:
+    repeat: 24
+
+_series: &format_series
+  label: "input format"
+  explicit:
+    - name: csv_optimized
+      baseline: true
+      overrides: {}
+    - name: native
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "16,32,32,16,4,256" }
+        query_config.input_parser: {}
+
+_axes_x: &w16_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [16]
+
+_y: &time_y { metric: processing_time_s, label: "Processing time (s)" }
+
+_stateful: &stateful_overrides
+  generator.repeat: 1
+  worker.default_query_execution.operator_buffer_size: 4096
+  worker.number_of_buffers_in_global_buffer_manager: 2000000
+
+variants:
+  - name: person_projection
+    description: "SELECT id FROM person — 1 fixed col of a varsized schema"
+    query: nexmark/person_projection
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  - name: person_star
+    description: "SELECT * FROM person — full varsized materialization (csv arm elided)"
+    query: nexmark/person_star
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  - name: bid_ts_projection
+    description: "SELECT timestamp FROM bid — 1-of-4 strict projection"
+    query: nexmark/bid_ts_projection
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  - name: bid_filter_eq
+    description: "SELECT * WHERE auctionId = 1000 — point filter, 758 survivors"
+    query: nexmark/bid_filter_eq
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  - name: q0_bid_star
+    description: "Q0: SELECT * FROM bid (CSV arm = passthrough-elided!)"
+    query: nexmark/bid_star
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  - name: q1_price
+    description: "Q1: price * 908/1000 — float parse + arith + ZMIJ out"
+    query: nexmark/q1_price
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  - name: q2_filter_proj
+    description: "Q2: auctionId,price WHERE %123 — int-parse/index bound on CSV"
+    query: nexmark/q2_filter_proj
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  - name: q5_window_join
+    description: "Q5: sliding-window agg + self-join (repeat=1, stateful pool)"
+    query: nexmark/q5_window_join
+    overrides: *stateful_overrides
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  - name: q8_join
+    description: "Q8: person JOIN auction (varsized build side; repeat=1, stateful pool)"
+    query: nexmark/q8_join
+    overrides: *stateful_overrides
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+
+  - name: q8_variant
+    description: "Q8 variant: bid JOIN auction, 182M output rows (repeat=1, stateful pool)"
+    query: nexmark/q8_variant
+    overrides: *stateful_overrides
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+    visualization: { type: grouped_bar }

@@ -1,0 +1,136 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: xml_matrix_bid
+  description: >
+    Phase-2 benchmark arms of the XML plan (session 2026-08-01): packed record-per-line XML bid
+    input through the HL7 indexers configured for XML (class {<,>}, 1-byte '\n' delimiter,
+    comp/sub disabled -- ZERO new indexer LOC; the SIMD path uses the 1-byte-delimiter flatten
+    mode landed 2026-07-31, commit cbf156f20c). Matrix = SIMDHL7-XML input x
+    {passthrough,q2,q1} x {CSV,JSON,HL7} out, + a scalar-HL7-XML ->CSV arm as the
+    interpreted-ish ladder reference.
+    PREDICTION (to be falsified): SIMDXML slightly BELOW SIMDHL7 rows/s (29 events/record vs
+    22, more glue bytes; post-band-FIF cost tracks event density) but comfortably ABOVE
+    SchemaJSON on q2. REFERENCE RAILS (same config, n=5 median, Mrows/s): SIMDHL7-in post-FIF
+    pass ->CSV 12.7 / q2 16.6 / q1 10.9; SchemaJSON q2 15.2; SIMDCSV q2 28.5.
+    GOTCHAS: '&' in bid URLs is NON-structural in XML mode (no subcomponent trap, unlike the
+    HL7 arms); delimiter configs are escape TEXT ('\n' single-quoted) unescaped by
+    validateAndFormat; MB/s charges XML its 5.66GB footprint (+72 B/row glue vs CSV, incl. the
+    trailing newline) -- quote Mrows/s across formats. File reproduces the cross-format
+    checksum 31300000,269477267979 through BOTH indexers (scripts/xml gates).
+    W1 fnattr fullopt, 128KiB, warm, Monitoring sink, n=5 median. 31.3M rows, xml 5.66GB.
+    RUN: cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+      experiments/xml_matrix_bid.yaml --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 5
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: xml
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: true
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: BlockingFile
+    sink_type: Monitoring
+    input_formatter:
+      type: SIMDHL7
+      message_delimiter: '\n'
+      segment_delimiter: '<'
+      field_delimiter: '>'
+      component_delimiter: ""
+      subcomponent_delimiter: ""
+    output_formatter: { type: CSV }
+    input_parser: { uint64: TracedUINT64, int64: TracedINT64, int32: FastINT32, int16: TracedINT16, uint32: TracedUINT32, uint16: TracedUINT16, bool: TracedBOOL, f64: EiselFloatF64, f32: EiselFloatF32 }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s, input bytes)" }
+
+_out_series: &out_series
+  label: "output"
+  explicit:
+    - name: to_csv
+      baseline: true
+      overrides: { query_config.output_formatter: { type: CSV } }
+    - name: to_json
+      overrides: { query_config.output_formatter: { type: JSON } }
+    - name: to_hl7
+      overrides: { query_config.output_formatter: { type: HL7, segment_name: BID } }
+
+_scalar_series: &scalar_series
+  label: "input"
+  explicit:
+    - name: scalar_hl7_config
+      baseline: true
+      overrides:
+        query_config.input_formatter:
+          type: HL7
+          message_delimiter: '\n'
+          segment_delimiter: '<'
+          field_delimiter: '>'
+          component_delimiter: ""
+          subcomponent_delimiter: ""
+
+variants:
+  - name: pass_xml_in
+    description: "passthrough, SIMDHL7-XML 1-byte-mode input -> {CSV,JSON,HL7} out"
+    query: nexmark/bid_xml_passthrough
+    axes: { x: *noop_x, series: *out_series }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: q2_xml_in
+    description: "q2 filter, SIMDHL7-XML 1-byte-mode input -> {CSV,JSON,HL7} out"
+    query: nexmark/bid_xml_q2
+    axes: { x: *noop_x, series: *out_series }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: q1_xml_in
+    description: "q1 compute, SIMDHL7-XML 1-byte-mode input -> {CSV,JSON,HL7} out"
+    query: nexmark/bid_xml_q1
+    axes: { x: *noop_x, series: *out_series }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: pass_xml_scalar
+    description: "passthrough, SCALAR HL7-XML config input -> CSV out (ladder reference rung)"
+    query: nexmark/bid_xml_passthrough
+    axes: { x: *noop_x, series: *scalar_series }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: q2_xml_scalar
+    description: "q2 filter, SCALAR HL7-XML config input -> CSV out (ladder reference rung)"
+    query: nexmark/bid_xml_q2
+    axes: { x: *noop_x, series: *scalar_series }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: q1_xml_scalar
+    description: "q1 compute, SCALAR HL7-XML config input -> CSV out (ladder reference rung)"
+    query: nexmark/bid_xml_q1
+    axes: { x: *noop_x, series: *scalar_series }
+    y: *tput_y
+    visualization: { type: grouped_bar }

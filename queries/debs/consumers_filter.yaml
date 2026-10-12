@@ -1,0 +1,28 @@
+query:
+  name: debs_consumers_filter
+  description: "DEBS consumers: WHERE consumedPower >= 400"
+
+  sql: "SELECT * FROM consumers WHERE consumedPower >= FLOAT64(400)"
+
+  sources:
+    - name: consumers
+      schema:
+        - { name: consumerId, type: INT32, not_null: true }
+        - { name: sectorId, type: INT32, not_null: true }
+        - { name: consumedPower, type: FLOAT64, not_null: true }
+        - { name: consumerType, type: VARSIZED, not_null: true }
+        - { name: timestamp, type: UINT64, not_null: true }
+      data:
+        large:
+          file: large/debs/CONSUMERS_TOPIC_1G.csv
+          size_bytes: 1073741824
+
+  sink_schema:
+    - { name: consumers.consumerId, type: INT32, not_null: true }
+    - { name: consumers.sectorId, type: INT32, not_null: true }
+    - { name: consumers.consumedPower, type: FLOAT64, not_null: true }
+    - { name: consumers.consumerType, type: VARSIZED, not_null: true }
+    - { name: consumers.timestamp, type: UINT64, not_null: true }
+
+  validation:
+    large: { tuples: 14236360, checksum: 36138915427 }

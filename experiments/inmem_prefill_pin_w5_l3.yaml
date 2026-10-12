@@ -1,0 +1,79 @@
+experiment:
+  name: inmem_prefill_pin_w5_l3
+  description: >
+    THE L3 TEST, done on the InMemory PREFILL source (the whole point — this is the
+    prefill rung WITH pinning + an L3-fit pool, not a File substitute). Single operating
+    point, no sweep: prefill source+formatter passthrough (SELECT key FROM mem5 -> Void),
+    IO=1, W=5, pool 256 x 128 KiB = 32 MB = CCX L3, pin_threads off vs on.
+
+    PREFILL recap: TYPE InMemory + NES_INMEM_PREFILL=1 reads the 5 GB CSV into private
+    source-owned buffers in the ctor (outside the window) and hands them straight to
+    emit() — no producer memcpy, no pool-acquire on the INPUT side. NES_INMEM_REPEAT=80
+    loops them for a steady (>1s) window. So vs (a) inmem_prefill_baseline this adds
+    exactly two knobs: pin_threads and the small (L3-fit) pool.
+
+    WHAT THE POOL DOES HERE (subtle): prefill bypasses the global pool for INPUT, but the
+    projection's OUTPUT buffers still come from it. So pool=256 (=L3) + pin makes the
+    OUTPUT produce->Void->recycle FIFO cycle L3-resident on CCX0. The INPUT is a 5 GB
+    working set re-read every pass (>> L3) so it stays DRAM-resident regardless — which
+    is the open question this point answers: does pinning W=5 to ONE CCX (6 cores, one
+    CCX's memory controllers) HELP (L3-local output handoff) or HURT (caps input DRAM
+    bandwidth to one CCX), for a DRAM-bound prefill source?
+
+    bench-runner mode (InMemory needs it — systest -b yields a null result for InMemory;
+    bench-runner honors pin_threads via createEmbeddedBackend -> ThreadPool pins worker
+    threads from --worker.query_engine.pin_threads). Throughput is REPEAT-corrected
+    (x80) by the runner. NOTE: pin pins the 5 WORKER threads; the InMemory blocking
+    producer thread is not pinned (separate from the async io path).
+
+    PREDICTION (uncertain — that's why we run it): the (a) baseline steady-state W is
+    ~16 GB/s @W=5 unpinned (interpolated 1w 3.6 -> 8w 25.3). pin ON confines to CCX0 ->
+    if input-DRAM-bound, pin ON <= pin OFF (one CCX's BW < 4 CCX); if the win is output
+    L3-locality + worker cache, pin ON > OFF. Contrast with the FILE passthrough L3 test
+    (pin +76%) where input ALSO flows through the pinned io thread + small pool.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 2
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: bench-runner
+  build: native
+  data_size: large
+  topology: single-node
+
+  env:
+    NES_INMEM_PREFILL: "1"
+    NES_INMEM_REPEAT: "80"
+    NES_INMEM_BUFSIZE: "131072"
+
+  worker:
+    query_engine:
+      number_of_worker_threads: 5
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+    default_query_execution:
+      operator_buffer_size: 131072            # 128 KiB
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 256   # 256 x 128 KiB = 32 MB = CCX L3
+
+  query_config:
+    source_type: InMemory
+    sink_type: Void
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64}
+
+variants:
+  - name: pin_w5_l3
+    description: "InMemory prefill passthrough, IO=1 W=5, pool 256 (=CCX L3), pin off vs on"
+    query: formatter/inmem_prefill
+    axes:
+      x:
+        label: "pin_threads"
+        explicit:
+          - {name: "off", overrides: {worker.query_engine.pin_threads: false}}
+          - {name: "on",  overrides: {worker.query_engine.pin_threads: true}}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s, REPEAT-corrected)"}
+    visualization: {type: bar_chart}

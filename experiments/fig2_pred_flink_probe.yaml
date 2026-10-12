@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: fig2_pred_flink_probe
+  description: >
+    PROBE (1 rep, N=1,4,10, 2026-09-27) Fig2 PREDICATE sweep on Apache Flink: SELECT * WHERE c0 < 8000 over mixed INT32+FLOAT64 rows (pred_nN). Original text: (2026-09-26): SELECT c0 FROM t over N=1..10 FLOAT64 columns
+    (multicol/proj1_nN, flink_sql identical), Flink's own csv format -> json_blackhole sink (JsonRowDataSerializationSchema
+    into the void sink), parallelism 1, streaming, xlarge = nf{N}_x10.csv (2 GB, JVM-length runs) exactly as
+    fig2_flink_fieldsweep (2026-09-03). 3 reps (as that run). Companion of fig2_proj1_nes.yaml. Flink's csv format
+    tokenises every column of the line; whether its projection pushdown skips converting the unused columns is what
+    the slope tells us.
+  primary_metric: throughput_mrows_s
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+defaults:
+  system: flink
+  mode: flink
+  build: native
+  data_size: xlarge
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  flink_execution_mode: streaming
+  flink_output_format: json_blackhole
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+  generator:
+    repeat: 1
+variants:
+  - name: pred_flink
+    description: "Flink csv->json, SELECT c0 over N=1..10 columns"
+    queries: [multicol/pred_n1, multicol/pred_n4, multicol/pred_n10]
+    axes:
+      x: {label: "source fields N", explicit: [{name: sweep, baseline: true, overrides: {}}]}
+    y: {metric: throughput_mrows_s, label: "records/s"}
+    visualization: {type: bar_chart}

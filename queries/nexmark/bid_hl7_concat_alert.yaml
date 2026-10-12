@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: Apache-2.0
+query:
+  name: nexmark_bid_hl7_concat_alert
+  description: >
+    q22 / concat_alert shape (unconditional CONCAT alert, the string-output regime
+    representative of the FROZEN paper workload) over the HL7 representation of bid_strings --
+    the HL7 twin of concat_alert for the input x output matrix's hl7 cells. Same 22-leaf
+    schema as bid_hl7_project_price (subcomponent '&' disabled, all leaves not_null -- the
+    interpreted r-base rung has no NULL coercion). On compiled rungs the CONCAT rope forwards
+    the lazy channel span; on the uncompiled rung the operands are MATERIALISED (exercises the
+    serialize-into-concat fallback landed 2026-08-04).
+
+  sql: |
+    SELECT auctionId, bidder, price, CONCAT(VARSIZED("alert: bid on channel "), channel) AS alert FROM bid
+
+  sources:
+    - name: bid
+      schema:
+        - { name: h01, type: VARSIZED, not_null: true }
+        - { name: h02, type: VARSIZED, not_null: true }
+        - { name: h03, type: VARSIZED, not_null: true }
+        - { name: h04, type: VARSIZED, not_null: true }
+        - { name: h05, type: VARSIZED, not_null: true }
+        - { name: h06, type: VARSIZED, not_null: true }
+        - { name: h07, type: VARSIZED, not_null: true }
+        - { name: h08, type: VARSIZED, not_null: true }
+        - { name: h09, type: VARSIZED, not_null: true }
+        - { name: h10, type: VARSIZED, not_null: true }
+        - { name: h11, type: VARSIZED, not_null: true }
+        - { name: h12, type: VARSIZED, not_null: true }
+        - { name: h13, type: VARSIZED, not_null: true }
+        - { name: h14, type: VARSIZED, not_null: true }
+        - { name: seg, type: VARSIZED, not_null: true }
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+        - { name: channel, type: VARSIZED, not_null: true }
+        - { name: url, type: VARSIZED, not_null: true }
+        - { name: pad, type: VARSIZED, not_null: true }
+      data:
+        hl7:
+          file: large/nexmark/bid_strings_3GB.hl7
+          size_bytes: 5723681395
+          rows: 31300000
+
+  sink_schema:
+    - { name: bid.auctionId, type: INT32, not_null: true }
+    - { name: bid.bidder, type: INT32, not_null: true }
+    - { name: bid.price, type: FLOAT64, not_null: true }
+    - { name: alert, type: VARSIZED, not_null: true }

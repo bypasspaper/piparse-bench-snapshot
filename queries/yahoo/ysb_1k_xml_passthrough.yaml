@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: Apache-2.0
+query:
+  name: ysb_1k_xml_passthrough
+  description: >
+    ysb passthrough (the 4-of-11 projection arms of the ysb suite) over packed record-per-line
+    XML input, parsed by the HL7 indexer configured for XML (class {<,>}, 1-byte '\n' delimiter,
+    comp/sub disabled -- see nexmark/bid_xml_passthrough.yaml for the model). Generated 1:1 from
+    ysb_1k_data_474M.csv via scripts/xml/convert_csv_to_xml.py (tags uid/pid/cid/adt/evt/cms/
+    ip/d1/d2/d3/d4, root rec). Same 5M logical rows; XML footprint 1.05GB = +123 B/row tag glue
+    (the ysb rows are short all-numeric -> glue dominates: 2.2x the CSV bytes; quote Mrows/s).
+    SCHEMA = ALL 49 leaves (arity 4F+5, F=11), values at slots 4f+4 (4,8,...,44); event density
+    49/record is the HIGHEST of the three datasets (bid 29, person 37) -- the band-FIF cost
+    tracks event density, so ysb is where XML should trail HL7 (arity 28) the most.
+  sql: |
+    SELECT user_id, campaign_id, event_type, current_ms FROM ysb
+  sources:
+    - name: ysb
+      schema:
+        - { name: x01, type: VARSIZED }
+        - { name: x02, type: VARSIZED }
+        - { name: x03, type: VARSIZED }
+        - { name: x04, type: VARSIZED }
+        - { name: user_id, type: UINT64, not_null: true }
+        - { name: x05, type: VARSIZED }
+        - { name: x06, type: VARSIZED }
+        - { name: x07, type: VARSIZED }
+        - { name: page_id, type: UINT64, not_null: true }
+        - { name: x08, type: VARSIZED }
+        - { name: x09, type: VARSIZED }
+        - { name: x10, type: VARSIZED }
+        - { name: campaign_id, type: UINT64, not_null: true }
+        - { name: x11, type: VARSIZED }
+        - { name: x12, type: VARSIZED }
+        - { name: x13, type: VARSIZED }
+        - { name: ad_type, type: UINT64, not_null: true }
+        - { name: x14, type: VARSIZED }
+        - { name: x15, type: VARSIZED }
+        - { name: x16, type: VARSIZED }
+        - { name: event_type, type: UINT64, not_null: true }
+        - { name: x17, type: VARSIZED }
+        - { name: x18, type: VARSIZED }
+        - { name: x19, type: VARSIZED }
+        - { name: current_ms, type: UINT64, not_null: true }
+        - { name: x20, type: VARSIZED }
+        - { name: x21, type: VARSIZED }
+        - { name: x22, type: VARSIZED }
+        - { name: ip, type: UINT64, not_null: true }
+        - { name: x23, type: VARSIZED }
+        - { name: x24, type: VARSIZED }
+        - { name: x25, type: VARSIZED }
+        - { name: d1, type: UINT64, not_null: true }
+        - { name: x26, type: VARSIZED }
+        - { name: x27, type: VARSIZED }
+        - { name: x28, type: VARSIZED }
+        - { name: d2, type: UINT64, not_null: true }
+        - { name: x29, type: VARSIZED }
+        - { name: x30, type: VARSIZED }
+        - { name: x31, type: VARSIZED }
+        - { name: d3, type: UINT32, not_null: true }
+        - { name: x32, type: VARSIZED }
+        - { name: x33, type: VARSIZED }
+        - { name: x34, type: VARSIZED }
+        - { name: d4, type: UINT16, not_null: true }
+        - { name: x35, type: VARSIZED }
+        - { name: x36, type: VARSIZED }
+        - { name: x37, type: VARSIZED }
+        - { name: x38, type: VARSIZED }
+      data:
+        xml:
+          file: large/ysb/ysb_1k_data_474M.xml
+          size_bytes: 1052214231
+          rows: 5000000
+  sink_schema:
+    - { name: ysb.user_id, type: UINT64, not_null: true }
+    - { name: ysb.campaign_id, type: UINT64, not_null: true }
+    - { name: ysb.event_type, type: UINT64, not_null: true }
+    - { name: ysb.current_ms, type: UINT64, not_null: true }

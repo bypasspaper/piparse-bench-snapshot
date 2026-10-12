@@ -1,0 +1,87 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: prof_ccx_pool_size_sweep
+  description: >
+    POOL-SIZE SWEEP for the per-CCX shared source pools (worker.ccx_source_pool_buffers over
+    powers of two; N=32 sources, 8io+16w striped cells, passthrough). Maps the latency-vs-
+    throughput dial the shared pool creates: p50 ~= pool_bytes x numCcx / throughput (Little's
+    law) while the ring fits L3; throughput collapses on both dome edges. NOTE bid_passthrough
+    resolves to the LARGE 6GB file (no medium entry) - every window moves 32 x 6GB x 6 = 1.15 TB.
+
+    RESULTS (2026-07-10, 7/7 ok for values 16-1024; values 1/2/4 per cell DEADLOCKED in the
+    aborted first attempt - see finding 4):
+      pool/cell   MB/s    p50us   p99us   p999us
+          16     20094      212     375      504    <- 2/source: alive but io-starved
+          32     42592      283     495     1037    <- THE SWEET SPOT (4/source)
+          64     42431      647    1116     3387
+         128     42731     1356    2365     7858    <- current default: same throughput, 5-8x
+         256     27982      203    3046    17197       worse latency than 32
+         512     20510      272    1666    32779    <- 256/cell x 128KiB x 4 = 128MB = total L3
+        1024     20779      268    2076    31960       boundary; 512+ = DRAM-ring floor ~20.5
+    FINDINGS:
+    (1) 32/cell DOMINATES: full plateau throughput AND p50 283us / p99 495us / p999 ~1ms -
+        5-8x better latency than the 128 default at equal throughput.
+    (2) Little's law verified across the plateau (32: pred 376us vs 283; 64: 753 vs 647;
+        128: 1507 vs 1356) - pool size IS the latency dial while rings fit L3.
+    (3) Dome edges: below ~4 buffers/source the io side starves (16/cell = 20 GB/s); at
+        256/cell the working set hits total L3 and the private-pool signature returns (low p50
+        from underutilized rings + exploded tails, p999 17-33ms).
+    (4) DEADLOCK FLOOR: pools < ~2 buffers/source wedge the PARALLEL formatter outright - a
+        source's emitted buffer is held for spanning-tuple resolution while its successor can
+        never be allocated (MonitoringSink silent until the 30-min timeout). 1/2/4 per cell
+        (8 src/cell) all stalled; 16/cell (2/source) ran. Upstream TODO: enforce a minimum
+        (>= 2-3 x expected sources-per-cell) or document loudly.
+    CONFIG GUIDANCE: ccx_source_pool_buffers ~= max(4 x sources_per_cell, 32), <= 192 (24MB);
+    default 128 = the SAFE choice (liveness to ~40 src/cell, plateau throughput, p50 1.4ms);
+    latency-sensitive deployments with known low fan-in: 32.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 600
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 8
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV }
+    input_parser: { uint64: TracedUINT64, int32: TracedINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  worker_env:
+    NES_TASKQUEUE_STATS: 1
+  generator:
+    repeat: 6
+
+variants:
+  - name: pool_size_sweep_n32
+    query: nexmark/bid_passthrough
+    overrides:
+      num_queries: 32
+      worker.ccx_shared_source_pools: true
+    axes:
+      x:
+        label: "ccx_source_pool_buffers (per cell)"
+        parameter: worker.ccx_source_pool_buffers
+        values: [16, 32, 64, 128, 256, 512, 1024]
+    y: { metric: throughput_mbps, label: "Aggregate System Throughput (MB/s)" }
+    visualization: { type: line_chart, x_scale: log }

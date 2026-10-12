@@ -1,0 +1,70 @@
+experiment:
+  name: iouring_regbuf_default_pool
+  description: >
+    Re-baseline the registered-fixed-buffers result at the DEFAULT pool size (number_of_buffers_in_global_
+    buffer_manager = 32768, the code default) instead of the tuned 4096 used in §36/§39, to confirm the regbuf
+    gain is not overfit to the small/L3-friendly pool. Buffer size KEPT at 128 KiB (131072); pinning OFF (it
+    always was for the io_uring source). At 128 KiB x 32768 the pool is ~4 GB, and regbuf registers that whole
+    slab (memlock ~8 GB here; modern kernels don't count io_uring regbufs vs RLIMIT_MEMLOCK -- if registration
+    fails the source logs a warning and falls back to plain reads, so CHECK the worker log that regbuf engaged).
+
+    Same 3-point A/B as iouring_regbuf_ab: baseline (non-fixed) / align512 (512-aligned pool, non-fixed,
+    isolates alignment) / regbuf (512-aligned + prep_read_fixed). Single-pass cold O_DIRECT QD64, W4/IO1, n=3
+    median. regbuf needs global_buffer_alignment: 512 (else falls back). Compare absolute + ratio vs the
+    pool-4096 numbers (baseline 5.77 / align512 5.92 / regbuf 6.76 GB/s; device cap 7.03).
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: true
+  completion_timeout_s: 120
+  worker:
+    query_engine:
+      number_of_worker_threads: 4
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+  query_config:
+    source_type: IoUringFile
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64}
+    output_formatter: {type: CSV}
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+  worker_env:
+    NES_IOURING_DIRECT: 1
+    NES_IOURING_QD: 64
+    NES_IOURING_REGBUF: 0
+
+variants:
+  - name: iouring_regbuf_default_pool
+    description: "single-pass cold O_DIRECT QD64, 128 KiB buffers, pool 32768 (default), no pinning: baseline vs 512-align vs regbuf"
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "mode"
+        explicit:
+          - name: "baseline"
+            baseline: true
+            overrides: {}
+          - name: "align512"
+            overrides: {"worker.global_buffer_alignment": 512}
+          - name: "regbuf"
+            overrides: {"worker.global_buffer_alignment": 512, "worker_env.NES_IOURING_REGBUF": 1}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

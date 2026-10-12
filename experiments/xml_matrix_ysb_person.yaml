@@ -1,0 +1,105 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: xml_matrix_ysb_person
+  description: >
+    Phase-2 XML arms off-bid (session 2026-08-01): ysb + person packed-XML passthrough through
+    SIMDHL7 in 1-byte-delimiter XML mode (class {<,>}, '\n'; see xml_matrix_bid for the bid
+    matrix + prediction). These two rows place XML on the event-density axis: ysb arity 49 =
+    the densest of the three datasets (bid 29, person 37) vs HL7's 28/22/25 -- the band-FIF
+    cost tracks event density, so ysb is where XML should trail its HL7 twin the most, person
+    (long varsized amortizes) the least.
+    REFERENCE RAILS (2026-07-31 band-FIF, same config, n=5 median, Mrows/s ->CSV):
+      ysb hl7_in 13.3 (=136% of SchemaJSON 9.8) | person hl7_in 8.6 (SchemaJSON 7.4).
+    GOTCHA: ysb XML glue is +123 B/row on ~94 B CSV rows -> 1.05GB file = 2.2x the CSV bytes;
+    MB/s across formats is meaningless here, quote Mrows/s. Both files reproduce their CSV-arm
+    checksums through both indexers (scripts/xml/{ysb,person}_{xml,csv}_checksum_gate.yaml).
+    W1 fnattr fullopt, 128KiB, warm, Monitoring sink, n=5 median.
+    RUN: cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+      experiments/xml_matrix_ysb_person.yaml --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 5
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: xml
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: true
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: BlockingFile
+    sink_type: Monitoring
+    input_formatter:
+      type: SIMDHL7
+      message_delimiter: '\n'
+      segment_delimiter: '<'
+      field_delimiter: '>'
+      component_delimiter: ""
+      subcomponent_delimiter: ""
+    output_formatter: { type: CSV }
+    input_parser: { uint64: TracedUINT64, int64: TracedINT64, int32: FastINT32, int16: TracedINT16, uint32: TracedUINT32, uint16: TracedUINT16, bool: TracedBOOL, f64: EiselFloatF64, f32: EiselFloatF32 }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s, input bytes)" }
+
+_out_series_ysb: &out_series_ysb
+  label: "output"
+  explicit:
+    - name: to_csv
+      baseline: true
+      overrides: { query_config.output_formatter: { type: CSV } }
+    - name: to_json
+      overrides: { query_config.output_formatter: { type: JSON } }
+    - name: to_hl7
+      overrides: { query_config.output_formatter: { type: HL7, segment_name: YSB } }
+
+_out_series_pid: &out_series_pid
+  label: "output"
+  explicit:
+    - name: to_csv
+      baseline: true
+      overrides: { query_config.output_formatter: { type: CSV } }
+    - name: to_json
+      overrides: { query_config.output_formatter: { type: JSON } }
+    - name: to_hl7
+      overrides: { query_config.output_formatter: { type: HL7, segment_name: PID } }
+
+variants:
+  - name: ysb_xml_in
+    description: "ysb passthrough, SIMDHL7-XML 1-byte-mode input (arity 49) -> {CSV,JSON,HL7} out"
+    query: yahoo/ysb_1k_xml_passthrough
+    axes: { x: *noop_x, series: *out_series_ysb }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: person_xml_in
+    description: "person passthrough, SIMDHL7-XML 1-byte-mode input (arity 37) -> {CSV,JSON,HL7} out"
+    query: nexmark/person_xml_passthrough
+    axes: { x: *noop_x, series: *out_series_pid }
+    y: *tput_y
+    visualization: { type: grouped_bar }

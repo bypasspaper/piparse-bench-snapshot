@@ -1,0 +1,36 @@
+experiment:
+  name: fullstack_uncompiled_seq
+  # Fully-UNCOMPILED SEQUENTIAL in/out, fast stack. SequentialUncompiledCSV pinned to the source thread
+  # (BlockingFile + THREADING_MODE=SEQUENTIAL: formatter runs single-threaded on the source thread, worker
+  # threads only parallelize the downstream follow-up + the interpreted legacy(ZMIJ) output). HARDCODED
+  # fast_float in + legacy CSVFormat(ZMIJ) out, no parser overrides. Compare vs fullstack_uncompiled
+  # (parallel) and fullstack_compiled. Branch pinned.
+  description: "Fully-uncompiled SEQUENTIAL (pinned) in + legacy ZMIJ out, parse-all, hardcoded fast codecs"
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: systest
+  build: native
+  data_size: large
+  worker:
+    query_engine: { number_of_io_threads: 1, pin_threads: false, invoke_mode_configuration: fnattr, admission_queue_size: 1024 }
+    default_query_execution: { operator_buffer_size: 131072, execution_mode: COMPILER }
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  topology: single-node
+  query_config:
+    source_type: BlockingFile
+    sink_type: Checksum
+    input_formatter: { type: SequentialUncompiledCSV, threading_mode: SEQUENTIAL }
+    output_formatter: { type: CSVUncompiled }
+variants:
+  - name: parseall
+    query: nexmark/bid_star_parseall
+    axes:
+      x: { label: "Worker Threads", parameter: worker.query_engine.number_of_worker_threads, values: [1, 4, 16] }
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: line_chart }

@@ -1,0 +1,64 @@
+experiment:
+  name: pin_ab_file_async_q1
+  description: >
+    Pinning A/B on the FILE async q1 scaling config (queued 2026-07-07 while the TCP
+    blocking-1000 run streamed). Question: this session's file/TCP experiments all ran
+    pin_threads: false (inherited from source_thread_scaling), but the old thread-model
+    PoC#3 found a PINNED worker + unified io pool gave the BEST/FLATTEST tail (~1 ms p99
+    at 50-100 file sources). Are this session's async tail numbers (q1 file, 24w/6io
+    tuned: p99 12.3 ms @N=100) pessimistic for lack of pinning?
+
+    ARMS: pin_threads false (reproduces the tuned baseline) vs true. N=100, tuned
+    24w/6io, warm bid_1GB x6, Monitoring, ONE rep each.
+
+    PREDICTION: throughput a WASH (worker/DRAM-bound, +-3%); the story would be in the
+    TAIL: if PoC#3 transfers, pinned p99 drops well below the ~12-13 ms unpinned tail
+    (PoC#3 saw ~1 ms class). p50 should stay ~1 ms either way. If pinned p99 does NOT
+    improve, the q1 tail is output-volume queueing (the 4-col output finding), not
+    scheduler placement, and the unpinned curves stand as-is.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 600
+  num_queries: 100
+  worker:
+    query_engine:
+      number_of_worker_threads: 24
+      number_of_io_threads: 6
+      invoke_mode_configuration: fnattr
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV }
+    input_parser: { uint64: TracedUINT64, int32: TracedINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  generator:
+    repeat: 6
+
+variants:
+  - name: pin_ab
+    description: "q1 file async, N=100, 24w/6io: pin_threads false vs true"
+    query: nexmark/q1_price
+    axes:
+      x:
+        label: "pin_threads"
+        parameter: worker.query_engine.pin_threads
+        values: [false, true]
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: bar_chart }

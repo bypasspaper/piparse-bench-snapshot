@@ -1,0 +1,116 @@
+experiment:
+  name: format_scalability
+  # ============================================================================================
+  # FASTEST-CONFIG GROUND TRUTH (2026-07-06). The old defaults here (invoke_mode=default,
+  # operator_buffer_size=4096, no parser overrides) were STALE/SLOW and a trap: on the release
+  # build they make the compiled JIT crash when it has to parse INT fields
+  #   JIT session error: Symbols not found: [ __emutls_v.0x... ]
+  # because DefaultUINT64 uses a thread_local (emulated-TLS) the release JIT can't resolve. The
+  # fast stack below avoids it. ALWAYS use the full fast stack (see memory benchmark-use-fastest-*):
+  #   - invoke_mode_configuration: fnattr        (proxy inlining; NOT "default")
+  #   - operator_buffer_size: 131072 (128 KiB)   (NOT 4096)
+  #   - number_of_buffers_in_global_buffer_manager: 16384  (128KiB*16384 = 2 GB pool)
+  #   - number_of_io_threads: 1                  (one io-thread per source)
+  #   - allow_commas_in_strings: false           (renderer default; no-quote SIMD index kernel)
+  #   - native AVX2 build; input_parse+output_parse inlining is a committed build default
+  #   - COMPILED parsers: input_parser {uint64: TracedUINT64, int32: FastINT32, f64: EiselFloatF64},
+  #     output_parser {f64: ZMIJF64}. TracedUINT64 auto-fuses -> no __emutls.
+  #
+  # PARSER SPLIT (why parser overrides are NOT in the shared defaults): the uncompiled path has ONLY
+  # Default* interpreted parsers (no Traced/Fast/Eisel/ZMIJ -- those are compiled plugins). Setting a
+  # compiled parser name on UncompiledCSV/SequentialUncompiledCSV errors (name not in the uncompiled
+  # registry). So COMPILED and UNCOMPILED cannot share one parser config -> use SEPARATE experiments,
+  # or per-series query_config. This file's mixed series is kept for the infra defaults only; for real
+  # numbers split by path (compiled variants get the parser overrides, uncompiled variants get none).
+  #
+  # SEQUENTIAL WIRING: Sequential* formatters must run PINNED TO THE SOURCE THREAD -- they need
+  # source_type: BlockingFile + input_formatter.threading_mode: SEQUENTIAL. With the File source and no
+  # threading_mode (as the series here does) the source runs the PARALLEL routine feeding a sequential
+  # formatter -> carry-accumulator race at >1 worker -> malformed-field failures. Benchmark the
+  # sequential formatters in a dedicated BlockingFile+SEQUENTIAL experiment.
+  #
+  # DATA: bid_6GB.csv (large) = 4 columns matching the bid schema. bid_653M.csv (small) = 5 columns
+  # (does NOT match this 4-field schema) -> use data_size: large for bid_star.
+  #
+  # FLOAT CHECKSUM: ZMIJF64 emits shortest-form floats (53.0 -> "53"), so float checksums differ from
+  # the fixed-6 baseline (expected; the fast serializer was changed intentionally). pbench benchmark
+  # mode records throughput anyway (WARNING "storing anyway"); it is NOT a correctness failure.
+  # ============================================================================================
+  description: "Throughput of input formatters scaling with worker threads (FAST stack; see header)"
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 10
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-base
+  mode: systest
+  build: native
+  data_size: large
+  worker:
+    query_engine:
+      number_of_io_threads: 1
+      pin_threads: false
+      invoke_mode_configuration: fnattr
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  topology: single-node
+  query_config:
+    source_type: File
+    sink_type: Checksum
+    output_formatter:
+      type: CSV
+    # Parser overrides are intentionally NOT here (mixed compiled/uncompiled series -- see header).
+    # For a COMPILED-only run add:
+    #   input_parser:  {uint64: TracedUINT64, int32: FastINT32, f64: EiselFloatF64}
+    #   output_parser: {f64: ZMIJF64}
+
+variants:
+  - name: nexmark_bid_star
+    description: "SELECT * on Nexmark bid 6GB"
+    query: nexmark/bid_star
+
+    axes:
+      x:
+        label: "Worker Threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [1, 2, 4, 8, 16, 24]
+      series:
+        label: "Input Formatter"
+        parameter: query_config.input_formatter.type
+        values: [CSV, UncompiledCSV, SequentialCSV, SequentialUncompiledCSV]
+        baseline: CSV
+
+    y:
+      metric: throughput_mbps
+      label: "Throughput (MB/s)"
+
+    visualization:
+      type: line_chart
+
+  - name: nexmark_q1_price
+    description: "Nexmark Q1: price * 908 / 1000"
+    query: nexmark/q1_price
+
+    axes:
+      x:
+        label: "Worker Threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [1, 2, 4, 8, 16, 24]
+      series:
+        label: "Input Formatter"
+        parameter: query_config.input_formatter.type
+        values: [CSV, UncompiledCSV]
+        baseline: CSV
+
+    y:
+      metric: throughput_mbps
+      label: "Throughput (MB/s)"
+
+    visualization:
+      type: line_chart

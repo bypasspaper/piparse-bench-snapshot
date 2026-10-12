@@ -1,0 +1,64 @@
+experiment:
+  name: pin_2src_privpool
+  description: >
+    Revisit the per-CCX warm building block (§21q: 2 File sources + IO=2/W=4 pinned, ONE shared pool of 256=L3
+    -> 12.6 GB/s, all 6 CCX0 cores 100%) now that each source gets its OWN inflight-sized pool. The twist: with
+    private pools, 2 sources x inflight + global outputs replace the single shared 256, so a SMALL per-source
+    inflight (~64 -> 2x8MB=16MB) may keep the handoff L3-resident (32MB/CCD) and could BEAT 12.6, while large
+    inflight (256 -> 2x32MB=64MB) blows L3. Sweep source pool (default_max_inflight_buffers) x pinning.
+
+    2 warm File sources (num_queries=2, generator.repeat=4 for a steady window, warm_read pre-warms the page
+    cache), bid_passthrough (lazy CSV fast-path), IO=2/W=4, DEFAULT global pool (outputs only; lazy passthrough
+    barely allocates outputs, so its size shouldn't matter -- demonstrates independence). n=3 median, aggregate
+    (sum of both sources). Baseline to beat: §21q 12.6 GB/s (pin on, shared pool 256). GOTCHA: this is WARM/DRAM
+    (page cache), so it can exceed the ~7 disk cap -- it measures the engine/CCX ceiling, not disk.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 180
+  worker:
+    query_engine:
+      number_of_io_threads: 2
+      number_of_worker_threads: 4
+      invoke_mode_configuration: fnattr
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64}
+    output_formatter: {type: CSV}
+  generator:
+    repeat: 4
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: pin_2src_privpool
+    description: "2 warm File sources, IO=2/W=4, source-pool sweep x pinning (aggregate)"
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "per-source inflight pool (buffers)"
+        parameter: worker.default_max_inflight_buffers
+        values: [64, 128, 256]
+      series:
+        label: "pin"
+        explicit:
+          - {name: "pin_off", baseline: true, overrides: {num_queries: 2, worker.query_engine.pin_threads: false}}
+          - {name: "pin_on", overrides: {num_queries: 2, worker.query_engine.pin_threads: true}}
+    y: {metric: throughput_mbps, label: "Aggregate Throughput (MB/s)"}
+    visualization: {type: line_chart}

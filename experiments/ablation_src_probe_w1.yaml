@@ -1,0 +1,165 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: ablation_src_probe_w1
+  description: >
+    SOURCE-SENSITIVITY PROBE for the CSV->JSON ablation ladder (session 2026-08-24). Question:
+    do the SEQUENTIAL (W1) rungs r5/r6/r6b care whether the source is BlockingFile (page-cache
+    read in the source thread) or InMemory (zero-copy prefilled buffers)? If InMemory ~= File at
+    W1, the source only handicaps the PARALLEL rung r7 (which ran on File @~11 GB/s read wall),
+    so we retake ONLY r7 with InMemory. If they DIFFER, the whole ladder needs InMemory.
+
+    METHOD: both source arms run on the SAME current binary, so the ~19-commit drift from the
+    ladder's tip 3d23dbc526 CANCELS -- this probe measures the SOURCE delta only, not absolutes.
+    6 series = {r5,r6,r6b} x {BlockingFile, InMemory}, W1, 3 reps, median. 3 bid-family variants
+    (all on bid_6GB.csv 6.4GB so a single pass is a 1.4-3.2s window -> NES_INMEM_REPEAT=1 needs
+    NO x-correction; File repeat=1 reports true throughput too -> direct apples-to-apples):
+      bid_ts_projection : SELECT timestamp  (1-field projection, highest source-sensitivity)
+      bid_filter_eq     : SELECT * WHERE auctionId=1000 (r6b overload fires -> parse skipped,
+                          source-sensitive at r6b)
+      q0_bid_star       : SELECT * (output-heavy JSON serialize control; least source-sensitive)
+
+    GOTCHAS:
+      - true_throughput = reported * NES_INMEM_REPEAT (InMemoryFileSource.cpp:148). REPEAT=1 here
+        so reported == true; if you raise it, multiply the InMemory arm ONLY.
+      - worker_env NES_INMEM_PREFILL/REPEAT/BUFSIZE live in defaults: BlockingFile IGNORES them,
+        so they bite the InMemory arm only (no need for per-series worker_env).
+      - overload:true stays in the r6b rung overrides, NOT defaults (stale validation rule trips
+        'requires branch benchmark-piparse-lazyparse' on -fast-csv otherwise).
+      - InMemory prefill loads 6.4GB into a private pool at query registration (outside the timed
+        window); needs ~7GB RAM (box has 53GB free). pkill -x main pre-flight; NEVER pkill -f.
+      - This binary is the current tip (fastpath ON), NOT the ladder's fastpath-OFF r5 binary, so
+        r5 here already includes the JSON output fast-path -> rung-to-rung deltas will NOT match
+        the canonical ladder. That is FINE: we only read the File-vs-InMemory delta WITHIN a rung.
+    RUN: cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/ablation_src_probe_w1.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: false
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: BlockingFile
+    sink_type: Monitoring
+    input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+    output_formatter: { type: JSON }
+    input_parser: {}
+    output_parser: {}
+  generator:
+    repeat: 1
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 1
+    NES_INMEM_BUFSIZE: 131072
+
+_fast_parsers: &fast_parsers
+  uint64: TracedUINT64
+  int64: TracedINT64
+  int32: FastINT32
+  int16: TracedINT16
+  uint32: TracedUINT32
+  uint16: TracedUINT16
+  bool: TracedBOOL
+  f64: EiselFloatF64
+  f32: EiselFloatF32
+_fast_out: &fast_out { f64: ZMIJF64, f32: ZMIJF32 }
+
+# common rung knob-sets (source_type differs per arm)
+_r5_knobs: &r5_knobs
+  query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+  query_config.output_formatter: { type: JSON }
+  query_config.input_parser: *fast_parsers
+  query_config.output_parser: *fast_out
+  worker.query_engine.number_of_worker_threads: 1
+  worker.query_engine.invoke_mode_configuration: fnattr
+  worker.query_engine.inline_invoke_calls: true
+  worker.query_engine.trace_constant_bytes: false
+  overload: false
+  generator.repeat: 1
+
+_srcprobe: &srcprobe
+  label: "rung x source"
+  explicit:
+    - name: r5_file
+      baseline: true
+      overrides:
+        <<: *r5_knobs
+        query_config.source_type: BlockingFile
+    - name: r5_inmem
+      overrides:
+        <<: *r5_knobs
+        query_config.source_type: InMemory
+    - name: r6_file
+      overrides:
+        <<: *r5_knobs
+        query_config.source_type: BlockingFile
+        worker.query_engine.trace_constant_bytes: true
+    - name: r6_inmem
+      overrides:
+        <<: *r5_knobs
+        query_config.source_type: InMemory
+        worker.query_engine.trace_constant_bytes: true
+    - name: r6b_file
+      overrides:
+        <<: *r5_knobs
+        query_config.source_type: BlockingFile
+        worker.query_engine.trace_constant_bytes: true
+        overload: true
+    - name: r6b_inmem
+      overrides:
+        <<: *r5_knobs
+        query_config.source_type: InMemory
+        worker.query_engine.trace_constant_bytes: true
+        overload: true
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s)" }
+
+variants:
+  - name: nx_bid_ts_projection
+    description: "SELECT timestamp FROM bid - 1-of-4 projection, most source-sensitive"
+    query: nexmark/bid_ts_projection
+    axes: { x: *noop_x, series: *srcprobe }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: nx_bid_filter_eq
+    description: "SELECT * WHERE auctionId=1000 - r6b overload fires, source-sensitive"
+    query: nexmark/bid_filter_eq
+    axes: { x: *noop_x, series: *srcprobe }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: nx_q0_bid_star
+    description: "Q0: SELECT * FROM bid - output-heavy JSON serialize control"
+    query: nexmark/bid_star
+    axes: { x: *noop_x, series: *srcprobe }
+    y: *tput_y
+    visualization: { type: grouped_bar }

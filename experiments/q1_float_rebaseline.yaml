@@ -1,0 +1,90 @@
+experiment:
+  name: q1_float_rebaseline
+  description: >
+    Nexmark Q1 (SELECT timestamp,auctionId,bidder, price*908/1000 AS price FROM bid)
+    done CORRECTLY. Q1 is FLOAT-OUTPUT-BOUND: it parses the input float (price) AND
+    re-serializes the computed float to CSV text -- "the float is parsed twice". The
+    CSV output serialization is fused into the JIT pipeline (stage-1 finding) and is
+    the dominant cost, so Q1 is the canonical exercise of BOTH fast float parsers:
+    EiselFloatF64 (input) and ZMIJF64 (output, Ryu shortest-form, ~+40% vs to_chars).
+
+    A prior run (HANDOVER §21i) OMITTED the ZMIJ output parser -> q1 used the slow
+    default float output formatter (that, not "NATIVE magic", is why NATIVE looked
+    faster than CSV: NATIVE skips CSV text output entirely). This experiment fixes
+    that and validates the ZMIJ plumbing through worker-cli by comparing
+    output_parser ZMIJF64 vs the default, across a worker sweep.
+
+    EXPECTED (isolated stage 1, File, fastest stack w/ ZMIJ, Checksum sink, RESULTS.md
+    "nexmark-q1-price-float"): W1 ~0.45 GB/s, W16 ~6.81 GB/s (float-output-bound).
+    Note: that reference used ChecksumSink + nes-bench-runner; here we use the
+    worker-cli MonitoringSink (size/processing-time) at OUTPUT_FORMAT=CSV, which DOES
+    add the pipeline CSV output-format stage (so ZMIJ is exercised) -- expect the
+    same ballpark, with the ZMIJ series clearly above the default-output series in the
+    compute-bound region (low W); at W16 the File io supply (~6 GB/s) may cap both.
+
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 2
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+
+  worker:
+    query_engine:
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr     # input-parse inlining; off-target for output-bound q1 but harmless
+    default_query_execution:
+      operator_buffer_size: 131072          # 128 KiB
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 4096   # 512 MB stateless optimum
+
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter:
+      type: SIMDCSV
+    input_parser:                           # fast integer + FLOAT input parsers
+      uint64: TracedUINT64
+      int32: TracedINT32
+      int64: TracedINT64
+      f64: EiselFloatF64                    # fast float INPUT parser
+    output_formatter:
+      type: CSV                             # adds the fused CSV output-format stage (the float is re-serialized)
+    output_parser:
+      f64: ZMIJF64                          # fast float OUTPUT parser (overridden per series below)
+
+  generator:
+    repeat: 4
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: q1_price
+    description: "q1 float round-trip: ZMIJ vs default output parser x worker scaling"
+    query: nexmark/q1_price
+    axes:
+      x:
+        label: "Worker Threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [1, 4, 8, 16]
+      series:
+        label: "float output parser"
+        explicit:
+          - name: ZMIJF64
+            baseline: true
+            overrides:
+              query_config.output_parser.f64: ZMIJF64
+          - name: default
+            overrides:
+              query_config.output_parser: {}      # no override -> engine default float output formatter
+    y:
+      metric: throughput_mbps
+      label: "Throughput (MB/s)"
+    visualization:
+      type: line_chart

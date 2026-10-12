@@ -1,0 +1,113 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: concat_alert_csv_compare
+  description: >
+    SINGLE-BINARY validation of the generalized lazy-VARSIZED rope (commit 210c68df1a,
+    "generalize the rope behind VarVal ops"). Runs the CURRENT build-dir binary on two
+    variants and reports median throughput_mbps; no A/B binary swap.
+
+    Two variants, same r6 config (W1, JSON out, SequentialCSV, FastINT32/EiselF64/ZMIJ),
+    same 22-char constant prefix, same bid_strings_3GB (3.6GB / 31.3M rows), single-node/fused:
+      A  concat_alert      CONCAT(const, channel[VARSIZED])  -> forward a runtime string
+      B  concat_alert_int  CONCAT(const, auctionId[INT32])   -> forward a runtime int's raw digits
+
+    PURPOSE:
+      A: does the generalization preserve the committed rope+const-fold number? Prior session
+         (committed tip fecc2a5b46, same machine/config) measured concat_alert = 2288 MB/s
+         (baseline 1831 -> +rope 1856 -> +const-escape-fold 2288). A within a few % = preserved.
+      B: is forwarding an INT column's raw text as cheap as forwarding a string? Both are
+         raw-text-forward with NO parse and NO materialisation (IR: 0 arena allocs for both).
+
+    GOTCHAS: bid_strings_3GB is the only data variant (in the build dir's testdata, so run with
+    --build-dir). Port 9099, governor performance, W1 to unmask per-row work (W16 = read-wall).
+    RUN:
+      cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+        experiments/concat_alert_generalized_single.yaml \
+        --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 5
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: true
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: BlockingFile
+    sink_type: Monitoring
+    input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+    output_formatter: { type: CSV }
+    input_parser: { uint64: TracedUINT64, int64: TracedINT64, int32: FastINT32, int16: TracedINT16, uint32: TracedUINT32, uint16: TracedUINT16, bool: TracedBOOL, f64: EiselFloatF64, f32: EiselFloatF32 }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s)" }
+
+_cell: &cell
+  label: "config"
+  explicit:
+    - name: r6_fullopt_w1
+      baseline: true
+      overrides:
+        query_config.source_type: BlockingFile
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: CSV }
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: fnattr
+        worker.query_engine.inline_invoke_calls: true
+        worker.query_engine.trace_constant_bytes: true
+        overload: false
+        generator.repeat: 1
+
+variants:
+  - name: A_2span_string
+    description: "A: CONCAT(const, channel[VARSIZED]) -> 2-span rope"
+    query: nexmark/concat_alert
+    axes: { x: *noop_x, series: *cell }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: B_2span_int
+    description: "B: CONCAT(const, auctionId[INT32]) -> 2-span rope"
+    query: nexmark/concat_alert_int
+    axes: { x: *noop_x, series: *cell }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: C_3span_string
+    description: "C: CONCAT(CONCAT(const, channel[VARSIZED]), const) -> flattened 3-span rope (2 const + 1 string)"
+    query: nexmark/concat_alert_nested_string
+    axes: { x: *noop_x, series: *cell }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: D_3span_int
+    description: "D: CONCAT(CONCAT(const, auctionId[INT32]), const) -> flattened 3-span rope (2 const + 1 int)"
+    query: nexmark/concat_alert_nested_int
+    axes: { x: *noop_x, series: *cell }
+    y: *tput_y
+    visualization: { type: grouped_bar }

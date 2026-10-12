@@ -1,0 +1,297 @@
+experiment:
+  name: count_loop_collapse
+  description: >
+    One-off LLVM-IR study: can the per-tuple COUNT loop be collapsed to
+    count += numTuples now that lazyVals + the fnattr/inlining machinery exist?
+    History: pre-lazyVal, a count query parsed ALL fields and the loop never
+    collapsed with any NebulaStream config; it collapsed only after MANUAL IR
+    edits (mark proxies pure/nomodref, noalias on getIndexPhaseResultProxy /
+    getAggHashMapProxy, alias.scope/noalias metadata separating hashmap-state
+    loads/stores from entry-data stores — see user notes in the session log).
+    Query = ingestion-time global COUNT (nexmark/bid_count_ingestion): ingestion
+    time means no field is parsed for the window either, so the loop body is
+    per-tuple hashmap-slot increment only.
+    SETUP: dump_compilation_result: FILE makes the worker (via nautilus
+    dump.all+dump.file) write one IR dump PER PIPELINE into the worker's cwd
+    (= the directory pbench is invoked from); the count-loop pipeline is the
+    aggregation-build pipeline (expected to be the first/scan pipeline). The
+    dump only adds compile-time cost, so it stays ON even for the throughput
+    point.
+    PREDICTIONS: (a) with lazyVals the dumped loop should contain NO parse
+    calls (COUNT's lift discards the value; window ts is ingestion time) —
+    if parse calls appear, lazy elision is broken for the agg path;
+    (b) the loop will NOT collapse at baseline: the slice-store/hashmap
+    proxy invokes are UNtagged plain nautilus::invoke (only parser call
+    sites use NAUTILUS_TAGGED_INVOKE), so fnattr config cannot mark them
+    pure, and LLVM must assume the stores clobber the loop-carried count;
+    (c) throughput baseline ~1-2 GB/s @W4 (per-tuple slice+hashmap work,
+    same ballpark as multicol proj_k1 framing-bound 2.0 GB/s); if the loop
+    ever collapses, throughput should jump toward the index/source bound
+    (>= 3.7 GB/s, fast-config proj-16 territory, possibly ~7 GB/s
+    single-File producer bound).
+    GOTCHAS: ingestion-time windows have NO systest coverage and needed TWO
+    patches (2026-07-07, on this branch) before this experiment ran at all:
+    (1) worker SIGSEGV during query deserialization — the ingestion-time
+    registrar called withInferredSchema(arguments.inputSchemas) on the EMPTY
+    schema vector deserializeOperator passes (PRECONDITION compiled out in
+    release; fix: return via unreflect, schemas are re-inferred afterwards,
+    IngestionTimeWatermarkAssignerLogicalOperator.cpp); (2) lowering rejects
+    "The ingestion time field of a window must be: $record.creationTs" —
+    createIngestionTime() left the sentinel field name empty and nothing ever
+    set it (fix: stamp RECORD_CREATION_TS_FIELD_NAME in TimeCharacteristic::
+    createIngestionTime). Sink schema bid.start/bid.end/bid.cnt (UINT64) is
+    accepted. IR dumps land in /tmp/dump/<timestamp>_#<hash>/ (NOT worker
+    cwd), one dir per compilation unit with after_{tracing,ssa,ir_creation,
+    mlir_generation,llvm_generation}; after_llvm_generation.ll is POST-
+    nautilus-optimization (lcssa/preheader forms). The count-loop unit is the
+    LARGEST after_ir_creation.ir (~300 KB): it fuses SIMDCSV spanning-tuple
+    proxies + watermark + slice-cache + hashmap + count. Callees appear as
+    raw @"0x..." addresses (ASLR, per-run): resolve them LIVE via
+    /proc/<pid>/maps + nm while the worker runs (scratchpad resolve_syms.py).
+    Monitoring sink throughput for agg queries is input-size based (output is
+    a single row at EoS flush; the 10 s window never closes during the run).
+    RESULT 2026-07-07 (fnattr_nocache, slice cache OFF): 174.7 MB/s @W4 —
+    a ~40x collapse vs baseline: without the cache the FULL slice-store
+    lookup (defaultTimeBasedSliceStoreRefCacheMissProxy, incl. locking) runs
+    PER TUPLE. The option's own docstring undersells this; the cache is
+    load-bearing for aggregation throughput. Run 2 also produced a bogus
+    19,059,171 MB/s for fnattr_baseline (monitoring wall-span glitch,
+    single-run artifact) — the valid baseline number is run 1's 6869.4.
+    RESULT 2026-07-07 (baseline): 6869.4 MB/s @W4 — that is the single-File
+    async producer bound (~7 GB/s), NOT a pipeline-compute number; prediction
+    (c)'s 1-2 GB/s was wrong because at W4 four workers hide the per-tuple
+    cost behind the source. A W1 run is needed for a compute-bound collapse
+    signal. Prediction (a) CONFIRMED (DIAG_PARSE calls=0; no parse/band
+    access in the loop; note AggregationBuildPhysicalOperator::execute DOES
+    call record.parseAllFields() — it no-ops only because projection
+    pushdown leaves a zero-field record for COUNT). Prediction (b) CONFIRMED:
+    per-tuple loop intact in the final IR; body = slice-cache ring (10-way,
+    urem 10) + UNCONDITIONAL updateTimestamp(ts, hashMap*) call + constant-
+    hash (902850234) bucket chase + in-memory count++, plus VOLATILE memset
+    on the entry-init path. All of it is loop-invariant for constant
+    ingestion ts (updateTimestamp is a monotonic max — per-buffer hoist is
+    exactly semantics-preserving).
+    REPLAY VERDICT 2026-07-07 (opt-19 attribute-replay on the dumped IR):
+    NO attribute/metadata set collapses TODAY's loop — not mark-all-pure,
+    not noalias returns, not the historical two-domain alias.scope metadata
+    (zero additive effect), not even destructively deleting the ring stores.
+    The historical manual-edit collapse worked on a SIMPLER IR SHAPE that no
+    longer exists: today nautilus's own -O3 statically unrolls the SLICE
+    CACHE into a 10-way urem-ring (30 unrolled slot arms) BEFORE LLVM ever
+    sees the loop, so the count address is a 10-way phi chased through
+    loaded pointers = loop-VARIANT; collapsing needs value-level reasoning
+    (constant ingestion ts => same slice every tuple) that opt cannot do.
+    Also: inttoptr-literal slice-cache base addresses defeat LLVM AA.
+    What attributes DO buy (honest iff watermark writes unobservable here):
+    memory(none) on updateTimestamp/cacheMissProxy + non-volatile memset
+    deletes the redundant per-tuple watermark + slice-miss work (asm calls
+    in @execute 27 -> 9) — a real win, but NOT collapse. Honest
+    argmem:readwrite buys NOTHING (hashmap-ptr arg is reloaded per
+    iteration, so LICM cannot hoist).
+    ROUND-2 REPLAY VERDICT (slice cache OFF, opt-19 on the 325-line dump):
+    FULL COLLAPSE ACHIEVED — @execute becomes straight-line (0 loops, count
+    update = one addq; insert survives as a per-buffer cold path). MINIMAL
+    SET (5 components, each individually necessary, ~= the historical
+    notes): (1)+(2) memory(none) willreturn nounwind on cacheMissProxy AND
+    updateTimestamp; (3) same on the insert lambda; (4) memset volatile ->
+    NON-volatile (the current i1 true pins residual loops against DSE —
+    looks like an emission bug); (5) the two-domain alias.scope/noalias
+    metadata (entry-data vs hashmap-metadata) on count-slot stores vs
+    bucket/size/slice-ptr loads. noalias-ret on insert is NOT needed and is
+    actively UNSOUND (DSE deletes the insert arm). NO honest attribute set
+    collapses: argmem readwrite is inert (LICM never hoists memory-writing
+    calls; cacheMiss argmem-writes the slot %39 reloads through); pure
+    cacheMiss/updateTimestamp is justifiable as "already hoisted" (the
+    per-buffer preamble calls both with identical args — idempotent for
+    buffer-constant ts); pure INSERT is not fully honest (first-buffer
+    entry creation: collapsed code stores count=1 where truth is n) — needs
+    a first-iteration peel or entry-preexistence guarantee in production.
+    DELTA vs round 1: cache off turns the entry address into
+    inttoptr-lit + tid*24 with ALL call args loop-invariant, so the only
+    blockers left are call side-effects + AA opacity — exactly what
+    attributes+metadata express; with the cache the 10-way phi made
+    collapse structurally impossible. Artifacts: scratchpad
+    count_ir/replay_nocache/ (m2.ll winner, m2_O3.s asm, full ladder).
+    Iteration levers, updated: (1) DISABLE THE SLICE CACHE (config:
+    worker.default_query_execution.slice_cache.enable_slice_cache: false)
+    to recover a simpler IR shape, re-dump, re-replay — the most promising
+    config-only path; (2) source-level hoist of getTs/slice-lookup/
+    updateSourceCreationTimestamp/findOrCreateEntry out of the per-tuple
+    path for buffer-constant-ts aggs (the structural fix, makes collapse
+    trivial); (3) NAUTILUS_TAGGED_INVOKE tags + fn_attr nomodref on
+    updateTimestamp/cacheMiss call sites for the deletion win from (What
+    attributes DO buy); (4) nautilus emit changes: argmem attrs WITH
+    loop-invariant args, no inttoptr literals, two-domain noalias
+    (necessary-not-sufficient, only pays after 1/2).
+    ⚠ METER CAVEAT (2026-07-07): the Monitoring sink is UNUSABLE for this
+    query — a global agg emits ONE output row at EoS, so the sink's wall-span
+    math degenerates (absurd 5-19 TB/s readings; the plausible-looking
+    6869/4991 early numbers were luck — runs that happened to emit 2 window
+    rows). The authoritative numbers below came from a manual File-sink
+    harness (scratchpad count_verify/): wall-clock from nes-cli submit to the
+    output row(s) summing to the expected total (551,975,163 = 3x file rows
+    with NES_FILE_REPEAT=3), throughput = 3*6442450944 B / duration. Do NOT
+    trust throughput_mbps rows in the results DB for this experiment.
+    ENGINE COLLAPSE LANDED 2026-07-07, revised same day: the case-specific
+    regcount commit (0a43863724, register-accumulated COUNT with a new
+    liftIsUnconditionalCountIncrement virtual) was DROPPED at user request
+    (too narrow/cluttered; parked on branch keep/regcount-collapse) and
+    replaced by a GENERAL fix with identical measured performance:
+    a678b69c04 perf(input-formatters) hoists the loop-invariant tuple
+    count out of the CSV parse loop (the per-iteration hasNext reload of
+    totalNumberOfTuples may-aliased the count store and pinned the loop;
+    opt-in trait HasLoopInvariantTupleCount on FieldBand+FieldOffsets,
+    SIMDJSON's stateful hasNext untouched). With the per-buffer entry
+    hoist (16ec8f85c3) the count loop body becomes PURE REGISTER
+    ARITHMETIC (count loaded once before / stored once after the loop,
+    zero per-tuple memory or calls); LLVM emits a 16-wide vectorized
+    register reduction rather than the count += n SCEV fold — proven a
+    nautilus pass-ordering artifact (opt-19 -O3 folds the identical
+    synthetic shape to c0+n instantly; in the JIT pipeline the in-loop
+    store is only LICM-promoted after indvars/loop-deletion ran, so the
+    vectorizer captures the reduction). Residual cost ~16 increments/
+    cycle = negligible; true closed form would need a nautilus pass-
+    pipeline tweak (indvars+loop-deletion re-run after LICM promotion,
+    before LV), NOT NebulaStream code.
+    FINAL RESOLUTION 2026-07-07 (commit efd657137a "let lazy values stay
+    lazy"): the TRUE late-DCE blocker was record.parseAllFields() in the
+    keyless buffer-constant agg path — it force-materialized every lazy
+    field, tracing 4 dead SWAR integer parses into the per-tuple loop; the
+    dead nest cleared only after the single IndVarSimplify visit (round-2
+    pass-dig on the REAL IR, reconstructed via bitcode carved from the
+    worker binary), so LV captured the reduction. Dropping the eager parse
+    (safe: keyless => nothing copies raw record memory; lift materializes
+    on demand) leaves the loop memory-free at the first indvars, and ONE
+    stock O3 emits `count += numTuples` PER BUFFER — no per-tuple loop in
+    the pipeline AT ALL, no nautilus/pipeline change, no count-specific
+    code. Truthful Ref-attrs on getMemArea/getBandDataProxy were plumbed +
+    verified but proved unnecessary (reverted; those getters alwaysinline
+    anyway). The validated-but-unneeded fallback (nautilus vectorizer-start
+    EP: loop-deletion,simplifycfg,licm,indvars+loop-deletion) is documented
+    in the memory file. Verified post-fix: exact count 183,991,721; W1
+    systest ~4960 MB/s (source-bound, as before — the vectorized reduction
+    was already ~free; the fold's value is the guarantee + cleanliness).
+    SYSTEST-BENCHMARK 2x2 GRID 2026-07-07 (the definitive meter per user:
+    systest -b + Void sink, nes-systests/benchmark/CountIngestionCollapse.test,
+    single pass bid_6GB, medians of 3): pre(865e9bc7ad = ingestion fixes
+    only) vs post(a678b69c04 tip) x slice cache on/off x W4/W1 —
+    pre/cacheON W4 5290, W1 4271; pre/cacheOFF W4 148 (!), W1 338 (W1
+    FASTER than W4 without cache: the per-tuple slice-store lock contends
+    worse with more workers); post/cacheON W4 5115, W1 5127; post/cacheOFF
+    W4 5169, W1 5040. Post-collapse the grid is FLAT ~5.0-5.3 GB/s: slice
+    cache irrelevant, W1==W4 (source/formatter-bound). Note systest -b
+    reads ~4-8% higher than the File-sink wall-clock harness (in-process,
+    no deploy overhead in the timed window).
+    AUTHORITATIVE RESULTS (W1, cache on, repeat=3, File-sink meter):
+    nohoist 3762-3902 -> hoist 4674 (+24%) -> hoist+bound-hoist 4673/4912
+    == dropped regcount variant 4917/4865 (parity, general beats special)
+    ; W1 == W4 == ~4.9 GB/s (agg pipeline no longer the limiter at ANY
+    worker count; source/formatter chain is). nocache cliff CURED by
+    hoist: ~175 -> 4937 MB/s @W4. Correctness: File-sink totals exact
+    (183,991,721 single pass; 551,975,163 at repeat=3) across all switch
+    combinations; window row-splits differ across runs only by wall-clock
+    boundary crossings (inherent to ingestion time). Kill switch:
+    NES_AGG_HOIST=0 (NES_AGG_REGCOUNT existed only in the dropped commit).
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+
+  worker:
+    query_engine:
+      number_of_worker_threads: 4
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+    default_query_execution:
+      execution_mode: COMPILER
+      operator_buffer_size: 131072
+    number_of_buffers_in_global_buffer_manager: 8192
+    dump_compilation_result: FILE
+
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter:
+      type: SIMDCSV
+    input_parser:
+      uint64: TracedUINT64
+      int32: TracedINT32
+      int64: TracedINT64
+    output_formatter:
+      type: CSV
+
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+
+variants:
+  # HOIST A/B (commit "hoist buffer-constant agg resolution", 2026-07-07): the
+  # AggregationBuildPhysicalOperator now resolves slice + watermark + entry ONCE
+  # per buffer in open() when the entry is buffer-constant (keyless + ingestion
+  # time); execute() only runs lift(). NES_AGG_HOIST=0 disables it (the nohoist
+  # points reproduce the pre-commit behavior; old x-point names fnattr_baseline/
+  # fnattr_nocache correspond to nohoist/nocache_nohoist). Correctness verified
+  # via File sink: hoist on/off both total 183,991,721 (= wc -l of bid_6GB;
+  # off split 2 windows only because that run crossed a 10 s wall boundary).
+  - name: count_ingestion
+    description: "W4: fast config (SIMDCSV, traced int parsers, fnattr, 128 KiB), IR dumped to file"
+    query: nexmark/bid_count_ingestion
+    axes:
+      x:
+        label: "config"
+        explicit:
+          - name: hoist
+            overrides: {}
+          - name: nohoist
+            overrides:
+              worker_env.NES_AGG_HOIST: "0"
+          # Slice-cache OFF: kills the 10-way urem ring that nautilus -O3 bakes in
+          # BEFORE LLVM sees the loop (the structural collapse-blocker found in the
+          # 2026-07-07 replay). With the hoist the per-tuple slice lookup is gone,
+          # so the 174 MB/s no-cache cliff should be cured (prediction: back to
+          # producer bound); nocache_nohoist is the cliff control.
+          - name: nocache_hoist
+            overrides:
+              worker.default_query_execution.slice_cache.enable_slice_cache: false
+          - name: nocache_nohoist
+            overrides:
+              worker.default_query_execution.slice_cache.enable_slice_cache: false
+              worker_env.NES_AGG_HOIST: "0"
+    y:
+      metric: throughput_mbps
+      label: "Throughput (MB/s)"
+    visualization:
+      type: bar_chart
+
+  # W1 = compute-bound signal (W4 hides per-tuple cost behind the ~7 GB/s single-
+  # File producer bound). Note W1 also runs the SIMDCSV formatter tasks on the
+  # single worker thread, so this measures formatter+pipeline sum, not pipeline
+  # alone — valid as an A/B, not as an absolute pipeline cost.
+  - name: count_ingestion_w1
+    description: "W1 hoist A/B (compute-bound)"
+    query: nexmark/bid_count_ingestion
+    axes:
+      x:
+        label: "config"
+        explicit:
+          - name: hoist
+            overrides:
+              worker.query_engine.number_of_worker_threads: 1
+          - name: nohoist
+            overrides:
+              worker.query_engine.number_of_worker_threads: 1
+              worker_env.NES_AGG_HOIST: "0"
+    y:
+      metric: throughput_mbps
+      label: "Throughput (MB/s)"
+    visualization:
+      type: bar_chart

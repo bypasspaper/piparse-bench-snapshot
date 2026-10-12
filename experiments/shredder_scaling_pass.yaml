@@ -1,0 +1,91 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: shredder_scaling_pass
+  description: >
+    E2E shredder-scaling, PASSTHROUGH (raw-forward) output. bypass arms = SIMDCSV -> CSV output:
+    the lazy CSV passthrough copies raw bytes (no parse, no serialize) = memcpy-bound, so it should
+    approach the no-serde (SystemNative -> NATIVE) native-memcpy ceiling as threads grow, while
+    no-serde saturates early on memory bandwidth. 2KiB buffers make the SequenceShredder a visible
+    share -> LOCK_FREE vs LOCKING (naive-locking) gap. bid passthrough (SELECT 4 int fields),
+    InMemory prefill, full thread sweep, 2 reps. y = rows/s = 313e6(31.3M x REPEAT 10)/processing_time.
+    RUN: cd ~/work/piparse-bench && pkill -x main; PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/shredder_scaling_pass.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 2
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 8
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: false
+      pin_threads: false
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false }
+    output_formatter: { type: CSV }
+    input_parser: {}
+    output_parser: {}
+  generator:
+    repeat: 1
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 10
+    NES_INMEM_BUFSIZE: 2048
+
+variants:
+  - name: shredder_pass
+    description: "bypass CSV-passthrough LOCK_FREE / LOCKING / no-serde native, x=threads, 2KiB"
+    query: nexmark/bid_pass_scaling
+    axes:
+      x:
+        label: "worker threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [1, 2, 4, 8, 12, 16, 20, 24]
+      series:
+        label: "arm"
+        explicit:
+          - name: bypass_lockfree
+            baseline: true
+            overrides:
+              data_size: csv
+              query_config.input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false, sequence_shredder_mode: LOCK_FREE }
+              query_config.output_formatter: { type: CSV }
+          - name: bypass_locking
+            overrides:
+              data_size: csv
+              query_config.input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false, sequence_shredder_mode: LOCKING }
+              query_config.output_formatter: { type: CSV }
+          - name: no_serde
+            overrides:
+              data_size: native
+              query_config.input_formatter: { type: SystemNative, string_length: "1" }
+              query_config.output_formatter: { type: NATIVE }
+              query_config.input_parser: {}
+    y:
+      metric: throughput_mbps
+      label: "Throughput (MB/s)"
+    visualization:
+      type: line_chart

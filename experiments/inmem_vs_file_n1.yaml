@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: inmem_vs_file_n1
+  description: >
+    CLEAN single-source (N=1) control: is InMemory prefill strictly better than File for bid 4-int
+    CSV projection passthrough? N=1 => exactly one MonitoringSink CSV per arm => one processing_time,
+    NO concurrent-query aggregation ambiguity. Compute rows/s = 31.3M x passes / processing_time by
+    hand from the CSV (ignore pbench's cross-source MB/s accounting). Repeat matched per arm for a
+    >1s window: File repeat=15 (~slow producer), InMemory repeat=80 (fast prefill). W16, 1 io, 128K.
+    RUN: cd ~/work/piparse-bench && pkill -x main; PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/inmem_vs_file_n1.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 20000
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV }
+    input_parser: { uint64: TracedUINT64, int32: TracedINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  generator:
+    repeat: 15
+  worker_env:
+    NES_TASKQUEUE_STATS: 1
+    NES_LOG_LEVEL: WARNING
+
+variants:
+  - name: n1
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "single source"
+        explicit:
+          - name: "n1"
+            baseline: true
+            overrides: {}
+      series:
+        label: "source"
+        explicit:
+          - name: file
+            baseline: true
+            overrides:
+              query_config.source_type: File
+              generator.repeat: 15
+          - name: inmem_prefill
+            overrides:
+              query_config.source_type: InMemory
+              generator.repeat: 80
+              worker_env.NES_INMEM_PREFILL: "1"
+              worker_env.NES_INMEM_REPEAT: "80"
+              worker_env.NES_INMEM_BUFSIZE: "131072"
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: bar_chart }

@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: prof_person_projection_cold_direct
+  # PROBE (user ask 2026-07-08): does cold io_uring+O_DIRECT hold up against the PINNED warm
+  # ceiling? Context: nexmark_person_star_cold_iouring measured cold O_DIRECT 6547 MB/s = "107%
+  # of warm" — but that warm reference was UNPINNED (~6.1 GB/s). prof_person_projection_pin_ccx
+  # then showed pinned warm = ~10.5 GB/s (both arms, fast-class files). Raw device check
+  # (dd iflag=direct, this session): person nes @ bs=1M -> 4.2 GB/s, bs=16M -> 6.6 GB/s =
+  # the NVMe streaming ceiling; prior deep-QD engine cold runs 6.5-6.9.
+  # EXPECT (predict-first): cold O_DIRECT ~6.3-6.9 GB/s BOTH arms (device-capped, format
+  # irrelevant since DMA skips the copy) = only ~62-66% of the pinned warm 10.5 -> the
+  # "cold ~= warm" story must be RESTATED as "cold ~= NVMe ceiling"; it matched warm before only
+  # because unpinned warm coincidentally sat at the same ~6.5 GB/s. Warm references (pin_ccx,
+  # same query/topology/files): csv 10487 / native 10431 MB/s.
+  # GOTCHAS: io_uring sources IGNORE NES_FILE_REPEAT -> repeat=1 single-pass windows (~0.15-0.25s,
+  # ramp-inflated; reps=5 median, compare within-experiment + against the warm refs with that
+  # caveat). default_max_inflight_buffers=128 (>=2x auto QD=pool/2=64, private-pool deadlock
+  # guard). cold_read: runner fadvise-evicts + mincore-verifies each rep (watch [cold_read] COLD
+  # lines). pin_threads pins the asio IOThread pool + workers; the IoUringFile source thread may
+  # not be covered by it — acceptable, O_DIRECT has no user-space copy to place.
+  #
+  # RESULTS (2026-07-08, reps=5 median, 10/10 ok, every rep mincore-verified COLD "0 -> 0 MB"):
+  #   csv_cold_direct     6507.1 MB/s / 29.5 Mr/s
+  #   native_cold_direct  6725.5 MB/s / 18.3 Mr/s
+  # PREDICTION HIT (6.3-6.9, format-independent): both arms sit at the NVMe streaming ceiling
+  # (raw dd O_DIRECT bs=16M = 6.6 GB/s; engine deep-QD squeezes 6.5-6.7 = ~100% of device) —
+  # the ~3% csv-vs-native diff is noise/window ramp, format truly irrelevant (DMA, no copy, no
+  # parse pressure at this rate). vs PINNED WARM (pin_ccx: csv 10487 / native 10431): cold =
+  # 62%/64%. => RESTATE the cold-io_uring story: cold O_DIRECT ~= NVMe CEILING, not "~= warm";
+  # it matched warm in nexmark_person_star_cold_iouring only because UNPINNED warm (~6.1) sat
+  # coincidentally at the same level. Ladder on this box: cold O_DIRECT 6.6 < pinned warm copy
+  # 10.5 < dd memcpy ceiling 13 < zero-copy/mmap (DRAM-bandwidth, unmeasured). Cold runs CANNOT
+  # exceed ~6.6 GB/s regardless of engine work until the disk is upgraded (PCIe4 NVMe class).
+  description: "cold io_uring+O_DIRECT vs pinned-warm ceiling: person_projection csv/native, 1io+5w CCX0"
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 5
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  completion_timeout_s: 300
+  cold_read: true
+  worker:
+    query_engine:
+      number_of_worker_threads: 5
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    default_max_inflight_buffers: 128
+    dump_compilation_result: NONE
+  query_config:
+    source_type: IoUringFile
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser: { uint64: TracedUINT64, int32: FastINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  worker_env:
+    NES_IOURING_DIRECT: 1
+  generator:
+    repeat: 1
+
+variants:
+  - name: person_projection_cold_direct
+    query: nexmark/person_projection
+    axes:
+      x:
+        label: "worker threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [5]
+      series:
+        label: "input format"
+        explicit:
+          - name: csv_cold_direct
+            baseline: true
+            overrides: {}
+          - name: native_cold_direct
+            overrides:
+              data_size: native
+              query_config.input_formatter: { type: SystemNative, string_length: "16,32,32,16,4,256" }
+              query_config.input_parser: {}
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: grouped_bar }

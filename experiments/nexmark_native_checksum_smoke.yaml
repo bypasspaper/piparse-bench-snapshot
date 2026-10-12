@@ -1,0 +1,137 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: nexmark_native_checksum_smoke
+  # CORRECTNESS smoke for nexmark_native_vs_csv (not a benchmark): arm-vs-arm CHECKSUM EQUALITY on
+  # the worker-cli path. The Checksum sink forces output_format=NATIVE in the pipeline + sink-side
+  # legacy CSV materialization (zmij-identical) — so BOTH arms format every field identically and
+  # their "count,checksum" lines must be EQUAL per query, EXCEPT person_star: the CSV arm keeps the
+  # trailing \r of the CRLF person file on the LAST column (extra), the .nes strings are clean ->
+  # csv is expected +13/row (85430084707 vs 85378084707), counts equal. This sidesteps two systest
+  # confounds: the CSV arm's SELECT * passthrough elision (raw-bytes checksums) and the native
+  # systest pool-retention issue. Sink-side materialization is single-threaded (slow, ~min for the
+  # big-output queries) — that's fine, this is correctness, not performance.
+  # RESULTS go in the run log; compare [checksum] lines per variant between series.
+  description: "SMOKE: arm-vs-arm checksum equality, all 10 queries, worker-cli Checksum sink"
+  primary_metric: processing_time_s
+  higher_is_better: false
+  repetitions: 1
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  completion_timeout_s: 600
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Checksum
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser: { uint64: TracedUINT64, int32: FastINT32, f64: EiselFloatF64 }
+  generator:
+    repeat: 1
+
+_series: &format_series
+  label: "input format"
+  explicit:
+    - name: csv_optimized
+      baseline: true
+      overrides: {}
+    - name: native
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "16,32,32,16,4,256" }
+        query_config.input_parser: {}
+
+_axes_x: &w16_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [16]
+
+_y: &time_y { metric: processing_time_s, label: "Processing time (s)" }
+
+variants:
+  - name: person_projection
+    query: nexmark/person_projection
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+  - name: person_star
+    description: "EXPECTED UNEQUAL: csv keeps \\r on extra (CRLF file), native clean; counts equal"
+    query: nexmark/person_star
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+  - name: bid_ts_projection
+    query: nexmark/bid_ts_projection
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+  - name: bid_filter_eq
+    query: nexmark/bid_filter_eq
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+  - name: q0_bid_star
+    query: nexmark/bid_star
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+  - name: q1_price
+    query: nexmark/q1_price
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+  - name: q2_filter_proj
+    query: nexmark/q2_filter_proj
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+  # Stateful variants need the many-small-buffers pool (state is count-bound, see
+  # stateful_join_knowngood.yaml): q8_join's person build side exhausted the 16384x128KiB
+  # passthrough pool (verified 2026-07-08); with 2M x 4KiB both q8 arms are EQUAL
+  # (q8_join 10999751,32904596101; q8_variant 182197843,1211407810784).
+  - name: q5_window_join
+    query: nexmark/q5_window_join
+    overrides:
+      worker.default_query_execution.operator_buffer_size: 4096
+      worker.number_of_buffers_in_global_buffer_manager: 2000000
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+  # RESULTS 2026-07-08 (run 1, pre-LF-auction): EQUAL arms on bid_filter_eq (758,1357116),
+  # q0_bid_star (183991721,388223174259), q2_filter_proj (1511777,1499177125), q5 (10589,23372488);
+  # person_star differs by the predicted 13/row \r (csv 83798084707 vs native 83746084707 — note
+  # the worker-cli sink-side materialization also differs from systest fused-CSV by a per-row
+  # constant, so compare only WITHIN this harness). FOUND: (a) native DUPLICATION bug —
+  # bid_ts_projection/q1 native +11229 rows, person_projection +488, others exact (open engine
+  # bug); (b) the default-int32-parser workaround for CRLF auction crashed the release JIT
+  # (__emutls) -> replaced by the LF auction file in the q8 catalog entries (full fast stack).
+  #
+  # RESULTS 2026-07-08 (run 2, POST-FIX — NativeInputFormatIndexer now uses the raw buffer's real
+  # size instead of the compile-time metaData.getBufferSize()=4096 for alignment; the "duplication"
+  # was actually whole misaligned buffers + phantom rows from undersized spanning tuples):
+  # ALL 10 QUERIES ARM-EQUAL, 20/20 ok. person_projection and bid_ts_projection native now equal
+  # the RECORDED catalog checksums exactly (4000000,1444868000 / 183991721,127905527607); q1 arms
+  # equal (183991721,431495796659). person_star remains the known 13/row \r delta. The native path
+  # is value-correct on every query shape.
+  - name: q8_join
+    query: nexmark/q8_join
+    overrides:
+      worker.default_query_execution.operator_buffer_size: 4096
+      worker.number_of_buffers_in_global_buffer_manager: 2000000
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+  - name: q8_variant
+    description: "182M output rows -> slow sink-side materialization"
+    query: nexmark/q8_variant
+    overrides:
+      worker.default_query_execution.operator_buffer_size: 4096
+      worker.number_of_buffers_in_global_buffer_manager: 2000000
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y

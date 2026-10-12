@@ -1,0 +1,138 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: nes_naive_native_scaling_probe
+  description: >
+    DE-RISK PROBE for the two NEW NES-internal arms of the many-source scaling sweep
+    (SCALABILITY_NAIVE_NATIVE_HANDOVER.md). NES-only, 2 arms, N=[1000,256,128] REVERSED
+    (heaviest first: surfaces OOM / thread-exhaustion / buffer-deadlock / timeout at N=1000
+    before committing to the ~10 h step20 grid). Same 10-query bidstr heterogeneous mix +
+    num_queries fan-out as nes_vs_flink_vs_spark_scaling_step20 (the SIMD green curve).
+      - NES-Naive: SequentialUncompiledOldCSV (scalar-find INTERPRETED, ablation r1) ->
+        JSONUncompiled, threading_mode sequential, W1, ccx OFF, no shared source pools,
+        BlockingFile, GENUINE original (de)serializers (NES_INPUT_CODEC/NES_OUTPUT_CODEC=
+        original). Each of the N sources = one inline single-thread pipeline (the natural
+        naive fan-out; N threads on 48 HT -> oversubscription past ~cores).
+      - NES-Native: SystemNative in (string_length 13,73 for the bidstr schema) + NATIVE out
+        (formatter BYPASSED, no serialize) = the no-parse/no-serde upper bound. SAME production
+        config as the SIMD arm (CCX cells + pin + 16w/8io + 192x128KiB shared pools + File),
+        only data + formatters swapped -> isolates the parse+serde cost vs SIMD.
+    Metric = throughput_mrows_s (records/s, FORMAT-INVARIANT: native .nes bytes != csv bytes)
+    + per-batch p99 latency (Monitoring sink; the uncompiled timestamp-propagation fix is in
+    the build so naive latency is valid). VALIDATE: naive worker.log DIAG shows original codecs;
+    native N=1000 no OOM; latency columns non-zero.
+    PRE-FLIGHT: pkill -x main; warm bid_strings_3GB.{csv,nes}; --worker-port 9099;
+    PBENCH_KEEP_LOGS=1. Run: pbench run --detach.
+  primary_metric: throughput_mrows_s
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 3600
+  query_mix:
+    - nexmark/matrix/bidstr_q0
+    - nexmark/matrix/bidstr_qproject
+    - nexmark/matrix/bidstr_qroute
+    - nexmark/matrix/bidstr_q1
+    - nexmark/matrix/bidstr_q2og
+    - nexmark/matrix/bidstr_q2mod
+    - nexmark/matrix/bidstr_q10
+    - nexmark/matrix/bidstr_q14
+    - nexmark/matrix/bidstr_q22
+    - nexmark/matrix/bidstr_qex
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 8
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+    ccx_shared_source_pools: true
+    ccx_source_pool_buffers: 192
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false, sequence_shredder_mode: LOCK_FREE_FRAGMENTS }
+    input_parser:
+      uint64: TracedUINT64
+      int64: TracedINT64
+      int32: FastINT32
+      int16: TracedINT16
+      uint32: TracedUINT32
+      uint16: TracedUINT16
+      f64: EiselFloatF64
+      f32: EiselFloatF32
+      bool: TracedBOOL
+    output_formatter: { type: JSON }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+  worker_env:
+    NES_MMAP_POPULATE: '1'
+
+_series_arms: &arms
+  label: "engine"
+  explicit:
+    # --- NES-Native: native in + native out (no parse, no serialize). SIMD production
+    #     config; only data + formatters swapped. baseline = the reference upper bound.
+    - name: NES-Native
+      baseline: true
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "13,73" }
+        query_config.output_formatter: { type: NATIVE }
+        query_config.input_parser: {}
+        query_config.output_parser: {}
+    # --- NES-Naive: interpreted scalar-find CSV -> JSON, original codecs, W1/sequential,
+    #     ccx OFF, no shared pools. N independent inline pipelines.
+    - name: NES-Naive
+      overrides:
+        # W16 (NOT W1): the uncompiled formatter tasks execute on the WORKER POOL
+        # (UncompiledInputFormatterTask: "the QueryEngine concurrently executes
+        # InputFormatterTasks"), so N sources funnel through the worker pool. W1 made
+        # the interpreted+original-codec path ~16x too slow -> N>=256 blew the 3600s
+        # completion timeout. W16 matches the SIMD/Native worker-thread budget so the
+        # arms differ only in formatter+codec, not thread count. ccx/pin/pools stay OFF
+        # (SIMD-path features the uncompiled rung can't use).
+        worker.query_engine.number_of_worker_threads: 16
+        worker.query_engine.ccx_aware_task_queues: false
+        worker.query_engine.pin_threads: false
+        worker.ccx_shared_source_pools: false
+        worker.number_of_buffers_in_global_buffer_manager: 65536
+        query_config.source_type: BlockingFile
+        query_config.input_formatter: { type: SequentialUncompiledOldCSV, threading_mode: sequential }
+        query_config.output_formatter: { type: JSONUncompiled }
+        query_config.input_parser: {}
+        query_config.output_parser: {}
+        worker_env:
+          NES_INPUT_CODEC: original
+          NES_OUTPUT_CODEC: original
+
+_axis_n: &n_x
+  label: "concurrent sources/queries"
+  parameter: num_queries
+  # REVERSED: heaviest point first to de-risk before the full grid.
+  values: [1000, 256, 128]
+
+_y: &tput_y { metric: throughput_mrows_s, label: "Throughput (records/s)" }
+
+variants:
+  - name: mix
+    description: "NES Naive + Native, 10-query mix, probe N=1000/256/128 (records/s + p99 latency)"
+    query: nexmark/matrix/bidstr_q0
+    axes: { x: *n_x, series: *arms }
+    y: *tput_y
+    visualization: { type: line_chart }

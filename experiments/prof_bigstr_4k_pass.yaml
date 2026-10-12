@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: prof_bigstr_4k_pass
+  description: >
+    PROFILING window for the e2e bigstr passthrough at 4 KiB INPUT buffers (SELECT s, CSV->CSV,
+    lazy raw-forward -> the string is NOT materialised; only read+index+shredder+output-memcpy+task
+    machinery). Single cell, LOCK_FREE, 24 workers, InMemory prefill, NES_INMEM_BUFSIZE=4096,
+    operator_buffer_size=128 KiB (80 KB rows fit -> POOLED, no unpooled). repeat=400 -> long warm
+    steady window so nes-profile.sh can attach on :9099 and sample 10-15 s. Goal: decompose the REAL
+    engine per-buffer cost at 4 KiB (no isolated-harness per-buffer-PEC artifact) -> is the shredder
+    visible or masked by task lifecycle / admission / buffer machinery? Not a throughput measurement.
+    RUN: cd ~/work/piparse-bench && pkill -x main; PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/prof_bigstr_4k_pass.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  cold_read: false
+  completion_timeout_s: 1800
+  worker:
+    query_engine:
+      number_of_worker_threads: 24
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: false
+      pin_threads: false
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+    dump_compilation_result: NONE
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false, sequence_shredder_mode: LOCK_FREE }
+    output_formatter: { type: CSV }
+    input_parser: {}
+    output_parser: {}
+  generator:
+    repeat: 1
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 400
+    NES_INMEM_BUFSIZE: 4096
+    NES_TASKQUEUE_STATS: 1
+    NES_LOG_LEVEL: WARNING
+
+variants:
+  - name: bigstr_4k_lockfree_w24
+    description: "bigstr 80KB @4KiB input, LOCK_FREE, 24 workers -- long profiling window"
+    query: formatter/bigstr_pass
+    axes:
+      x:
+        label: "cell"
+        explicit:
+          - name: "prof"
+            baseline: true
+            overrides: {}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

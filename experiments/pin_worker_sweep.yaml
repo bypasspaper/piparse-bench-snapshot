@@ -1,0 +1,56 @@
+experiment:
+  name: pin_worker_sweep
+  description: >
+    Worker scaling at the pinned CCX-local config (pin_threads=true, pool 128=16 MB,
+    File passthrough warm). Two io-thread counts, all configs <=6 threads so they stay
+    within CCX0 (cores 0-5): IO=1 W=1..5, IO=2 W=1..4. Finds the knee (where workers
+    match the single io thread's supply) and whether a 2nd io thread helps a single
+    File source. Companion profiling (pidstat -t / perf) localizes the bottleneck.
+    PREDICTION: throughput rises with W then saturates ~W=3-4 at ~8.8 GB/s; IO=2 ~= IO=1
+    per worker count (a single source = one fillBuffer coroutine = one ACTIVE io thread,
+    so the 2nd io thread is idle). Bottleneck hypothesis: the single io thread's kernel
+    page-cache read-copy (_copy_to_iter), CPU-saturated ~8.8 GB/s; workers starve beyond
+    the knee; 2nd io thread has no source to read.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  worker:
+    query_engine:
+      pin_threads: true
+      invoke_mode_configuration: fnattr
+    default_query_execution: {operator_buffer_size: 131072, execution_mode: COMPILER}
+    number_of_buffers_in_global_buffer_manager: 128
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64}
+    output_formatter: {type: CSV}
+  generator: {repeat: 4, mode: burst, rate: 1000000}
+variants:
+  - name: pin_worker_sweep
+    description: "pinned pool=128, IO=1 W1-5 and IO=2 W1-4 (all within CCX0)"
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "io / worker threads"
+        explicit:
+          - {name: "IO1_W1", baseline: true, overrides: {worker.query_engine.number_of_io_threads: 1, worker.query_engine.number_of_worker_threads: 1}}
+          - {name: "IO1_W2", overrides: {worker.query_engine.number_of_io_threads: 1, worker.query_engine.number_of_worker_threads: 2}}
+          - {name: "IO1_W3", overrides: {worker.query_engine.number_of_io_threads: 1, worker.query_engine.number_of_worker_threads: 3}}
+          - {name: "IO1_W4", overrides: {worker.query_engine.number_of_io_threads: 1, worker.query_engine.number_of_worker_threads: 4}}
+          - {name: "IO1_W5", overrides: {worker.query_engine.number_of_io_threads: 1, worker.query_engine.number_of_worker_threads: 5}}
+          - {name: "IO2_W1", overrides: {worker.query_engine.number_of_io_threads: 2, worker.query_engine.number_of_worker_threads: 1}}
+          - {name: "IO2_W2", overrides: {worker.query_engine.number_of_io_threads: 2, worker.query_engine.number_of_worker_threads: 2}}
+          - {name: "IO2_W3", overrides: {worker.query_engine.number_of_io_threads: 2, worker.query_engine.number_of_worker_threads: 3}}
+          - {name: "IO2_W4", overrides: {worker.query_engine.number_of_io_threads: 2, worker.query_engine.number_of_worker_threads: 4}}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: line_chart}

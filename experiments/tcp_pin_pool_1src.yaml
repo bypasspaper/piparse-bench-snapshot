@@ -1,0 +1,72 @@
+experiment:
+  name: tcp_pin_pool_1src
+  description: >
+    Does a SINGLE asio TCP source profit from (a) a small L3-resident private buffer pool and
+    (b) thread pinning? The §44/§45 private-pool + §45B pinning/L3 wins were all measured on FILE
+    sources; this is the TCP analog, never measured before (HANDOVER §49/§50 follow-up, user Q2).
+
+    Query: bid_passthrough (4-field projection passthrough -> MonitoringSink, output_format=CSV ->
+    parse ELIDED, pure ingestion). Single TCP source, W=16/IO=1, COLD (repeat 1, no warmup), fastest
+    stack. Sweep the per-source private pool (default_max_inflight_buffers) 64 (8 MB, L3-resident) vs
+    4096 (512 MB, DRAM-spilled) x pinning off/on.
+
+    HYPOTHESIS (reasoned, unmeasured): TCP copies FRESH kernel socket data into the pool buffer every
+    time -- there is no warm source data to keep L3-resident (unlike warm File reads). So the only pool
+    benefit is the file-like one: a small reused pool keeps the COPY DESTINATION faulted/warm (avoids
+    first-touch on a 512 MB pool) -> expect small pool MODESTLY faster. Pinning: a single source uses
+    the global MPMC task queue with no affinity routing (HANDOVER §1), so pinning controls only where
+    threads run, not which worker drains which buffer -> expect LITTLE benefit (matches §42 cold
+    single-source: pinning irrelevant). Baseline: cold single asio TCP ~5.1 GB/s e2e (HANDOVER §49.1).
+
+    GOTCHAS: 1 generator, 1 client -> supply must exceed the engine (~5 GB/s); the pbench tcp-generator
+    in burst mode should. MonitoringSink throughput (proc-time window) is reliable for asio (smooth, no
+    stall -- unlike the multishot source). repeat 1 = cold/no-warmup (the user's ask).
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  completion_timeout_s: 180
+  worker:
+    query_engine:
+      number_of_io_threads: 1
+      number_of_worker_threads: 16
+      invoke_mode_configuration: fnattr
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+  query_config:
+    source_type: TCP
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64}
+    output_formatter: {type: CSV}
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: tcp_pin_pool_1src
+    description: "single cold asio TCP source, private-pool {64,4096} x pinning {off,on}"
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "private pool (buffers)"
+        parameter: worker.default_max_inflight_buffers
+        values: [64, 4096]
+      series:
+        label: "pin"
+        explicit:
+          - {name: "pin_off", baseline: true, overrides: {worker.query_engine.pin_threads: false}}
+          - {name: "pin_on", overrides: {worker.query_engine.pin_threads: true}}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

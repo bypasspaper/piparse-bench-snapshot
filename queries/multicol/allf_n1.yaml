@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+# Fig2: SELECT * over N=1 equi-width FLOAT64 (.6f) columns. Every field is *FLOAT64(1) to
+# FORCE parse+serialize of all N (defeats passthrough elision) -> real per-field work. csv->json.
+# Constant ~200MB total; bytes/row scales ~10.9*N so rows/s spans ~10x at ~constant MB/s.
+query:
+  name: multicol_allf_n1
+  description: "Fig2 field-count point: parse+serialize all 1 FLOAT64 columns (csv->json)."
+  sql: "SELECT c0 * FLOAT64(1) AS c0 FROM t"
+  # Flink dialect (2026-09-03, Fig2-on-Flink): same shape; Flink has no passthrough elision, so the
+  # *1 is symmetry only (every column is parsed by Flink's csv format and re-serialized by json).
+  flink_sql: "SELECT c0 * CAST(1 AS DOUBLE) AS c0 FROM t"
+  sources:
+    - name: t
+      schema:
+        - { name: c0, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/multicol/nf1.csv
+          size_bytes: 200000004
+          rows: 18365679
+        xlarge:
+          # nf1.csv concatenated 10x (2026-09-03, Fig2-on-Flink: JVM-length run; same bytes/row)
+          file: large/multicol/nf1_x10.csv
+          size_bytes: 2000000040
+          rows: 183656790
+  sink_schema:
+    - { name: c0, type: FLOAT64, not_null: true }

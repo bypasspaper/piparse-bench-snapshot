@@ -1,0 +1,44 @@
+query:
+  name: nexmark_q14_calc
+  description: "Nexmark q14 (reduced): computed-expression range filter on converted price (flink repo q14 minus CASE/UDF/extra)"
+
+  # Full flink q14 adds CASE(HOUR)+UDF over `extra` (fields our data lacks; engine lacks
+  # CASE). The kept core: derived-float predicate with TUNABLE selectivity via the bounds
+  # (bid_6GB price: min 100 / max ~1e8 / avg ~463K -> 0.908*price in (1e6, 5e7) selects
+  # the upper tail, ~10-15%). Our only other filters are int point-eq and int modulo -
+  # this adds arithmetic-on-float in the predicate itself.
+  sql: |
+    SELECT auctionId, bidder, price * FLOAT64(908) / FLOAT64(1000) AS price FROM bid
+    WHERE price * FLOAT64(908) / FLOAT64(1000) > FLOAT64(1000000)
+    AND price * FLOAT64(908) / FLOAT64(1000) < FLOAT64(50000000)
+
+  flink_sql: |
+    SELECT auctionId, bidder, price * CAST(908 AS DOUBLE) / CAST(1000 AS DOUBLE) AS price FROM bid
+    WHERE price * CAST(908 AS DOUBLE) / CAST(1000 AS DOUBLE) > CAST(1000000 AS DOUBLE)
+    AND price * CAST(908 AS DOUBLE) / CAST(1000 AS DOUBLE) < CAST(50000000 AS DOUBLE)
+
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/nexmark/bid_6GB.csv
+          size_bytes: 6442450944
+          rows: 183991721
+        medium:
+          file: large/nexmark/bid_1GB.csv
+          size_bytes: 1089194961
+          rows: 31300000
+        native:
+          file: large/nexmark/bid_6GB.nes
+          size_bytes: 4415801304
+          rows: 183991721
+
+  sink_schema:
+    - { name: bid.auctionId, type: INT32, not_null: true }
+    - { name: bid.bidder, type: INT32, not_null: true }
+    - { name: price, type: FLOAT64, not_null: true }

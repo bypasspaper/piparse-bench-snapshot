@@ -1,0 +1,35 @@
+experiment:
+  name: _fmt_probe
+  description: "Which compiled formatter works on SELECT* vs parseall (*1)"
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: systest
+  build: native
+  data_size: small
+  worker:
+    query_engine: { number_of_io_threads: 2, pin_threads: false, invoke_mode_configuration: default, admission_queue_size: 1024, number_of_worker_threads: 4 }
+    default_query_execution: { operator_buffer_size: 4096, execution_mode: COMPILER }
+    number_of_buffers_in_global_buffer_manager: 40000
+    dump_compilation_result: NONE
+  topology: single-node
+  query_config: { source_type: File, sink_type: Checksum, output_formatter: { type: CSV } }
+variants:
+  - name: select_star
+    query: nexmark/bid_star
+    axes:
+      x: { label: "wt", parameter: worker.query_engine.number_of_worker_threads, values: [4] }
+      series: { label: "fmt", parameter: query_config.input_formatter.type, values: [CSV, SIMDCSV, UncompiledCSV], baseline: CSV }
+    y: { metric: throughput_mbps, label: "MB/s" }
+    visualization: { type: line_chart }
+  - name: parseall
+    query: nexmark/bid_star_parseall
+    axes:
+      x: { label: "wt", parameter: worker.query_engine.number_of_worker_threads, values: [4] }
+      series: { label: "fmt", parameter: query_config.input_formatter.type, values: [CSV, SIMDCSV, UncompiledCSV], baseline: CSV }
+    y: { metric: throughput_mbps, label: "MB/s" }
+    visualization: { type: line_chart }

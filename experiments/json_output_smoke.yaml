@@ -1,0 +1,105 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: json_output_smoke
+  description: >
+    SMOKE (2026-07-13): does output_formatter type JSON work at all in the fast stack
+    (compiled JSONOutputFormatter plugin, registered in OutputFormatterRegistry as "JSON"),
+    and what is the first-order cost vs CSV output on the same csv input? One rep, small
+    data, repeat=1 - feasibility + signal only, NOT a benchmark number. Queries chosen to
+    cover the three output paths: q1_price (numeric codec path via formatAndWriteVal ->
+    to_chars/ZMIJ), bid_star (all-lazy passthrough: JSON pays per-field invoke + a
+    heap-allocated std::string "{\"name\":" prefix per field per row and DEFEATS the CSV
+    coalesced-run elision), person_star (VARSIZED: JSON escapes strings through
+    nlohmann::json().dump() per value).
+    GOTCHA: JSONOutputFormatter is the pre-optimization shape (writeValueToBuffer/strlen,
+    no run coalescing, per-field prefix string alloc) - expect it to lose big on
+    passthrough shapes; that gap is the optimization target, not a "JSON is slow" law.
+  primary_metric: processing_time_s
+  higher_is_better: false
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: small
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser:
+      uint64: TracedUINT64
+      int64: TracedINT64
+      int32: FastINT32
+      int16: TracedINT16
+      uint32: TracedUINT32
+      uint16: TracedUINT16
+      f64: EiselFloatF64
+      f32: EiselFloatF32
+      bool: TracedBOOL
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+
+_series_outfmt: &outfmt_series
+  label: "output format"
+  explicit:
+    - name: csv_out
+      baseline: true
+      overrides: {}
+    - name: json_out
+      overrides:
+        query_config.output_formatter: { type: JSON }
+
+_x: &w16_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [16]
+
+_y: &time_y { metric: processing_time_s, label: "Processing time (s)" }
+
+variants:
+  - name: q1_price_json_smoke
+    description: >
+      Q1 float codec: CSV vs JSON output, csv input. GOTCHA: data_size small = bid_653M.csv
+      is the 5-FIELD bid file. Under CRLF it failed outright ("eisel malformed", both arms);
+      since the 2026-07-14 in-place LF conversion q1 runs (only the float field parses), but
+      full-parse paths (Checksum sink) still throw. medium = bid_1GB.csv is the clean 4-field
+      file - keep using it here.
+    query: nexmark/q1_price
+    overrides: { data_size: medium }
+    axes: { x: *w16_x, series: *outfmt_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: bid_star_json_smoke
+    description: "SELECT * passthrough: CSV coalesced-lazy vs JSON per-field glue (small 653MB)"
+    query: nexmark/bid_star
+    axes: { x: *w16_x, series: *outfmt_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
+  - name: person_star_json_smoke
+    description: "VARSIZED strings: JSON nlohmann escaping path (840MB - only size person has)"
+    query: nexmark/person_star
+    overrides: { data_size: large }
+    axes: { x: *w16_x, series: *outfmt_series }
+    y: *time_y
+    visualization: { type: grouped_bar }

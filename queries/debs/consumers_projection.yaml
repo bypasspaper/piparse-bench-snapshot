@@ -1,0 +1,24 @@
+query:
+  name: debs_consumers_projection
+  description: "DEBS consumers: SELECT consumedPower / 1000 AS consumedPower"
+
+  sql: "SELECT consumedPower / FLOAT64(1000) AS consumedPower FROM consumers"
+
+  sources:
+    - name: consumers
+      schema:
+        - { name: consumerId, type: INT32, not_null: true }
+        - { name: sectorId, type: INT32, not_null: true }
+        - { name: consumedPower, type: FLOAT64, not_null: true }
+        - { name: consumerType, type: VARSIZED, not_null: true }
+        - { name: timestamp, type: UINT64, not_null: true }
+      data:
+        large:
+          file: large/debs/CONSUMERS_TOPIC_1G.csv
+          size_bytes: 1073741824
+
+  sink_schema:
+    - { name: consumedPower, type: FLOAT64, not_null: true }
+
+  validation:
+    large: { tuples: 42700000, checksum: 15336467257 }

@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: Apache-2.0
+query:
+  name: passthrough_f64
+  description: >
+    PASSTHROUGH control for the parse-vs-forward A/B. csv->json, SELECT the 15 FLOAT64 payload fields
+    UNCHANGED (no *1) -> their raw text is forwarded input->output (no parse, no re-serialize). Compare vs
+    parsergrid/mixed_float_f64 (same fields *1 = parse + re-serialize). Dataset mixed_n16.csv.
+  sql: "SELECT f1 AS f1, f2 AS f2, f3 AS f3, f4 AS f4, f5 AS f5, f6 AS f6, f7 AS f7, f8 AS f8, f9 AS f9, f10 AS f10, f11 AS f11, f12 AS f12, f13 AS f13, f14 AS f14, f15 AS f15 FROM t"
+  sources:
+    - name: t
+      schema:
+        - { name: f0, type: UINT64, not_null: true }
+        - { name: f1, type: FLOAT64, not_null: true }
+        - { name: f2, type: FLOAT64, not_null: true }
+        - { name: f3, type: FLOAT64, not_null: true }
+        - { name: f4, type: FLOAT64, not_null: true }
+        - { name: f5, type: FLOAT64, not_null: true }
+        - { name: f6, type: FLOAT64, not_null: true }
+        - { name: f7, type: FLOAT64, not_null: true }
+        - { name: f8, type: FLOAT64, not_null: true }
+        - { name: f9, type: FLOAT64, not_null: true }
+        - { name: f10, type: FLOAT64, not_null: true }
+        - { name: f11, type: FLOAT64, not_null: true }
+        - { name: f12, type: FLOAT64, not_null: true }
+        - { name: f13, type: FLOAT64, not_null: true }
+        - { name: f14, type: FLOAT64, not_null: true }
+        - { name: f15, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/multicol/mixed_n16.csv
+          size_bytes: 250000054
+  sink_schema:
+    - { name: f1, type: FLOAT64, not_null: true }
+    - { name: f2, type: FLOAT64, not_null: true }
+    - { name: f3, type: FLOAT64, not_null: true }
+    - { name: f4, type: FLOAT64, not_null: true }
+    - { name: f5, type: FLOAT64, not_null: true }
+    - { name: f6, type: FLOAT64, not_null: true }
+    - { name: f7, type: FLOAT64, not_null: true }
+    - { name: f8, type: FLOAT64, not_null: true }
+    - { name: f9, type: FLOAT64, not_null: true }
+    - { name: f10, type: FLOAT64, not_null: true }
+    - { name: f11, type: FLOAT64, not_null: true }
+    - { name: f12, type: FLOAT64, not_null: true }
+    - { name: f13, type: FLOAT64, not_null: true }
+    - { name: f14, type: FLOAT64, not_null: true }
+    - { name: f15, type: FLOAT64, not_null: true }

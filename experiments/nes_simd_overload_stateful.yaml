@@ -1,0 +1,143 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: nes_simd_overload_stateful
+  description: 'OVERLOAD RETAKE (2026-10-05). Optimised NES arm of the per-query tier as a same-session A/B: NES-SIMD
+    = verbatim the 5-arm NES-SIMD arm (these defaults + MmapFile (repeat 1, event-time windows)) with lazy overloads
+    OFF = the engine default every tier and ladder silently ran with; NES-SIMD-ovl = identical + pbench overload:
+    true (INPUT_FORMATTER.LAZY_INT/UINT/FLOAT_OVERLOADS). Audit 2026-10-05: no per-query tier or scaling ladder
+    on either box ever set the knob; the Sept Fig1/Fig2 teasers did. Expected: q2_og moves unless at the memory
+    ceiling (Aug-14 q2_og already matched native at W23); q_ex / cm_q2 minor; VARSIZED == is always overloaded;
+    q14 / q2_mod cannot be. Built from naive_corrected_stateful.yaml (same defaults, anchors expanded) with the
+    NES-Naive series replaced. Runner: results/run_tr_ovl.sh (held until the Pi A/B finished).'
+  primary_metric: throughput_mrows_s
+  higher_is_better: true
+  repetitions: 10
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  worker:
+    query_engine:
+      number_of_worker_threads: 23
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter:
+      type: SIMDCSV
+      allow_commas_in_strings: false
+    input_parser:
+      uint64: TracedUINT64
+      int64: TracedINT64
+      int32: FastINT32
+      int16: TracedINT16
+      uint32: TracedUINT32
+      uint16: TracedUINT16
+      f64: EiselFloatF64
+      f32: EiselFloatF32
+      bool: TracedBOOL
+    output_formatter:
+      type: JSON
+    output_parser:
+      f64: ZMIJF64
+      f32: ZMIJF32
+  generator:
+    repeat: 1
+  worker_env:
+    NES_MMAP_POPULATE: '1'
+variants:
+- name: ysb_1k_varsized
+  description: YSB varsized 1k, tumble 30s count per campaign (input-bound pole)
+  query: yahoo/ysb_1k_varsized
+  overrides:
+    data_size: xlarge
+  axes:
+    x:
+      label: worker threads
+      parameter: worker.query_engine.number_of_worker_threads
+      values:
+      - 23
+    series:
+      label: engine
+      explicit:
+      - name: NES-SIMD
+        baseline: true
+        overrides:
+          query_config.source_type: MmapFile
+      - name: NES-SIMD-ovl
+        overrides:
+          query_config.source_type: MmapFile
+          overload: true
+  y:
+    metric: throughput_mrows_s
+    label: Throughput (records/s)
+  visualization:
+    type: grouped_bar
+- name: q8_join
+  description: 'Nexmark Q8: person JOIN auction, tumble 10s (state-dominated pole)'
+  query: nexmark/q8_join
+  overrides:
+    worker.default_query_execution.operator_buffer_size: 4096
+    worker.number_of_buffers_in_global_buffer_manager: 2000000
+  axes:
+    x:
+      label: worker threads
+      parameter: worker.query_engine.number_of_worker_threads
+      values:
+      - 23
+    series:
+      label: engine
+      explicit:
+      - name: NES-SIMD
+        baseline: true
+        overrides:
+          query_config.source_type: MmapFile
+      - name: NES-SIMD-ovl
+        overrides:
+          query_config.source_type: MmapFile
+          overload: true
+  y:
+    metric: throughput_mrows_s
+    label: Throughput (records/s)
+  visualization:
+    type: grouped_bar
+- name: cm_q2
+  description: 'ClusterMonitoring Q2: sliding 60s/1s SUM(cpu) by jobId, eventType=3 (middle)'
+  query: cluster_monitoring/q2_original
+  axes:
+    x:
+      label: worker threads
+      parameter: worker.query_engine.number_of_worker_threads
+      values:
+      - 23
+    series:
+      label: engine
+      explicit:
+      - name: NES-SIMD
+        baseline: true
+        overrides:
+          query_config.source_type: MmapFile
+      - name: NES-SIMD-ovl
+        overrides:
+          query_config.source_type: MmapFile
+          overload: true
+  y:
+    metric: throughput_mrows_s
+    label: Throughput (records/s)
+  visualization:
+    type: grouped_bar

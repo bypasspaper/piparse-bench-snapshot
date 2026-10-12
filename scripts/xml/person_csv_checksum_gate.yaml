@@ -1,0 +1,43 @@
+# REFERENCE ARM for the person XML gate: same SELECT over the source CSV through SIMDCSV
+# into the identical Checksum sink config.
+query: SELECT id, name, email_address, credit_card, city, state, timestamp, extra FROM person INTO chk
+logical:
+  - name: person
+    schema:
+      - { name: id, type: INT32 }
+      - { name: name, type: VARSIZED }
+      - { name: email_address, type: VARSIZED }
+      - { name: credit_card, type: VARSIZED }
+      - { name: city, type: VARSIZED }
+      - { name: state, type: VARSIZED }
+      - { name: timestamp, type: UINT64 }
+      - { name: extra, type: VARSIZED }
+physical:
+  - logical: person
+    type: File
+    host: "localhost:8080"
+    parser_config:
+      type: SIMDCSV
+    source_config:
+      file_path: __TESTDATA__/large/nexmark/person_840MB.csv
+sinks:
+  - name: chk
+    type: Checksum
+    host: "localhost:8080"
+    schema:
+      - { name: person$id, type: INT32 }
+      - { name: person$name, type: VARSIZED }
+      - { name: person$email_address, type: VARSIZED }
+      - { name: person$credit_card, type: VARSIZED }
+      - { name: person$city, type: VARSIZED }
+      - { name: person$state, type: VARSIZED }
+      - { name: person$timestamp, type: UINT64 }
+      - { name: person$extra, type: VARSIZED }
+    config:
+      file_path: __OUTPUT__
+      legacy_output_format: CSV
+    ## the nes-cli Sink decoder requires the key even when empty
+    parser_config: {}
+workers:
+  - host: "localhost:8080"
+    max_operators: 10000

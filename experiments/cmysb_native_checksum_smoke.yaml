@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: cmysb_native_checksum_smoke
+  # CORRECTNESS smoke for cmysb_native_vs_csv (not a benchmark): arm-vs-arm CHECKSUM equality
+  # for ClusterMonitoring Q2 (original + lightsaber) and YSB (1k + 10k campaigns), csv fast
+  # stack vs SystemNative, worker-cli Checksum sink. All four queries are event-time windowed
+  # aggregations -> generator.repeat MUST stay 1 (replay wraps event time backward).
+  #
+  # EXPECT: counts equal per query across arms; checksums equal (no varsized cols anywhere, no
+  # \r asymmetry: the csv arm reads the _lf copies / the LF original file). vs the RECORDED
+  # catalog values (systest provenance): counts must match; checksum comparability across
+  # harnesses is uncertain for the FLOAT totalCpu queries (sink-side materialization vs
+  # systest-fused formatting can differ per-row) - arm-vs-arm equality is the gate, catalog
+  # equality is a bonus. YSB output is all-integer -> catalog checksums should match exactly.
+  #
+  # GOTCHAS: cm_q2_original has a BOOLEAN col -> DefaultBOOL CRASHES the release worker
+  # (SIGABRT, JIT "__emutls_v" symbols-not-found: the default parser's static/thread_local
+  # diagnostics can't inline under the inline-enabled release JIT; non-passthrough queries
+  # parse ALL fields, so the unused bool still runs). Fixed by the TracedBOOL plugin
+  # (first-byte decision, added to TracedIntegerInputParsers this session) -> bool:
+  # TracedBOOL below. File is LF so no \r trap on that column. lightsaber/ysb csv arms MUST
+  # use the _lf files (catalog now points there); the CM windows are SLIDING 60s/1s ->
+  # 3.09M/3.4K output rows; float SUM checksums are deterministic per the .test's own note
+  # (f64 chosen for determinism; lightsaber f32 recorded stable).
+  # RESULTS (2026-07-13, 8/8 ok after the TracedBOOL fix; first attempt crashed the
+  # cm_q2_original csv arm exactly as the gotcha above describes):
+  #   ysb_1k  csv=native= 167167,232106578   = EXACT catalog match (both arms certified)
+  #   ysb_10k csv=native= 1517953,2109797738 = EXACT catalog match (both arms certified)
+  #   cm_q2_lightsaber csv=native= 3403,8168721 (arm-EQUAL; catalog recorded 7612888 from
+  #     systest = cross-harness f32-output formatting difference, count matches)
+  #   cm_q2_original: counts EQUAL 3094778 (= catalog); checksums differ BETWEEN RUNS EVEN
+  #     WITHIN ONE ARM (csv 7861063389, native 7860785066 / 7860720364 across two runs):
+  #     the f64 SUM(cpu) is combine-order nondeterministic at W16 and ZMIJ shortest-form
+  #     prints the noisy LSBs; f32 (lightsaber) is stable because shortest-form f32 rounds
+  #     the noise away. Count equality + float-LSB-only drift = arms functionally equal.
+  description: "SMOKE: arm-vs-arm checksum equality, CM Q2 x2 + YSB x2, worker-cli Checksum sink"
+  primary_metric: processing_time_s
+  higher_is_better: false
+  repetitions: 1
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  completion_timeout_s: 600
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Checksum
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser:
+      uint64: TracedUINT64
+      int64: TracedINT64
+      int16: TracedINT16
+      uint32: TracedUINT32
+      uint16: TracedUINT16
+      f64: EiselFloatF64
+      f32: EiselFloatF32
+      bool: TracedBOOL
+  generator:
+    repeat: 1
+
+_series: &format_series
+  label: "input format"
+  explicit:
+    - name: csv_optimized
+      baseline: true
+      overrides: {}
+    - name: native
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "16" }
+        query_config.input_parser: {}
+
+_axes_x: &w16_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [16]
+
+_y: &time_y { metric: processing_time_s, label: "Processing time (s)" }
+
+variants:
+  - name: cm_q2_original
+    query: cluster_monitoring/q2_original
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+  - name: cm_q2_lightsaber
+    query: cluster_monitoring/q2_lightsaber
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+  - name: ysb_1k
+    query: yahoo/ysb_1k
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y
+  - name: ysb_10k
+    query: yahoo/ysb_10k
+    axes: { x: *w16_x, series: *format_series }
+    y: *time_y

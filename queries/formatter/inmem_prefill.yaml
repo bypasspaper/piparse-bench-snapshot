@@ -1,0 +1,66 @@
+# InMemory PREFILL source — the engine's source+formatter ceiling, decoupled from
+# disk and from the producer memcpy.
+#
+# WHAT THIS IS: TYPE InMemory + env NES_INMEM_PREFILL=1 makes the source read the
+# whole CSV into a private pool of ready TupleBuffers *in its ctor* (OUTSIDE the
+# timed window), then the blocking BlockingSourceRunner hands those source-owned
+# buffers straight to emit() — no pool-acquire, no fillTupleBuffer, no producer
+# memcpy. So the measured window is pure engine: scan-dispatch + JIT pipeline
+# (SIMDCSV index + TracedUINT64 parse of the projected column) + sink. This is the
+# "prefill" rung from 1_isolated_to_engine — it isolates the engine/formatter from
+# every source-supply cost (disk QD1 latency, page-cache copy, producer handoff).
+#
+# SINK = Void (projVoid): emit runs but the sink discards. This matches the OLD
+# prefill baseline (FormatterInMemory.test:2). Do NOT switch to Checksum here — the
+# checksum sink serializes key->CSV and would make this OUTPUT-format-bound, a
+# different (much lower) number that no longer measures the source+scan ceiling.
+# Correctness of the prefill delivery is gated separately by the committed
+# nes-systests/benchmark/FormatterInMemory.test:1 (Checksum, must equal the
+# File/SIMDCSV result 143128260 / 15104504004 — byte-identical delivery).
+#
+# REQUIRES (set via the experiment's `env:` block, forwarded by the systest runner):
+#   NES_INMEM_PREFILL=1   — enable the prefill path (else InMemory falls back to the
+#                           per-buffer memcpy producer = the ~8.5 GB/s plateau, NOT this)
+#   NES_INMEM_REPEAT=N    — loop the prefilled buffers N passes (copy semantics) so the
+#                           timed window is N passes long. WITHOUT this the window is a
+#                           single ~0.16s pass at high W = pure pipeline ramp -> the
+#                           number COLLAPSES with worker count (a measurement artifact,
+#                           not the engine). N>=80 gives a steady-state (>1s) window.
+#   NES_INMEM_BUFSIZE     — prefill granularity (default 128 KiB; leave at the operator
+#                           buffer size). NOTE: operator_buffer_size does NOT change the
+#                           prefill input buffer size — only NES_INMEM_BUFSIZE does.
+#
+# ⚠️ THROUGHPUT CORRECTION (load-bearing): systest -b / nes-bench-runner compute
+# bytesPerSecond from the INPUT FILE SIZE (5.368 GB) and are BLIND to NES_INMEM_REPEAT.
+# The raw reported number is therefore 1/N of the truth (~648 MB/s @24w looks like a
+# cliff — it is not). The systest runner multiplies throughput_mbps by NES_INMEM_REPEAT
+# to recover the real rate (REPEAT x 5.368 GB / engine-window-seconds). If you read the
+# raw bench-runner line instead, apply the x N yourself.
+query:
+  name: formatter_inmem_prefill
+  description: "InMemory prefill: SELECT key FROM mem5 -> Void (source+formatter ceiling)"
+
+  sql: "SELECT key FROM mem5"
+
+  sources:
+    - name: mem5
+      schema:
+        - { name: creationTS, type: UINT64, not_null: true }
+        - { name: key,        type: UINT64, not_null: true }
+        - { name: v1,         type: UINT64, not_null: true }
+        - { name: v2,         type: UINT64, not_null: true }
+        - { name: v3,         type: UINT64, not_null: true }
+      data:
+        large:
+          file: large/formatter/bench_5xUINT64_5g.csv
+          size_bytes: 5368801906
+        small:
+          file: large/formatter/bench_5xUINT64_512m.csv
+          size_bytes: 536880336
+
+  sink_schema:
+    - { name: mem5.key, type: UINT64, not_null: true }
+
+  # Void sink produces no output rows -> no checksum gate here (see header; gated by
+  # the committed FormatterInMemory.test:1). Empty validation = systest expects 0 rows.
+  validation: {}

@@ -1,0 +1,87 @@
+experiment:
+  name: latency_flink_passthrough_scaling
+  # ============================================================================================
+  # FLINK bid-passthrough e2e LATENCY vs source count — the fair Flink counterpart to the NES
+  # file-source scaling green curve (shredder_fragments_source_scaling / lock_free_fragments:
+  # CCX cells + fragment shredder, bid passthrough, warm cache). "Run the query N times" = N
+  # independent source->project->sink pipelines run concurrently in one Flink job (StatementSet),
+  # each at parallelism 1 (a single non-splittable CSV = one reader anyway), with N task slots.
+  #
+  # Latency = full ingest->sink path (read + Flink's NATIVE csv parse + source->task queue +
+  # projection + sink), stamped at readBatch() start via the csv-latency delegating format and
+  # pooled EXACTLY across all N pipelines' sinks. Flink's per-fetch batch is aligned to NES's
+  # operator_buffer_size so the per-batch vs per-TupleBuffer stamp granularity matches.
+  #
+  # WORKLOAD NOTE: NES elides the parse on passthrough (byte-copy, ~9.7 GB/s); Flink always parses
+  # CSV. The comparison is the identical ingest->sink measurement METHODOLOGY, not equal per-row
+  # work — Flink's latency/throughput carry the parse cost by construction.
+  #
+  # NES BASELINE to compare against (recorded lock_free_fragments, ms):
+  #   N=1  p50 0.049 / p99 0.151 / p999 1.245, 9.7 GB/s
+  #   N=8  p50 1.41  / p99 2.13  / p999 3.34,  38.8 GB/s
+  #
+  # RUN: pbench run experiments/latency_flink_passthrough_scaling.yaml \
+  #        --build-dir <repo>/cmake-build-release
+  #   (dd bid_1GB first to warm the page cache. Flink-only, no worker needed.)
+  #
+  # RESULT — FULL 1->1024 SWEEP (2026-07-15, 1-rep, ms; NES = recorded lock_free_fragments,
+  # N=1024 from the certified shredder_fragments_n1024_timerwait/throughput runs):
+  #   N     NES p50/p99/p999  GB/s | Flink p50/p99/p999    GB/s
+  #   1     0.05/0.15/1.2     9.7  | 1.30/2.76/10.1        0.10
+  #   8     1.41/2.13/3.3     38.8 | 1.36/3.32/22.1        0.75
+  #   16    2.03/3.12/4.6     39.3 | 1.55/3.90/41.8        1.35
+  #   32    2.23/3.83/5.7     40.7 | 2.95/6.74/32.9        1.38
+  #   64    2.23/4.19/5.6     41.5 | 4.00/37.8/94.7        1.45
+  #   128   2.29/3.98/5.8     39.5 | 5.41/181.7/296        1.14
+  #   256   2.29/3.94/5.5     40.6 | 3.78/195.5/404        1.46
+  #   512   2.30/3.95/5.8     39.8 | 3.66/496.3/1263       1.44
+  #   1024  2.38/4.09/5.62    39.0 | 3.53/1197.7/3142     1.40
+  #   (NES N=1024 = the CERTIFIED plateau config: shredder_fragments_n1024_pool_ladder, 192x128KiB
+  #    pool + timer wait; NES held BOTH ~39 GB/s AND p99 ~4 ms at 1024. Do NOT use the
+  #    n1024_timerwait median = suboptimal-pool configs (256x128K L3-tax / undersized) at 24-32 GB/s.)
+  #   HEADLINE: NES (CCX cells + fragment shredder) holds p99 BOUNDED ~4 ms FLAT from N=8 to
+  #   N=1024 (Little's law on the fixed 16-worker shared pool), ~40 GB/s. Flink's TAIL COLLAPSES
+  #   once #pipelines exceeds the core count (~N=32-64): p99 3.9->37.8->181.7->1197.7 ms
+  #   (N=16->64->128->1024), p999 -> 3.1 s. Flink has NO shared-pool multiplexing -- each
+  #   concurrent pipeline needs its own slot + fetcher/task threads, so N pipelines ~= 2N threads
+  #   oversubscribing 24 cores -> HOL/scheduling jitter (same as the C10K blocking-file collapse).
+  #   Flink p50 stays LOW (~3.5 ms even at 1024) -- purely a tail phenomenon. At N=1024 Flink p99
+  #   ~= 150-240x NES, at ~20x lower throughput. Flink plays the role of the figure's pre-CCX
+  #   "q1-parse campaign" blowup (363 ms @1000). Throughput plateaus at the 24-core parse ceiling
+  #   ~1.4 GB/s from N=16.
+  # ============================================================================================
+  description: "Flink bid-passthrough e2e latency vs source count (1..1024) — fair vs NES green curve"
+  primary_metric: p99_latency_us
+  higher_is_better: false
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: flink
+  mode: flink
+  build: native
+  data_size: medium
+  topology: single-node
+  flink_execution_mode: streaming
+  flink_output_format: latency
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+    default_query_execution:
+      operator_buffer_size: 131072
+
+variants:
+  - name: passthrough_latency
+    description: "bid passthrough e2e latency, N concurrent Flink pipelines"
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "Concurrent pipelines (= sources)"
+        parameter: num_queries
+        values: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+      series:
+        label: "engine"
+        explicit:
+          - {name: Flink, baseline: true, overrides: {}}
+    y: {metric: p99_latency_us, label: "p99 latency (us)"}
+    visualization: {type: line_chart, x_scale: log}

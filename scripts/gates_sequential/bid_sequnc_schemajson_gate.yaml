@@ -1,0 +1,46 @@
+# SEQUENTIAL-RUNG GATE (r-base SchemaJSON): derived from the proven parallel gate; same schema,
+# same 5-field projection, same Checksum sink -> must reproduce 31300000,269477267979.
+# Sequential/uncompiled rungs need BlockingFile + threading_mode SEQUENTIAL.
+# REFERENCE ARM for the XML gate: the same SELECT over the source CSV through SIMDCSV into
+# the identical Checksum sink config. At full scale this reproduces the known cross-format
+# anchor (count 31300000, checksum 269477267979); its real job is producing the reference
+# checksum for ROW SLICES (e.g. the 100-row phase-0 proof), where no precomputed value exists.
+# Keep the sink config byte-identical to bid_xml_checksum_gate.yaml -- the comparison is only
+# meaningful if both arms materialize through the same legacy CSV path.
+query: SELECT auctionId, bidder, price, channel, url FROM bid INTO bidChecksum
+logical:
+  - name: bid
+    schema:
+      - { name: timestamp, type: UINT64 }
+      - { name: auctionId, type: INT32 }
+      - { name: bidder, type: INT32 }
+      - { name: price, type: FLOAT64 }
+      - { name: channel, type: VARSIZED }
+      - { name: url, type: VARSIZED }
+physical:
+  - logical: bid
+    type: BlockingFile
+    host: "localhost:8080"
+    parser_config:
+      type: SequentialUncompiledSchemaJSON
+      threading_mode: SEQUENTIAL
+    source_config:
+      file_path: __TESTDATA__/large/nexmark/bid_strings_3GB.json
+sinks:
+  - name: bidChecksum
+    type: Checksum
+    host: "localhost:8080"
+    schema:
+      - { name: bid$auctionId, type: INT32 }
+      - { name: bid$bidder, type: INT32 }
+      - { name: bid$price, type: FLOAT64 }
+      - { name: bid$channel, type: VARSIZED }
+      - { name: bid$url, type: VARSIZED }
+    config:
+      file_path: __OUTPUT__
+      legacy_output_format: CSV
+    ## the nes-cli Sink decoder requires the key even when empty
+    parser_config: {}
+workers:
+  - host: "localhost:8080"
+    max_operators: 10000

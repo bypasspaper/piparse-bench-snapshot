@@ -1,0 +1,64 @@
+# SEQUENTIAL-RUNG GATE (r-base HL7): derived from the proven parallel gate; same schema,
+# same 5-field projection, same Checksum sink -> must reproduce 31300000,269477267979.
+# Sequential/uncompiled rungs need BlockingFile + threading_mode SEQUENTIAL.
+# CORRECTNESS GATE: the HL7 arm must reproduce the cross-format bid passthrough checksum.
+# SELECT auctionId, bidder, price, channel, url over bid_strings_3GB.hl7 (SIMDHL7 input,
+# subcomponent '&' disabled -- see bid_hl7_passthrough.yaml) into the Checksum sink with
+# legacy CSV materialization -- the exact sink config pbench's Checksum runs use, so the
+# result is comparable with the known json/schemajson/csv values:
+#   count 31300000, checksum 269477267979  (json_schemajson_smoke "pass" gate)
+# A match proves the generated HL7 dataset AND the HL7 input indexer end-to-end at full scale.
+query: SELECT auctionId, bidder, price, channel, url FROM bid INTO bidChecksum
+logical:
+  - name: bid
+    schema:
+      - { name: h01, type: VARSIZED }
+      - { name: h02, type: VARSIZED }
+      - { name: h03, type: VARSIZED }
+      - { name: h04, type: VARSIZED }
+      - { name: h05, type: VARSIZED }
+      - { name: h06, type: VARSIZED }
+      - { name: h07, type: VARSIZED }
+      - { name: h08, type: VARSIZED }
+      - { name: h09, type: VARSIZED }
+      - { name: h10, type: VARSIZED }
+      - { name: h11, type: VARSIZED }
+      - { name: h12, type: VARSIZED }
+      - { name: h13, type: VARSIZED }
+      - { name: h14, type: VARSIZED }
+      - { name: seg, type: VARSIZED }
+      - { name: timestamp, type: UINT64 }
+      - { name: auctionId, type: INT32 }
+      - { name: bidder, type: INT32 }
+      - { name: price, type: FLOAT64 }
+      - { name: channel, type: VARSIZED }
+      - { name: url, type: VARSIZED }
+      - { name: pad, type: VARSIZED }
+physical:
+  - logical: bid
+    type: BlockingFile
+    host: "localhost:8080"
+    parser_config:
+      type: SequentialUncompiledHL7
+      threading_mode: SEQUENTIAL
+      subcomponent_delimiter: ""
+    source_config:
+      file_path: __TESTDATA__/large/nexmark/bid_strings_3GB.hl7
+sinks:
+  - name: bidChecksum
+    type: Checksum
+    host: "localhost:8080"
+    schema:
+      - { name: bid$auctionId, type: INT32 }
+      - { name: bid$bidder, type: INT32 }
+      - { name: bid$price, type: FLOAT64 }
+      - { name: bid$channel, type: VARSIZED }
+      - { name: bid$url, type: VARSIZED }
+    config:
+      file_path: __OUTPUT__
+      legacy_output_format: CSV
+    ## the nes-cli Sink decoder requires the key even when empty
+    parser_config: {}
+workers:
+  - host: "localhost:8080"
+    max_operators: 10000

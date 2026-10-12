@@ -1,0 +1,175 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: q2_gvn_dedup
+  description: >
+    GVN parse-dedup microbenchmark: NEXMark q2_original (SELECT auctionId, price FROM bid WHERE
+    auctionId == c1 OR ... OR ck) over a sweep of the number of OR terms k (1,2,3,4,5,6,8,10),
+    CSV->JSON, InMemory prefill, W1. auctionId is a LAZY int; each `==` use-site re-emits the SAME
+    opaque parse invoke (parseWithFastInt<int32>), so a k-way OR emits k identical parse invokes.
+    Data auctionId in [1e6,9e6); OR constants all <1e6 => 0% match => every row traverses the full
+    chain and does exactly k int-parses (no-dedup arm) vs 1 (GVN-dedup arm). The two arms differ in
+    EXACTLY ONE knob:
+      * no_dedup_default: invoke_mode_configuration=default -> parse invokes are opaque/may-write/
+        may-throw -> GVN cannot prove them equal -> k parses/row survive.
+      * gvn_dedup_fnattr: invoke_mode_configuration=fnattr (ref/will_return/no_unwind) -> the invokes
+        become readonly + speculatable -> GVN collapses the k identical parses to 1/row.
+    overload MUST stay OFF (LAZY_*_OVERLOADS rewrites == into raw-byte compare => 0 parses, erasing
+    the measurement); inline_invoke_calls OFF (keeps input_parse an opaque proxy; inlining it is the
+    separate -2.9x GVN-hostile result). No DISABLE_PASSTHROUGH -- the measured parse is in the FILTER,
+    not the output; 0% match => ~empty output => output format is irrelevant.
+    Expectation: gvn_dedup_fnattr ~flat in k; no_dedup_default throughput ~ 1/(fixed + k*c); the
+    ratio is ~1x at k=1 and rises through ~2.7x at k=5 (classic q2) and beyond. Contrast the hoisting
+    microbench, where fnattr was ~1% (neutral) -- here fnattr is THE lever.
+    RUN: cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/q2_gvn_dedup.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 5
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: default
+      inline_invoke_calls: false
+      trace_constant_bytes: false
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+    output_formatter: { type: JSON }
+    input_parser: { uint64: FastUINT64, int32: FastINT32, f64: EiselFloatF64 }
+    output_parser: { f64: ZMIJF64 }
+  generator:
+    repeat: 5
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 5
+    NES_INMEM_BUFSIZE: 131072
+
+_arms: &arms
+  label: "arm"
+  explicit:
+    - name: no_dedup_default
+      baseline: true
+      overrides:
+        query_config.source_type: InMemory
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: { uint64: FastUINT64, int32: FastINT32, f64: EiselFloatF64 }
+        query_config.output_parser: { f64: ZMIJF64 }
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: default
+        worker.query_engine.inline_invoke_calls: false
+        worker.query_engine.trace_constant_bytes: false
+        overload: false
+        generator.repeat: 5
+    - name: gvn_dedup_fnattr
+      overrides:
+        query_config.source_type: InMemory
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: { uint64: FastUINT64, int32: FastINT32, f64: EiselFloatF64 }
+        query_config.output_parser: { f64: ZMIJF64 }
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: fnattr
+        worker.query_engine.inline_invoke_calls: false
+        worker.query_engine.trace_constant_bytes: false
+        overload: false
+        generator.repeat: 5
+    # 3rd arm: fnattr PLUS NES_ASSUME_VALID_SPANS=1 (skip the missing-field null-span sentinel at trace
+    # time for CSV, which always passes a valid span). Removing that per-parseValue() `icmp eq ptr,null`
+    # guard folds the diamond that stranded the last term's parse, so GVN collapses the whole k-way OR to
+    # ONE parse + a switch/SIMD over all k constants (IR-verified: hot-path parses 2 -> 1). CSV/native only
+    # -- MUST NOT be set for JSON input (the sentinel raises ERROR 2004 for a used missing field).
+    - name: gvn_dedup_fnattr_nonnull
+      overrides:
+        query_config.source_type: InMemory
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: { uint64: FastUINT64, int32: FastINT32, f64: EiselFloatF64 }
+        query_config.output_parser: { f64: ZMIJF64 }
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: fnattr
+        worker.query_engine.inline_invoke_calls: false
+        worker.query_engine.trace_constant_bytes: false
+        worker_env.NES_ASSUME_VALID_SPANS: "1"
+        overload: false
+        generator.repeat: 5
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s)" }
+
+variants:
+  - name: k01
+    description: "1-way OR (anchor: 1 parse both arms)"
+    query: q2gvn/k01
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k02
+    description: "2-way OR"
+    query: q2gvn/k02
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k03
+    description: "3-way OR"
+    query: q2gvn/k03
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k04
+    description: "4-way OR"
+    query: q2gvn/k04
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k05
+    description: "5-way OR (classic NEXMark q2_original)"
+    query: q2gvn/k05
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k06
+    description: "6-way OR"
+    query: q2gvn/k06
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k08
+    description: "8-way OR"
+    query: q2gvn/k08
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: k10
+    description: "10-way OR"
+    query: q2gvn/k10
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }

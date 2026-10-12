@@ -1,0 +1,135 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: cmysb_repeat_probe
+  description: >
+    STEADY-STATE companion to cmysb_native_vs_csv: the honest input-side csv-vs-native ratio.
+    Problem: all four CM/YSB queries are event-time windowed, so single-pass runs on 0.5-1.5GB
+    files have sub-2s wall spans = ramp-inflated (the v2 protocol solved this for stateless
+    nexmark with repeat=24, but replay wraps event time backward on stateful queries).
+    IDEA UNDER TEST: wrapped-time replay is ACCEPTABLE for the INPUT-side comparison - late
+    rows still pay SIMD index + parse + filter in the fused ingestion pipeline and are only
+    discarded at slice assignment (watermark), and the discarded window work is
+    format-INVARIANT anyway. The probe therefore measures the format gap on a long warm
+    window; absolute Mr/s is an input-side number, NOT comparable to the single-pass suite
+    numbers (state work amortizes away over repeats).
+
+    SEMANTICS GATE (repeat_semantics variant, runs first): ysb_1k csv with repeat=4 +
+    Checksum sink. Decision rule: count==167167 -> replayed rows all late-dropped, probe
+    fully valid; count ~ 4x -> watermarks are lenient on replay (each pass re-runs window
+    work too - probe still valid for the input-side ratio since that term is
+    format-invariant, but absolute rates include window work every pass); hang or crash ->
+    watermark wrap breaks the operator, probe DEAD, only single-pass numbers exist.
+    Interpret the steady variants ONLY after this gate's actual count is recorded here.
+
+    RESULTS (2026-07-13): PROBE DEAD - the worst branch of the decision rule. 19/21 runs
+    KILLED THE WORKER: SIGSEGV storms + "malloc(): unsorted double linked list corrupted"
+    + exit -6 across csv AND native arms, ysb AND cm variants. Wrapped event time on
+    stateful windows is not late-dropped OR leniently re-windowed - it CORRUPTS THE HEAP
+    (engine bug, worth a minimal repro + issue: File source NES_FILE_REPEAT>1 into any
+    event-time window aggregation on this branch). The 2 surviving gate reps (repeat=4,
+    Checksum) returned counts 646729 / 646421 vs 167167 single-pass: ~4x minus a
+    NON-DETERMINISTIC ~22K sliver (replayed rows re-enter windows; wrap boundaries lose a
+    variable set; third gate rep crashed). Even absent the crash the semantics would be
+    unusable for a controlled comparison. DO NOT RE-RUN; steady-state numbers come from
+    genuinely extended files with forward-shifted timestamps (ysb_1k_ext24 experiment).
+
+    GOTCHAS: everything from cmysb_native_vs_csv (fast stack incl TracedBOOL, _lf files,
+    string_length for SystemNative) plus: Monitoring-sink throughput on repeat runs is
+    wall-span based (long window = honest); repeat sized per file for ~10-20s windows at the
+    expected rates (ysb ~x24 on 0.5GB, cm_original ~x12 on 1.5GB; lightsaber excluded - 1MB
+    would need x10000).
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser:
+      uint64: TracedUINT64
+      int64: TracedINT64
+      int16: TracedINT16
+      uint32: TracedUINT32
+      uint16: TracedUINT16
+      f64: EiselFloatF64
+      f32: EiselFloatF32
+      bool: TracedBOOL
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 24
+
+_series: &format_series
+  label: "input format"
+  explicit:
+    - name: csv_optimized
+      baseline: true
+      overrides: {}
+    - name: native
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "16" }
+        query_config.input_parser: {}
+
+_axes_x: &w16_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [16]
+
+_y: &tp_y { metric: throughput_mbps, label: "Aggregate Throughput (MB/s of own input)" }
+
+variants:
+  - name: repeat_semantics
+    description: "GATE: ysb_1k csv repeat=4 + Checksum; count==167167 proves late-drop on replay"
+    query: yahoo/ysb_1k
+    overrides:
+      query_config.sink_type: Checksum
+      generator.repeat: 4
+    axes:
+      x: *w16_x
+    y: { metric: processing_time_s, label: "Processing time (s)" }
+    repetitions: 1
+
+  - name: ysb_1k_steady
+    query: yahoo/ysb_1k
+    axes: { x: *w16_x, series: *format_series }
+    y: *tp_y
+    visualization: { type: grouped_bar }
+
+  - name: ysb_10k_steady
+    query: yahoo/ysb_10k
+    axes: { x: *w16_x, series: *format_series }
+    y: *tp_y
+    visualization: { type: grouped_bar }
+
+  - name: cm_original_steady
+    query: cluster_monitoring/q2_original
+    overrides:
+      generator.repeat: 12
+    axes: { x: *w16_x, series: *format_series }
+    y: *tp_y
+    visualization: { type: grouped_bar }

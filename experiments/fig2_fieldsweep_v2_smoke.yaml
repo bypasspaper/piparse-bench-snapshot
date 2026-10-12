@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: fig2_fieldsweep_v2_smoke
+  description: >
+    SMOKE for fig2_fieldsweep_v2 (1 rep, N=1,4 only; gates: naive runs on FLOAT64-only schema, eager != lazy,
+    eager pass_n4 ~= allf_n4, allf_n4 ~= 2026-08-19 (308 MB/s, 7.1 Mrows/s)). Full description follows.
+    Fig2 v2 (2026-09-25): rows/s-vs-MB/s field sweep (N=1..10 equi-width FLOAT64 columns, ~200 MB each,
+    csv->json, InMemory prefill W1) on THREE NebulaStream rungs measured in ONE session on ONE binary, plus an
+    anchor. Purpose: (a) replace the 2026-08-19 Fig2 NES line (which was the compiled fast arm = a partial
+    sneak peek) with an honest NAIVE baseline for the Sec.2 motivation, and (b) add the fully-optimised
+    LAZY rung as the Sec.2 teaser; the compiled-EAGER rung is the evaluation's intermediate.
+    Query text is the SAME plain projection (multicol/pass_nN = SELECT c0..cN-1) on every rung; rungs differ
+    only by knobs:
+      naive          = SequentialUncompiledOldCSV (scalar interpreted indexer) + JSONUncompiled +
+                       NES_INPUT_CODEC=original (stod) + NES_OUTPUT_CODEC=original (stringstream) +
+                       EMPTY parser overrides (the uncompiled path hardcodes codecs; an EiselF64 override
+                       crashes the integer parse). == the Fig1 naive arm and the 5-arm 'NES-Naive'.
+      compiled_eager = SequentialCSV + JSON, fast codecs, INPUT_FORMATTER.eager_parse=true -> every
+                       field materialised at scan and re-serialised (no passthrough). Expected == allf_nN.
+      compiled_lazy  = SequentialCSV + JSON, fast codecs, defaults -> every field is a raw-span passthrough
+                       (index + copy + JSON key; no float parse/format). The teaser line.
+      anchor_allf    = the ORIGINAL allf_nN (c*FLOAT64(1)) on the compiled default path. Two gates:
+                       (1) within +-5% of the 2026-08-19 numbers (MB/s 322/327/318/308/319/302/308/301/301/303,
+                       Mrows/s 29.5/15.0/9.7/7.1/5.8/4.6/4.0/3.5/3.1/2.8) else branch drift, and
+                       (2) within +-5% of compiled_eager pass_nN else eager_parse is NOT taking effect.
+    Metric: throughput_mrows_s (catalog rows x generator.repeat / MonitoringSink window); input MB/s =
+    throughput_mbps. Fit ns/row = a + b*N per rung. Expect naive a>0 (MB/s RISES with N, Flink-like),
+    eager a~0 b~36 ns (flat MB/s ~310), lazy a~0 b<<36 (flat MB/s, higher). If lazy MB/s rises with N,
+    that exposes a per-row fixed cost in the lazy path.
+    GOTCHAS: generator.repeat and worker_env.NES_INMEM_REPEAT MUST match (input_rows is catalog rows x
+    generator.repeat; a mismatch fakes the metric). naive uses repeat 5 (else ~2 min/run), compiled rungs
+    keep the original's repeat 20. Binary: cmake-build-release worker+nes-cli mtime 2026-09-03 10:50
+    (HEAD b5d757c9f6 + uncommitted lazy/eager/overload knobs; only ShardedTaskQueue.hpp is newer, no knobs).
+    `strings` does NOT find descriptor keys in this binary (not even sequence_shredder_mode) -- verify knobs
+    by BEHAVIOUR (eager != lazy, eager == anchor), not by strings. Governor performance, load <0.3.
+    Flink reference = fig2_flink_fieldsweep (2026-09-03), not re-run.
+    RUN: cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/fig2_fieldsweep_v2_smoke.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mrows_s
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: false
+  completion_timeout_s: 600
+  overload: false
+  worker:
+    query_engine: {number_of_worker_threads: 1, number_of_io_threads: 1, invoke_mode_configuration: fnattr, pin_threads: false, admission_queue_size: 1024}
+    default_query_execution: {operator_buffer_size: 131072, execution_mode: COMPILER}
+    number_of_buffers_in_global_buffer_manager: 16384
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: {type: SequentialCSV, threading_mode: sequential}
+    input_parser: {f64: EiselFloatF64}
+    output_formatter: {type: JSON}
+    output_parser: {f64: ZMIJF64}
+  generator: {repeat: 20, mode: burst, rate: 1000000}
+  worker_env: {NES_INMEM_PREFILL: '1', NES_INMEM_REPEAT: '20', NES_INMEM_BUFSIZE: '131072'}
+
+_pass_queries: &pass_queries
+  [multicol/pass_n1, multicol/pass_n4]
+_allf_queries: &allf_queries
+  [multicol/allf_n4]
+
+_sweep_x: &sweep_x
+  label: "source fields N"
+  explicit: [{name: sweep, baseline: true, overrides: {}}]
+
+_rungs: &rungs
+  label: "NES rung"
+  explicit:
+    - name: naive
+      baseline: true
+      overrides:
+        query_config.input_formatter: {type: SequentialUncompiledOldCSV, threading_mode: sequential}
+        query_config.output_formatter: {type: JSONUncompiled}
+        query_config.input_parser: {}
+        query_config.output_parser: {}
+        worker_env.NES_INPUT_CODEC: original
+        worker_env.NES_OUTPUT_CODEC: original
+        generator.repeat: 5
+        worker_env.NES_INMEM_REPEAT: '5'
+    - name: compiled_eager
+      overrides:
+        query_config.input_formatter: {type: SequentialCSV, threading_mode: sequential, eager_parse: true}
+    - name: compiled_lazy
+      overrides: {}
+
+_y: &y {metric: throughput_mrows_s, label: "records/s"}
+
+variants:
+  - name: fieldsweep
+    description: "plain SELECT c0..cN-1 across N=1..10 fields, csv->json, three NES rungs"
+    queries: *pass_queries
+    axes: {x: *sweep_x, series: *rungs}
+    y: *y
+    visualization: {type: grouped_bar}
+  - name: anchor_allf
+    description: "ORIGINAL allf_nN (c*FLOAT64(1)) on the compiled default path: drift + eager-effect gate"
+    queries: *allf_queries
+    axes: {x: *sweep_x}
+    y: *y
+    visualization: {type: bar_chart}

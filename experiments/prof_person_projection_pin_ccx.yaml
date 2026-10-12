@@ -1,0 +1,121 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: prof_person_projection_pin_ccx
+  # QUICK PROBE (user ask 2026-07-08): person_projection A/B with pin_threads=true, 1 io + 5
+  # workers = exactly CCX0 (5965WX: cpus 0-5 share L3-0; io pins to cpu0, workers to cpu1-5 —
+  # verified in QueryEngine.cpp addThread + Async/IOThread.cpp, NES_PIN_CPU_OFFSET default 0).
+  # WHY: prof_person_projection_ab found both arms producer-bound (io thread pegged ~1 core,
+  # IPC ~0.24 pure _copy_to_iter) with csv paying ~24% more LLC misses/byte (worker SIMD scan of
+  # 100% of recycled raw-buffer lines vs native ~1 line/368B -> cross-CCX RFO drag on the io
+  # thread's stores), net ~5% steady-state gap; plus BIG unpinned run-to-run native-supply
+  # variance (6.1 vs 10.2 GB/s across days). Compact same-CCX placement makes worker-held lines
+  # CCX-LOCAL to the io thread's stores (intra-L3 invalidate, cheap) and kills placement luck.
+  # EXPECT (predict-first): (1) io copy cyc/B DROPS in both arms, csv gains MORE (its drag was
+  #   the cross-CCX RFO) -> gap shrinks toward ~0-3%; absolute supply maybe 6.5-7.5 GB/s both.
+  #   (2) run-to-run variance collapses. Risk: cpu0 softirq noise on the io thread (mild for
+  #   file I/O); 5 workers ample (csv formatter needed ~1.3 cores at 6 GB/s).
+  # Windows sized as in prof_person_projection_ab (csv repeat 500, native 380, ~80-90s each).
+  #
+  # RESULTS (2026-07-08, n=1/arm, pinning VERIFIED via taskset -pc: io=cpu0, workers=cpu1-5):
+  #   wall-span: csv 10402.6 MB/s / 47.2 Mr/s, native 7773.6 / 21.1 — the per-byte ordering
+  #   FLIPPED: pinned CSV BEATS native 1.34x GB/s (and 2.2x Mr/s). vs unpinned W16: csv 5.77->10.4
+  #   (+80%!), native 6.09->7.77 (+28%). Both io threads STILL PEGGED (~43-44G cyc/10s = the wall);
+  #   per-tid 10s: csv 10.41 GB/s rchar, IPC 0.43, 539M LLC-miss (0.412 cyc/B, 0.33 miss/64B line);
+  #   native 7.71 GB/s, IPC 0.31, 670M (0.571 cyc/B, 0.56 miss/line).
+  # PREDICTION SCORECARD: "both 6.5-7.5, gap ->0-3%" was WRONG in an instructive way — pinning
+  #   didn't just remove the RFO drag, it exposed a FILE-level confound:
+  # *** FILE-CACHE-CLASS DISCOVERY (dd triangulation, taskset -c 2, warm, bs=128K): per-file warm
+  #   page-cache read rate is BIMODAL on this box — FAST ~12.7-13.5 GB/s: person_840MB.csv 13.2,
+  #   auction_707MB.csv 13.1, bid_6GB.csv 12.9, bid_6GB.nes 12.8 (python-written!), fresh cp of
+  #   person nes 13.5, fresh dd-written zeros 12.7; SLOW ~8.9-9.3: person_840MB.nes 9.2,
+  #   auction_707MB_lf.csv 8.9 (tr-written). NOT format (bid.nes fast), NOT size (first-881MB of
+  #   person.nes still 8.9), NOT extents (all ~36-288), NOT fixable by fadvise-DONTNEED evict +
+  #   readahead re-read (cold 2.3 then STILL 9.1 warm; ext4 on 6.8 has no large folios either) —
+  #   but a fresh CP of the same bytes IS fast (13.5). => property of the file's RESIDENT PAGES
+  #   (likely physical scatter of the cached 4K pages; readahead re-population didn't heal it,
+  #   big-chunk rewrite does). FIX for benchmarking: rewrite slow-class files (cp+rename) and
+  #   re-verify with dd ~13 GB/s before any supply-sensitive run.
+  # POST-REWRITE RE-RUN (2026-07-08, person_840MB.nes rewritten fast-class via cp+cmp+mv,
+  #   dd-verified 12.9-13.0 GB/s; csv file already fast): wall-span csv 10486.9 MB/s / 47.6 Mr/s,
+  #   native 10431.0 / 28.3 -> GB/s ratio 0.995 = PERFECT WASH, and Mr/s ratio 0.594 == the byte-
+  #   footprint ratio 0.599. io-thread counters now IDENTICAL across arms (csv 43.5G cyc IPC 0.43
+  #   552M miss @10.57 GB/s rchar; native 44.0G cyc IPC 0.42 564M miss @10.46). Prediction
+  #   ("both ~10.4, Mr/s ~47 vs ~28") EXACT. => With placement + file-class controlled,
+  #   person_projection per-byte cost is FORMAT-NEUTRAL (both arms = the ~10.5 GB/s io-copy
+  #   ceiling = ~80% of the 13 GB/s dd rate) and the ENTIRE Mr/s gap is the .nes 1.67x bloat.
+  # OPEN PUZZLE: auction_707MB_lf.csv resists the fix — still 8.7-8.9 GB/s after cp AND dd-bs=8M
+  #   rewrites, slow from every CCX (cpu 2/8/14/20), while person nes rewrite healed instantly and
+  #   stays 13.0 from all cores. Only affects q8 joins (state-bound at 0.4 GB/s) -> parked.
+  # MECHANISM (perf stat on the dd itself, fast person.nes vs slow auction_lf): NOT TLB (dTLB
+  #   misses negligible both: 86K vs 126K per-GB-scale copy — direct-map-fragmentation theory
+  #   dead), NOT instruction path (identical insn/byte). Slow file = 1.55x MORE LLC misses/byte
+  #   (7.0/MB vs 4.5/MB), IPC 0.21 vs 0.31, 0.50 vs 0.34 cyc/B => hardware prefetch is less
+  #   effective on the slow file's resident pages. Remaining explanation: PHYSICAL SCATTER vs
+  #   contiguity of the cached 4K pages (buddy-allocator luck at population time; prefetchers /
+  #   DRAM open-page locality reward physically-contiguous streams). Proof needs root (pagemap).
+  # VERDICT: person_projection per-byte "format gap" ~DISSOLVES under control — each pinned arm
+  #   runs at ~80% of ITS OWN file's dd ceiling (csv 10.4/13.2=79%, native 7.7/9.2=84%). The
+  #   nexmark_native_vs_csv W16 GB/s column on this query measures file-cache class x thread
+  #   placement, NOT text-format cost. Remaining shared wall = the single-io-thread page-cache
+  #   copy (pread/mmap zero-copy or O_DIRECT io_uring are the levers). Native's honest per-byte
+  #   edge should be re-measured AFTER rewriting person_840MB.nes fast-class + pinned.
+  description: "quick probe: person_projection csv-vs-native, pinned 1io+5w on CCX0"
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  completion_timeout_s: 300
+  worker:
+    query_engine:
+      number_of_worker_threads: 5
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser: { uint64: TracedUINT64, int32: FastINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  generator:
+    repeat: 500
+
+_series: &format_series
+  label: "input format"
+  explicit:
+    - name: csv_optimized
+      baseline: true
+      overrides: {}
+    - name: native
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "16,32,32,16,4,256" }
+        query_config.input_parser: {}
+        generator.repeat: 380
+
+variants:
+  - name: person_projection_pin_ccx0
+    query: nexmark/person_projection
+    axes:
+      x:
+        label: "worker threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [5]
+      series: *format_series
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: grouped_bar }

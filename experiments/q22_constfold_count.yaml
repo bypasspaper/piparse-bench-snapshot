@@ -1,0 +1,138 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: q22_constfold_count
+  description: >
+    Constant-folding microbenchmark, COUNT axis (companion to q22_constfold's SIZE axis). q22-shape
+    CONCAT interleaving k distinct 8-byte constant fragments with the runtime channel:
+    CONCAT(f1, channel, f2, channel, ..., fk, channel), k in {1,2,4,6,8,12}. Fragment size FIXED at 8B,
+    so k varies both the NUMBER of foldable constants and total constant volume (8*k B). CSV->JSON,
+    unconditional (every row serializes), W1, InMemory. One-knob A/B (== q22_constfold):
+      * tcb_off: trace_constant_bytes=false -> each fragment is an opaque inttoptr host ptr -> k per-row
+        `call memcpy`.
+      * tcb_on:  trace_constant_bytes=true  -> each fragment is a @nautilus_const_bytes global -> k folded
+        inline-store copies, no calls.
+    inline_invoke_calls=true + invoke_mode=fnattr held on. Hypothesis: tcb_on/off grows with k (each
+    added constant eliminates one call). Cross-reference the SIZE sweep at equal total bytes (c06=48B ==
+    n48, c12=96B == n96; c01=8B == n08) to separate the "more copies" effect from raw volume.
+    RUN: cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/q22_constfold_count.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 5
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: false
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+    output_formatter: { type: JSON }
+    input_parser: { uint64: FastUINT64, int32: FastINT32, f64: EiselFloatF64 }
+    output_parser: { f64: ZMIJF64 }
+  generator:
+    repeat: 5
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 5
+    NES_INMEM_BUFSIZE: 131072
+
+_arms: &arms
+  label: "arm"
+  explicit:
+    - name: tcb_off
+      baseline: true
+      overrides:
+        query_config.source_type: InMemory
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: { uint64: FastUINT64, int32: FastINT32, f64: EiselFloatF64 }
+        query_config.output_parser: { f64: ZMIJF64 }
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: fnattr
+        worker.query_engine.inline_invoke_calls: true
+        worker.query_engine.trace_constant_bytes: false
+        overload: false
+        generator.repeat: 5
+    - name: tcb_on
+      overrides:
+        query_config.source_type: InMemory
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON }
+        query_config.input_parser: { uint64: FastUINT64, int32: FastINT32, f64: EiselFloatF64 }
+        query_config.output_parser: { f64: ZMIJF64 }
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: fnattr
+        worker.query_engine.inline_invoke_calls: true
+        worker.query_engine.trace_constant_bytes: true
+        overload: false
+        generator.repeat: 5
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s)" }
+
+variants:
+  - name: c01
+    description: "1 x 8B fragment (8B total; == size n08)"
+    query: q22cf/c01
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: c02
+    description: "2 x 8B fragments (16B total)"
+    query: q22cf/c02
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: c04
+    description: "4 x 8B fragments (32B total)"
+    query: q22cf/c04
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: c06
+    description: "6 x 8B fragments (48B total; == size n48)"
+    query: q22cf/c06
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: c08
+    description: "8 x 8B fragments (64B total)"
+    query: q22cf/c08
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: c12
+    description: "12 x 8B fragments (96B total; == size n96)"
+    query: q22cf/c12
+    axes: { x: *noop_x, series: *arms }
+    y: *tput_y
+    visualization: { type: grouped_bar }

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "piparse-bench"
+version = "0.1.0"
+description = "Benchmarking framework for PiParse / NebulaStream"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "click>=8.0",
+    "duckdb>=1.0",
+]
+
+[project.optional-dependencies]
+viz = ["matplotlib>=3.8"]
+dev = ["pytest>=8.0", "ruff>=0.4"]
+# Flink backend (mode: flink). PyFlink 2.0/2.1 support Python 3.9-3.12 AND Java 11;
+# 2.2+ dropped Java 11, so pin <2.2 to stay compatible with the benchmark box's JDK 11.
+# apache-flink bundles a full Flink distribution (~hundreds of MB) — hence an opt-in extra.
+flink = ["apache-flink>=2.0,<2.2"]
+
+[project.scripts]
+pbench = "piparse_bench.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.ruff]
+line-length = 100

@@ -1,0 +1,83 @@
+query:
+  name: nexmark_q8_variant
+  description: "Nexmark Q8 variant: bid JOIN auction on auctionId = id, tumbling window 10s"
+
+  sql: |
+    SELECT start, end, timestamp, auctionId, bidder, price, timestamp,
+           id, initialbid, reserve, expires, seller, category
+    FROM (SELECT * FROM bid)
+    INNER JOIN (SELECT * FROM auction)
+    ON auctionId = id WINDOW TUMBLING (timestamp, size 10 sec)
+
+  flink_sql: |
+    SELECT CAST(TIMESTAMPDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', CAST(b.window_start AS TIMESTAMP(3))) AS BIGINT) * 1000 AS `start`, CAST(TIMESTAMPDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', CAST(b.window_end AS TIMESTAMP(3))) AS BIGINT) * 1000 AS `end`,
+    b.`timestamp`, b.auctionId, b.bidder, b.price,
+    a.`timestamp` AS a_timestamp, a.id, a.initialbid, a.reserve, a.expires, a.seller, a.category
+    FROM (SELECT window_start, window_end, `timestamp`, auctionId, bidder, price
+    FROM TABLE(TUMBLE(TABLE bid, DESCRIPTOR(`__rt`), INTERVAL '10' SECOND))) b
+    INNER JOIN (SELECT window_start, window_end, `timestamp`, id, initialbid, reserve, expires, seller, category
+    FROM TABLE(TUMBLE(TABLE auction, DESCRIPTOR(`__rt`), INTERVAL '10' SECOND))) a
+    ON b.window_start = a.window_start AND b.window_end = a.window_end AND b.auctionId = a.id
+
+  sources:
+    - name: bid
+      flink_rowtime: { column: timestamp, delay: "0.001 SECOND" }
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+      data:
+        large:
+          file: large/nexmark/bid_6GB.csv
+          size_bytes: 6442450944
+          rows: 183991721
+        native:
+          # 183,991,721 rows x 24 B (uint64,int32,int32,float64 packed LE); generated from
+          # bid_6GB.csv via nes-systests/testdata/small/csv_to_binary.py
+          file: large/nexmark/bid_6GB.nes
+          size_bytes: 4415801304
+          rows: 183991721
+
+    - name: auction
+      flink_rowtime: { column: timestamp, delay: "0.001 SECOND" }
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: id, type: INT32, not_null: true }
+        - { name: initialbid, type: INT32, not_null: true }
+        - { name: reserve, type: INT32, not_null: true }
+        - { name: expires, type: UINT64, not_null: true }
+        - { name: seller, type: INT32, not_null: true }
+        - { name: category, type: INT32, not_null: true }
+      data:
+        large:
+          # LF copy of the CRLF auction_707MB.csv — see nexmark/q8_join.yaml for the full story
+          # (FastINT32 crash / __emutls / TracedINT32 mis-parse) and the regeneration recipe.
+          file: large/nexmark/auction_707MB.csv
+          size_bytes: 729852154
+          rows: 12000000
+        native:
+          # 12,000,000 rows x 36 B (uint64,int32,int32,int32,uint64,int32,int32 packed LE)
+          file: large/nexmark/auction_707MB.nes
+          size_bytes: 432000000
+          rows: 12000000
+
+  sink_schema:
+    - { name: bidauction.start, type: UINT64, not_null: true }
+    - { name: bidauction.end, type: UINT64, not_null: true }
+    - { name: bid.timestamp, type: UINT64, not_null: true }
+    - { name: bid.auctionId, type: INT32, not_null: true }
+    - { name: bid.bidder, type: INT32, not_null: true }
+    - { name: bid.price, type: FLOAT64, not_null: true }
+    - { name: bid.timestamp, type: UINT64, not_null: true }
+    - { name: auction.id, type: INT32, not_null: true }
+    - { name: auction.initialbid, type: INT32, not_null: true }
+    - { name: auction.reserve, type: INT32, not_null: true }
+    - { name: auction.expires, type: UINT64, not_null: true }
+    - { name: auction.seller, type: INT32, not_null: true }
+    - { name: auction.category, type: INT32, not_null: true }
+
+  validation:
+    large: { tuples: 182197843, checksum: 1176742157900 }
+    # native == large: numeric roundtrip through both binary sources
+    native: { tuples: 182197843, checksum: 1176742157900 }

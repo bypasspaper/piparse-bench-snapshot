@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# (id UINT64, s VARSIZED ~80KB) rows. SELECT id: the 80KB string still makes each row span ~20 buffers
+# @4KiB (forcing the SequenceShredder to reassemble the span), but output is only the 8-byte id -> NO
+# 80KB output copy. Isolates shredder/spanning work from the varsized output-copy cost.
+query:
+  name: bigstr_id_pass
+  description: "SELECT id FROM (id, 80KB string): shredder spans buffers, output is tiny (no varsized copy)."
+  sql: "SELECT id FROM src"
+  sources:
+    - name: src
+      schema:
+        - { name: id, type: UINT64, not_null: true }
+        - { name: s, type: VARSIZED, not_null: true }
+      data:
+        csv:
+          file: large/formatter/bigstr_id_80k_500m.csv
+          size_bytes: 524358214
+          rows: 6554
+  sink_schema:
+    - { name: src.id, type: UINT64, not_null: true }

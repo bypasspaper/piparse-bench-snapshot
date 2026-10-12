@@ -1,0 +1,97 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: prof_q2_wall_mechanism
+  # MECHANISM PROBE (user ask 2026-07-09): WHY do more pinned workers degrade q2_filter_proj
+  # (csv 11.2 GB/s @W5 -> 8.2 @W11 -> 6.4 @W23, io thread PEGGED throughout; even native with
+  # ~idle workers loses 15%)? Two candidate mechanisms (user's hypotheses):
+  #   H-A cross-CCX routing: workers beyond cpu5 put band/buffer lines on other CCXs; the io
+  #       thread's copy pays cross-CCX RFO/DRAM. Signature: io-thread LLC-misses/byte RISES
+  #       with W; no scheduler symbols in its profile.
+  #   H-B admission-queue wake churn: at W5 workers are ~saturated (4.9/5 busy - they spin and
+  #       grab tasks); at W>5 permanent slight undersaturation makes workers park (exponential
+  #       backoff) and get re-woken per task - and the EMITTER (the pegged io thread) pays each
+  #       futex_wake + IPI out of its copy budget. Signature: worker voluntary-cs/s low at W5,
+  #       exploding at W11/23 (>= task rate ~50-90K/s, more with backoff re-polls); io-thread
+  #       self-time gains futex_wake/try_to_wake_up/sched symbols at high W. (Same diagnostic
+  #       that nailed the TCP wake/park storm, 21K->787K cs/s.)
+  # Prior fingerprints pointing at BOTH: worker cores-per-GB/s inflates +35% (csv) / +60%
+  # (native) W5->W23; q2 csv's biggest step is the first CCX crossing (W5->W11).
+  # PROBE per window: (1) vol/nonvol ctxt-switch deltas for io + all workers over the 10s stat
+  # window; (2) perf stat -t io_tid (cycles, LLC misses) + rchar rate; (3) 8s flat perf record
+  # of the io thread (futex/sched vs copy symbols).
+  # EXPECT: both signatures present; the QUESTION is the split. If vol-cs/s at W23 is O(task
+  # rate) and the io profile shows wake symbols at >5-10% self-time -> H-B is the main thief
+  # (fix direction: longer spin-before-park / emit-to-busy-worker affinity). If io LLC-misses/
+  # byte rises >30% with no sched symbols -> H-A (fix: placement/partitioning).
+  # repeat=80 (512 GB/pass-set) sizes windows W5 ~46s / W11 ~62s / W23 ~79s > the ~30s probe.
+  #
+  # RESULTS (2026-07-09; bid csv re-rolled slow OVERNIGHT 14.9->8.1, rewritten back to 14.7
+  # pre-run — the per-session dd check earns its keep):
+  #   wall-span: W5 10960 / W11 8149 / W23 6655 MB/s (reproduces yesterday's curve).
+  #   ctxt-switches (10s window): worker vol-cs/s 581 -> 2025 -> 4060 (rises with W but is
+  #     ~1.5 ORDERS below the ~53K/s task rate; ~177/s per worker at W23); worker nonvol ~12-18;
+  #     io vol-cs/s 125 -> 0 -> 0 (at W5 io occasionally blocks on the full pool = healthy
+  #     backpressure; at high W it NEVER blocks - it is the pure bottleneck).
+  #   io-thread counters: cyc/B 0.364 -> 0.521 -> 0.639 (+76%); LLC-miss/B 0.0046 -> 0.0089 ->
+  #     0.0121 = 0.30 -> 0.57 -> 0.77 misses per 64B line (2.6x); IPC 0.49 -> 0.34 -> 0.28.
+  #   io-thread profile W23 vs W5: ZERO futex/sched symbols at any W (>1% cutoff);
+  #     _copy_to_iter share RISES 58.7% -> 71.4% - the copy itself absorbs the loss, memory-
+  #     stalled. Worker-side cores-per-GB/s also +32% (they pay the reverse direction).
+  # VERDICT - H-A CONFIRMED, H-B REFUTED (here): the degradation is cross-CCX cache-line
+  #   routing on the RECYCLED SOURCE-POOL RING, driven by task-scattering: any worker on any
+  #   CCX may scan any 128KiB buffer, leaving its lines Shared in that CCX's L3; the pegged io
+  #   thread then pays a cross-fabric RFO per line when storing into the recycled buffer
+  #   (0.77 miss/line at W23 ~= every line). It is WHERE the lines sit, not how busy workers
+  #   are (only 3.9 busy cores at W23). Wake churn exists (vol-cs 7x) but costs <1% of the io
+  #   budget - the spin-before-park absorbs the task rate; unlike the TCP wake storm (787K
+  #   cs/s) this workload never enters that regime.
+  # FIX DIRECTIONS (engine): (a) buffer->worker affinity / sticky task placement so a source's
+  #   ring stays on one CCX; (b) per-CCX source pools; (c) protocol-level: right-size W (W5
+  #   compact is optimal, more is harmful); (d) long-term zero-copy mmap read removes the
+  #   destination ring entirely.
+  description: "mechanism probe: q2 csv W{5,11,23} pinned - wake-churn vs cross-CCX RFO split"
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  completion_timeout_s: 300
+  worker:
+    query_engine:
+      number_of_worker_threads: 5
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser: { uint64: TracedUINT64, int32: FastINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  generator:
+    repeat: 80
+
+variants:
+  - name: q2_csv_wall_mechanism
+    query: nexmark/q2_filter_proj
+    axes:
+      x:
+        label: "worker threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [5, 11, 23]
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: line_chart }

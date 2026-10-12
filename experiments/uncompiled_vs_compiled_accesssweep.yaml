@@ -1,0 +1,92 @@
+experiment:
+  name: uncompiled_vs_compiled_accesssweep
+  description: Compiled vs uncompiled INPUT formatter on a FIXED 10-FLOAT64-field
+    dataset (nf10.csv); x = number of fields ACCESSED K=1..10 (project first K, cI*FLOAT64(1)),
+    csv->json, InMemory seq W1, y=tuples/s. COMPILED parses only K (pushdown) -> grows
+    with K; UNCOMPILED parses all 10 -> flat. At K=10 both parse all 10 -> CONVERGE
+    (gap 5.9x -> 1x). Dual of the field-count sweep.
+  primary_metric: throughput_mrows_s
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  completion_timeout_s: 300
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter:
+      type: SequentialCSV
+      threading_mode: sequential
+    input_parser:
+      f64: EiselFloatF64
+    output_formatter:
+      type: JSON
+    output_parser:
+      f64: ZMIJF64
+  generator:
+    repeat: 20
+    mode: burst
+    rate: 1000000
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 20
+    NES_INMEM_BUFSIZE: 131072
+variants:
+- name: accesssweep
+  description: compiled vs uncompiled formatter across N=1..10 fields, project c0,
+    csv->json
+  queries:
+  - multicol/projK_k1
+  - multicol/projK_k2
+  - multicol/projK_k3
+  - multicol/projK_k4
+  - multicol/projK_k5
+  - multicol/projK_k6
+  - multicol/projK_k7
+  - multicol/projK_k8
+  - multicol/projK_k9
+  - multicol/projK_k10
+  axes:
+    x:
+      label: source fields N
+      explicit:
+      - name: sweep
+        baseline: true
+        overrides: {}
+    series:
+      label: formatter
+      explicit:
+      - name: compiled
+        baseline: true
+        overrides: {}
+      - name: uncompiled
+        overrides:
+          query_config.input_formatter:
+            type: SequentialUncompiledCSV
+            threading_mode: sequential
+          query_config.output_formatter:
+            type: JSONUncompiled
+          query_config.input_parser: {}
+          query_config.output_parser: {}
+  y:
+    metric: throughput_mrows_s
+    label: records/s
+  visualization:
+    type: grouped_bar

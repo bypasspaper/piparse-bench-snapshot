@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: shredder_fragments_stall_repro
+  description: >
+    N=1024 STRAGGLER-STALL REPRO at small scale (session 2026-07-12 investigation). Finding
+    under test: in the fragments sweep, N=1024 @ pool 192 froze AFTER ~812 completions (~101
+    per cell), with the 212 stragglers uniform across cells and only ~15% into their streams
+    (late-deployment wave). That timing CONTRADICTS concurrent-fan-in arithmetic (26-27 live
+    sources/cell against a 192 pool cannot starve) and fits a CUMULATIVE-DEPLETION model: each
+    COMPLETED query permanently removes ~k buffers from its cell pool (k~2 fits both: N=1024
+    froze at 101 completions/cell x 2 ~ 192, and N=512 survived because 64 x 2 = 128 < 192).
+    PREDICTION (leak model): N=512 on pool 96 wedges after ~30-40 completions/cell (~250-320
+    total), stragglers = late deployments. NO-LEAK model predicts clean completion (live
+    working set of 64 src/cell circulates fine through a 96 pool, just throttled).
+    INSTRUMENTATION: worker runs with NES_CELLPOOL_STATS=1 (new DIAG_CELLPOOL stderr lines,
+    2 s cadence + _FINAL at shutdown): watch per-cell available counts trend DOWN as
+    completions accumulate; at the freeze avail ~0 on all cells confirms depletion; the
+    _FINAL line after engine teardown discriminates "held by live stopped-query state"
+    (avail returns to ~96) vs "true refcount leak" (buffers still missing at teardown).
+    GOTCHAS: same stack as shredder_fragments_source_scaling (fragments arm only);
+    completion_timeout_s 300 bounds the wedge cost; grep worker.log for DIAG_CELLPOOL.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 8
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+    ccx_shared_source_pools: true
+    ccx_source_pool_buffers: 96
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, sequence_shredder_mode: LOCK_FREE_FRAGMENTS }
+    input_parser: { uint64: TracedUINT64, int32: TracedINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  worker_env:
+    NES_TASKQUEUE_STATS: 1
+    NES_CELLPOOL_STATS: 1
+  generator:
+    repeat: 6
+
+variants:
+  - name: n512_pool96
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "Concurrent Queries (= Concurrent Sources)"
+        parameter: num_queries
+        values: [512]
+    y: { metric: throughput_mbps, label: "Aggregate System Throughput (MB/s)" }

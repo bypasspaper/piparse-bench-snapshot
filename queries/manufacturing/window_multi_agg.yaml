@@ -1,0 +1,60 @@
+query:
+  name: mfg_window_multi_agg
+  description: "Manufacturing: sliding window with AVG, SUM, MIN, COUNT on mf01/mf02/mf03"
+
+  sql: |
+    SELECT start, end, AVG(mf01) AS avg_mf01, SUM(mf02) AS sum_mf02, MIN(mf03) AS min_mf03, COUNT(mf01) AS count_mf01, SUM(mf01) AS sum_mf01
+    FROM manufacturing
+    WINDOW SLIDING(creationTS, SIZE 1 MINUTE, ADVANCE BY 1 SEC)
+
+  flink_sql: |
+    SELECT CAST(TIMESTAMPDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', CAST(window_start AS TIMESTAMP(3))) AS BIGINT) * 1000 AS `start`, CAST(TIMESTAMPDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', CAST(window_end AS TIMESTAMP(3))) AS BIGINT) * 1000 AS `end`,
+    AVG(CAST(mf01 AS DOUBLE)) AS avg_mf01, CAST(SUM(mf02) AS SMALLINT) AS sum_mf02,
+    MIN(mf03) AS min_mf03, COUNT(mf01) AS count_mf01, CAST(SUM(mf01) AS SMALLINT) AS sum_mf01
+    FROM TABLE(HOP(TABLE manufacturing, DESCRIPTOR(`__rt`), INTERVAL '1' SECOND, INTERVAL '1' MINUTE))
+    GROUP BY window_start, window_end
+
+  sources:
+    - name: manufacturing
+      flink_rowtime: { column: creationTS, delay: "0.001 SECOND" }
+      schema:
+        - { name: creationTS, type: UINT64, not_null: true }
+        - { name: messageIndex, type: UINT64, not_null: true }
+        - { name: mf01, type: INT16, not_null: true }
+        - { name: mf02, type: INT16, not_null: true }
+        - { name: mf03, type: INT16, not_null: true }
+        - { name: pc13, type: INT16, not_null: true }
+        - { name: pc14, type: INT16, not_null: true }
+        - { name: pc15, type: INT16, not_null: true }
+        - { name: pc25, type: INT16, not_null: true }
+        - { name: pc26, type: INT16, not_null: true }
+        - { name: pc27, type: INT16, not_null: true }
+        - { name: res, type: INT16, not_null: true }
+        - { name: bm05, type: INT16, not_null: true }
+        - { name: bm06, type: INT16, not_null: true }
+      data:
+        large:
+          # actual on-disk size (the old 1073741824 was the name's "1G": file is 1.43GB).
+          # LF file, no CRLF trap; int fields carry LEADING ZEROS ("0071") - digit parsers
+          # handle them. 22.39M rows over 14.8 DAYS of event time - real span, no tiling
+          # needed for steady windows.
+          file: large/manufacturing/manufacturing_1G.csv
+          size_bytes: 1430850438
+          rows: 22390514
+        native:
+          # 22,390,514 rows x 40 B (u64 x2, i16 x12 packed LE); footprint csv/nes = 1.598
+          file: large/manufacturing/manufacturing_1G.nes
+          size_bytes: 895620560
+          rows: 22390514
+
+  sink_schema:
+    - { name: manufacturing.start, type: UINT64, not_null: true }
+    - { name: manufacturing.end, type: UINT64, not_null: true }
+    - { name: manufacturing.avg_mf01, type: FLOAT64, not_null: true }
+    - { name: manufacturing.sum_mf02, type: INT16, not_null: true }
+    - { name: manufacturing.min_mf03, type: INT16, not_null: true }
+    - { name: manufacturing.count_mf01, type: UINT64, not_null: true }
+    - { name: manufacturing.sum_mf01, type: INT16, not_null: true }
+
+  validation:
+    large: { tuples: 221338, checksum: 698355948 }

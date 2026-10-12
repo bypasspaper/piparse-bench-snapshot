@@ -1,0 +1,111 @@
+experiment:
+  name: source_thread_scaling
+  description: >
+    PoC #1 for the SCALING paper (axis B = ingestion thread model). Isolate the
+    "thread-count explosion" half of the async-vs-blocking source story by scaling the
+    number of concurrent queries (= concurrent sources) 1 -> 10 -> 50 -> 100, holding
+    EVERYTHING else identical and changing ONLY the source threading model:
+
+      series CSV "File"         = async FileSource  -> all N sources multiplex onto a
+                                  FIXED pool of number_of_io_threads (=4) io threads
+                                  (LazySingleton<IOThread>, round-robin). 4 io + 24 worker
+                                  = 28 threads regardless of N.
+      series CSV "BlockingFile" = BlockingFileSource -> ONE dedicated OS thread PER source.
+                                  N=100 -> 100 source threads + 24 workers = 124 threads on
+                                  a 24c/48t box = ~2.6x HW-thread oversubscription.
+
+    Both read the SAME warm (page-cache-resident) 1 GB file via the SAME 24-worker shared
+    pool + single global MPMC task queue, same SIMDCSV + lazy-elision passthrough pipeline,
+    same Monitoring sink. The ONLY independent variable per series is async(4 io threads) vs
+    blocking(N threads). => the async-vs-blocking gap that opens as N grows is the pure
+    thread-count / CPU-oversubscription penalty, with NO real-I/O-wait component (warm reads
+    from page cache do not park threads in a slow syscall). That residual (the syscall-parking
+    half) is what a later TCP-on-a-real-NIC run will add on top.
+
+    HYPOTHESIS (predict before running):
+      - N <= ~24 (fits cores): File ~= BlockingFile (thread count within HW budget).
+      - N = 50, 100: BlockingFile aggregate throughput DROPS and avg latency RISES vs File
+        (124 runnable threads thrash the 48 HW threads: context-switch storm, run-queue
+        contention, cache pollution). File stays flat-ish (28 threads, no explosion).
+      - If BlockingFile does NOT degrade, the thread-count half is cheap on this box and the
+        async win must be ~entirely the I/O-syscall-parking half (-> network experiment).
+
+    WHY THIS QUERY: nexmark/bid_passthrough_1gb = 4-int-field SELECT *, lazy CSV fast-path
+    (parse elided, byte-copy) -> minimal per-tuple work -> maximally EXPOSES scheduling /
+    thread overhead (the thing under test) rather than burying it under parse cost. 1 GB
+    file => 100 sources x 1 GB warm ~= 100 GB cached reads -> fast iteration, RAM-bounded.
+
+    GOTCHAS / CAVEATS (load-bearing — keep with care):
+      - warm_read: true warms the file into page cache ONCE before submit (all N queries read
+        the same file -> shared cache, no disk). Flip to a cold run only deliberately.
+      - number_of_io_threads (=4) is the ASYNC pool size; BlockingFile IGNORES it (spawns its
+        own thread per source). Keep it FIXED so the only moving part is the series.
+      - number_of_worker_threads (=24) is SHARED across all N queries (one global task queue).
+        Fixed across both series — this experiment does NOT touch the consumer side.
+      - Global buffer pool 32768 x 128 KiB = 4 GB serves pipeline OUTPUTS. Each source ALSO
+        takes its OWN 64-buffer private pool (SourceProvider, =8 MB) -> 100 sources ~= 800 MB.
+        Total RAM ~= 6 GB. If a 100-source run hits "buffer allocation failure" raise the pool.
+      - Throughput = SUM of per-query MB/s (aggregate system throughput); latency = MEDIAN of
+        per-query avg latency. Monitoring sink only gives avg/min/max latency (NO percentiles
+        yet) -> tail-latency (p50/p99/p99.9) is a planned MonitoringSink enhancement, not here.
+      - Submitting 100 queries = compiling 100 pipelines (JIT). That setup cost is OUTSIDE the
+        Monitoring throughput window (per-query steady rate), but inflates wall time. Expect the
+        100-source points to take noticeably longer to start.
+      - completion-based (no duration_seconds): polls until every Monitoring CSV has data.
+        completion_timeout_s 300 is the safety net; warm 100 GB should finish well under.
+      - Engine is UNCHANGED for this PoC (File/BlockingFile both already exist) -> no rebuild.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 300
+  worker:
+    query_engine:
+      number_of_worker_threads: 24
+      number_of_io_threads: 4
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+    default_query_execution:
+      operator_buffer_size: 131072          # 128 KiB (fastest known)
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768   # 4 GB global (outputs); sources use own pools
+  query_config:
+    source_type: File          # overridden by the series axis
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64}
+    output_formatter: {type: CSV}
+  generator:
+    repeat: 6                  # steady-state window: worker-cli sets NES_FILE_REPEAT=repeat for
+                               # File+BlockingFile (both loop on EOF now) so the tail isn't
+                               # single-pass ramp-inflated; sink size is x6 so throughput stays honest.
+
+variants:
+  - name: source_thread_model
+    description: "async File (fixed 4 io threads) vs BlockingFile (1 thread/source), scaling concurrent queries"
+    query: nexmark/bid_passthrough_1gb
+    axes:
+      x:
+        label: "Concurrent Queries (= Concurrent Sources)"
+        parameter: num_queries
+        values: [1, 10, 50, 100]
+      series:
+        label: "Source Threading Model"
+        parameter: query_config.source_type
+        values: [File, BlockingFile]
+        baseline: File
+    y:
+      metric: throughput_mbps
+      label: "Aggregate System Throughput (MB/s)"
+    visualization:
+      type: line_chart
+      x_scale: log

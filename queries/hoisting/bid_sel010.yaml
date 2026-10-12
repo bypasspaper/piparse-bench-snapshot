@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+# Parse-hoisting selectivity microbenchmark: q_route at 10% filter selectivity (channel=="TARGET").
+# Synthetic bid-schema CSV (8M rows); 10% of rows match. CSV->JSON, passthrough disabled so both
+# arms genuinely parse; the eager arm parses all rows, the lazy arm only the matching 10%.
+query:
+  name: hoisting_bid_sel010
+  description: "q_route 10% selectivity (channel==TARGET)"
+  sql: |
+    SELECT * FROM bid WHERE channel == VARSIZED("TARGET")
+  sources:
+    - name: bid
+      schema:
+        - { name: ts, type: UINT64, not_null: true }
+        - { name: auctionId, type: UINT64, not_null: true }
+        - { name: bidder, type: UINT64, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+        - { name: channel, type: VARSIZED, not_null: true }
+        - { name: url, type: VARSIZED, not_null: true }
+      data:
+        csv:
+          file: large/hoisting/bid_sel010.csv
+          size_bytes: 556453358
+          rows: 8000000
+  sink_schema:
+    - { name: bid.ts, type: UINT64, not_null: true }
+    - { name: bid.auctionId, type: UINT64, not_null: true }
+    - { name: bid.bidder, type: UINT64, not_null: true }
+    - { name: bid.price, type: FLOAT64, not_null: true }
+    - { name: bid.channel, type: VARSIZED, not_null: true }
+    - { name: bid.url, type: VARSIZED, not_null: true }

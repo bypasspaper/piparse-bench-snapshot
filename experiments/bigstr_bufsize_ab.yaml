@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: bigstr_bufsize_ab
+  description: >
+    What does bigstr (80 KB strings) reach at 128 KiB vs 4 KiB buffers, single-source InMemory prefill?
+    Tests the claim that the 4K ~2.9 GB/s is the small-buffer machinery collapse, not the workload. At
+    128K the 80 KB string fits in one buffer (NO spanning, shredder idle) -> should approach the memory
+    ceiling. LF, single source, W sweep. Matched repeat accounting (generator.repeat==NES_INMEM_REPEAT).
+    RUN: cd ~/work/piparse-bench && pkill -x main; PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+           experiments/bigstr_bufsize_ab.yaml \
+           --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 2
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      pin_threads: false
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 262144
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 200000
+    dump_compilation_result: NONE
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false, sequence_shredder_mode: LOCK_FREE }
+    output_formatter: { type: CSV }
+    input_parser: {}
+    output_parser: {}
+  generator:
+    repeat: 40
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 40
+    NES_LOG_LEVEL: WARNING
+
+variants:
+  - name: bufsize
+    query: formatter/bigstr_pass
+    axes:
+      x:
+        label: "worker threads"
+        parameter: worker.query_engine.number_of_worker_threads
+        values: [8, 16, 24]
+      series:
+        label: "input buffer size"
+        explicit:
+          - name: buf_128k
+            baseline: true
+            overrides:
+              worker_env.NES_INMEM_BUFSIZE: "131072"
+          - name: buf_4k
+            overrides:
+              worker_env.NES_INMEM_BUFSIZE: "4096"
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: line_chart }

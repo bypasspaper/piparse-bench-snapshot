@@ -1,0 +1,66 @@
+experiment:
+  name: stateful_join_pool_sweep
+  description: >
+    §15 confirmation: how much GLOBAL buffer pool does a windowed varsized JOIN
+    need? Smoke (stateful_join_smoke) showed q3/q8 FAIL at pool=4096 (512 MB) with
+    "Global buffer pool could not allocate buffer before timeout" — so stateful
+    state pressures the POOLED pool, unlike passthrough (which peaks at 512 MB).
+    Sweep pool ascending to find the success threshold and the throughput curve.
+    q3 = auction JOIN person ON seller=personId, TUMBLING 10s, varsized person.
+    File source, single pass (repeat=1). Companion: HANDOVER §15/§20.2.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+    default_query_execution:
+      operator_buffer_size: 131072          # 128 KiB
+      execution_mode: COMPILER
+    # number_of_buffers_in_global_buffer_manager is the X axis.
+
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter:
+      type: SIMDCSV
+    input_parser:
+      uint64: TracedUINT64
+      int32: TracedINT32
+      int64: TracedINT64
+      f64: EiselFloatF64
+    output_formatter:
+      type: CSV
+
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+
+variants:
+  - name: q3_pool
+    description: "q3 auction JOIN person, sweep global buffer pool (failures fast-fail)"
+    query: nexmark/q3_join
+    axes:
+      x:
+        label: "Buffer pool (buffers x 128 KiB)"
+        parameter: worker.number_of_buffers_in_global_buffer_manager
+        values: [4096, 8192, 16384, 32768, 65536]
+    y:
+      metric: throughput_mbps
+      label: "Throughput (MB/s)"
+    visualization:
+      type: line_chart
+      x_scale: log

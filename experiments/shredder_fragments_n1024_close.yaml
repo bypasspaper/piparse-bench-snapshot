@@ -1,0 +1,75 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: shredder_fragments_n1024_close
+  description: >
+    CLOSE-OUT for the N=1024 straggler stall (2026-07-12): rerun of the failed sweep point
+    (N=1024, LOCK_FREE_FRAGMENTS, 128 KiB x 192/cell pools) after the TWO async-source-runner
+    fixes: (1) getBufferBlocking's silent 1 s BufferAllocationFailure (exception swallowed by
+    co_spawn's unobserved future -> silent source death -> zombie Running query) replaced by a
+    cancellation-aware retry loop; (2) the retry loop YIELDS to the io context (asio::post)
+    between attempts -- a non-yielding wait starves sibling coroutines' completion handlers
+    that hold the very buffers whose recycle would refill the pool (livelock; the old 1 s
+    throw was accidentally the deadlock breaker). Runner also now catches loop exceptions and
+    emits Error (loud failure instead of zombie).
+    EXPECT: 1024/1024 queries complete; DIAG_SRCLIFE routine-end == spawned == 1024 and
+    frame-destroyed-unresumed == 0; throughput below the 40 GB/s plateau is ACCEPTABLE
+    (256 src/cell on a 192 pool = deliberate overcommit -> throttling, not deadlock).
+    GOTCHAS: deployment ~4-5 min at N=1024 -> completion_timeout_s 1800; DIAG_CELLPOOL
+    telemetry on (NES_CELLPOOL_STATS).
+    RESULTS (2026-07-12): PASS on all criteria — 1024/1024 completed at 6190 MB/s aggregate;
+    spawned=1024, routine-end=1024, frame-destroyed-unresumed=0, no DIAG_SRCEXIT deaths;
+    pools cycled at ~0 avail throughout (expected overcommit throttling). N=1024 on a fixed
+    192-buffer cell pool is now LIVE end-to-end with the fragment shredder + fixed runner.
+    Full speed at this fan-in remains a capacity question (borrow valve / bigger pools), not
+    a liveness one. NOTE: the 5 ms retry slice in the runner's yield loop is untuned — the
+    throttled rate may have headroom.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 8
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+    ccx_shared_source_pools: true
+    ccx_source_pool_buffers: 192
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, sequence_shredder_mode: LOCK_FREE_FRAGMENTS }
+    input_parser: { uint64: TracedUINT64, int32: TracedINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  worker_env:
+    NES_TASKQUEUE_STATS: 1
+    NES_CELLPOOL_STATS: 1
+  generator:
+    repeat: 6
+
+variants:
+  - name: n1024_pool192_fixed_runner
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "Concurrent Queries (= Concurrent Sources)"
+        parameter: num_queries
+        values: [1024]
+    y: { metric: throughput_mbps, label: "Aggregate System Throughput (MB/s)" }

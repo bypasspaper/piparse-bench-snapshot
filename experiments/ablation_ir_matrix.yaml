@@ -1,0 +1,84 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: ablation_ir_matrix
+  description: >
+    tcb IR STUDY -- the 2x2 matrix {trace_constant_bytes off/on} x {inline_invoke_calls off/on},
+    compiled SequentialCSV -> JSON, W1, on tiny data (bid_5K, 165 rows, compile-only). Each cell
+    is one query compile that dumps LLVM IR to /tmp/dump/<ts>_#<hash>/after_llvm_generation.ll.
+    The run_ir_matrix.sh driver clears /tmp/dump around each cell and files the dump under a
+    labeled dir for Opus IR analysis.
+      A off_off : tcb OFF, inline OFF  (opaque host ptr, un-inlined write)
+      B off_on  : tcb OFF, inline ON   (== r5: opaque host ptr, inlined write)   <- naive baseline
+      C on_on   : tcb ON,  inline ON   (== r6: const global,   inlined write)    <- baked target
+      D on_off  : tcb ON,  inline OFF  (const global, un-inlined write)
+    Primary comparison B vs C (does baking the glue actually fold vs opaque memcpy?).
+    Query = SELECT auctionId, bidder FROM bid (2x INT32, no float codec noise). Glue per row:
+    {"BID$AUCTIONID":<i>,"BID$BIDDER":<i>}\n = 3 writeConstantBytes calls.
+    fnattr ON in all cells (orthogonal, matches r5/r6) so only tcb x inline vary.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: tiny
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 300
+  overload: false
+  worker:
+    dump_compilation_result: FILE
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: true
+      pin_threads: false
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 4096
+  query_config:
+    source_type: BlockingFile
+    sink_type: Monitoring
+    input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+    output_formatter: { type: JSON }
+    input_parser: { uint64: TracedUINT64, int64: TracedINT64, int32: FastINT32, int16: TracedINT16, uint32: TracedUINT32, uint16: TracedUINT16, bool: TracedBOOL, f64: EiselFloatF64, f32: EiselFloatF32 }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s)" }
+
+_matrix: &matrix
+  label: "cell"
+  explicit:
+    - name: A_off_off
+      baseline: true
+      overrides: { worker.query_engine.trace_constant_bytes: false, worker.query_engine.inline_invoke_calls: false }
+    - name: B_off_on
+      overrides: { worker.query_engine.trace_constant_bytes: false, worker.query_engine.inline_invoke_calls: true }
+    - name: C_on_on
+      overrides: { worker.query_engine.trace_constant_bytes: true, worker.query_engine.inline_invoke_calls: true }
+    - name: D_on_off
+      overrides: { worker.query_engine.trace_constant_bytes: true, worker.query_engine.inline_invoke_calls: false }
+
+variants:
+  - name: ir_bid2int
+    description: "2x INT32 JSON glue matrix"
+    query: nexmark/ir_bid2int
+    axes: { x: *noop_x, series: *matrix }
+    y: *tput_y
+    visualization: { type: grouped_bar }

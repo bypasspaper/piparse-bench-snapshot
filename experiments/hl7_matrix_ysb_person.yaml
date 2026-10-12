@@ -1,0 +1,142 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: hl7_matrix_ysb_person
+  description: >
+    The 3x3 format-conversion matrix (input {SIMDCSV, SchemaJSON, SIMDHL7} x output {CSV, JSON,
+    HL7}) for the two remaining datasets, complementing hl7_matrix_bid (passthrough) and
+    hl7_matrix_bid_q1q2 (filter/compute):
+      ysb    -> 4-of-11-field numeric passthrough over 5M ad events
+                (csv 492MB / json 977MB / hl7 832MB)
+      person -> 5-of-8-field varsized-heavy passthrough over 4M persons
+                (csv 877MB / json 1241MB / hl7 1149MB)
+    Same logical rows per arm; HL7 arms use DEFAULT delimiters (values verified free of
+    structural bytes -- no '&' issue here, unlike bid). HL7 output segment matches the
+    dataset's generated segment (YSB / PID). W1 fnattr fullopt, 128KiB buffers, warm reads,
+    Monitoring sink, n=5 median. MB/s = engine-measured on INPUT bytes.
+    RUN: cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+      experiments/hl7_matrix_ysb_person.yaml --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 5
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: true
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: BlockingFile
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    output_formatter: { type: CSV }
+    input_parser: { uint64: TracedUINT64, int64: TracedINT64, int32: FastINT32, int16: TracedINT16, uint32: TracedUINT32, uint16: TracedUINT16, bool: TracedBOOL, f64: EiselFloatF64, f32: EiselFloatF32 }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s, input bytes)" }
+
+_out_series_ysb: &out_series_ysb
+  label: "output"
+  explicit:
+    - name: to_csv
+      baseline: true
+      overrides: { query_config.output_formatter: { type: CSV } }
+    - name: to_json
+      overrides: { query_config.output_formatter: { type: JSON } }
+    - name: to_hl7
+      overrides: { query_config.output_formatter: { type: HL7, segment_name: YSB } }
+
+_out_series_pid: &out_series_pid
+  label: "output"
+  explicit:
+    - name: to_csv
+      baseline: true
+      overrides: { query_config.output_formatter: { type: CSV } }
+    - name: to_json
+      overrides: { query_config.output_formatter: { type: JSON } }
+    - name: to_hl7
+      overrides: { query_config.output_formatter: { type: HL7, segment_name: PID } }
+
+variants:
+  # ── ysb (numeric) ───────────────────────────────────────────────────────────
+  - name: ysb_csv_in
+    description: "ysb passthrough, SIMDCSV input -> {CSV,JSON,HL7} out"
+    query: yahoo/ysb_1k_passthrough
+    overrides:
+      data_size: csv
+      query_config.input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    axes: { x: *noop_x, series: *out_series_ysb }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: ysb_json_in
+    description: "ysb passthrough, SchemaJSON input -> {CSV,JSON,HL7} out"
+    query: yahoo/ysb_1k_passthrough
+    overrides:
+      data_size: json
+      query_config.input_formatter: { type: SchemaJSON }
+    axes: { x: *noop_x, series: *out_series_ysb }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: ysb_hl7_in
+    description: "ysb passthrough, SIMDHL7 input (default delimiters) -> {CSV,JSON,HL7} out"
+    query: yahoo/ysb_1k_hl7_passthrough
+    overrides:
+      data_size: hl7
+      query_config.input_formatter: { type: SIMDHL7 }
+    axes: { x: *noop_x, series: *out_series_ysb }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  # ── person (varsized-heavy) ─────────────────────────────────────────────────
+  - name: person_csv_in
+    description: "person passthrough, SIMDCSV input -> {CSV,JSON,HL7} out"
+    query: nexmark/person_passthrough
+    overrides:
+      data_size: csv
+      query_config.input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    axes: { x: *noop_x, series: *out_series_pid }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: person_json_in
+    description: "person passthrough, SchemaJSON input -> {CSV,JSON,HL7} out"
+    query: nexmark/person_passthrough
+    overrides:
+      data_size: json
+      query_config.input_formatter: { type: SchemaJSON }
+    axes: { x: *noop_x, series: *out_series_pid }
+    y: *tput_y
+    visualization: { type: grouped_bar }
+  - name: person_hl7_in
+    description: "person passthrough, SIMDHL7 input (default delimiters) -> {CSV,JSON,HL7} out"
+    query: nexmark/person_hl7_passthrough
+    overrides:
+      data_size: hl7
+      query_config.input_formatter: { type: SIMDHL7 }
+    axes: { x: *noop_x, series: *out_series_pid }
+    y: *tput_y
+    visualization: { type: grouped_bar }

@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: Apache-2.0
+# Fig1 REPEAT ON FLINK (2026-09-03): the serde CPU-share profile of the paper's Section-2 Fig1
+# (~/Notes/nebulastream/benchmark/fig1_fig2_motivation_2026-08-19.md) taken on Apache Flink
+# instead of NebulaStream. Same csv->json workload shape as NES's Fig1 naive arm: Flink's OWN
+# csv format (Jackson CsvParser + CsvToRowDataConverters) on the fetcher thread, Flink's OWN
+# JsonRowDataSerializationSchema in the json_blackhole void sink (flink-ext jar) on the task
+# thread. parallelism 1 (= NES W1). Profiled with async-profiler (JVM_ARGS -agentpath, see
+# scratch profile_flink_one.sh): cpu event @4 kHz, per-thread collapsed stacks, whole job.
+# Attribution: fetcher thread = deserialize; task thread by nearest classified frame from the
+# leaf (formats.json/Jackson generator = serialize, generated Calc/window ops = process,
+# RecordWriter/serializers across the keyBy = engine-internal serde); GC/JIT/main threads and
+# kernel read frames excluded (NES nulled read via InMemory prefill), renormalized.
+experiment:
+  name: fig1_flink_thru_q2og
+  description: 'Fig1-on-Flink clean throughput (no profiler) for the bar annotations, 3 reps'
+  primary_metric: throughput_mrows_s
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+defaults:
+  system: flink
+  mode: flink
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1500
+  flink_execution_mode: streaming
+  flink_output_format: json_blackhole
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+  generator:
+    repeat: 1
+variants:
+  - name: q2og
+    description: 'Flink clean throughput: NEXMark Q2 original (5-way OR point selection), json_blackhole, p=1'
+    query: nexmark/q2_original
+    axes:
+      x:
+        label: config
+        explicit:
+          - name: flink_json_blackhole_p1
+            baseline: true
+            overrides: { data_size: large }
+    y:
+      metric: throughput_mbps
+      label: MB/s
+    visualization:
+      type: bar_chart

@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+# serde-micro: SELECT * on K=2 float64 columns. CSV + SystemNative binary twin.
+query:
+  name: serde_micro_floatk2
+  description: "serde micro: SELECT * on 2 float64 cols (passthrough projection)"
+  sql: |
+    SELECT * FROM src
+  sources:
+    - name: src
+      schema:
+        - { name: c0, type: FLOAT64, not_null: true }
+        - { name: c1, type: FLOAT64, not_null: true }
+      data:
+        csv:
+          file: large/serde_micro/floatk2.csv
+          size_bytes: 51554041
+          rows: 2000000
+        native:
+          file: large/serde_micro/floatk2.nes
+          size_bytes: 32000000
+          rows: 2000000
+  sink_schema:
+    - { name: src.c0, type: FLOAT64, not_null: true }
+    - { name: src.c1, type: FLOAT64, not_null: true }

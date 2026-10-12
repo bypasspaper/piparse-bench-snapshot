@@ -1,0 +1,108 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: wsweep_output_plateau
+  description: >
+    OUTPUT-SERIALIZATION PLATEAU PROBE (2026-08-06c, follows the matrix-v2 wall challenge):
+    csv->json q0 at W23 sits at Par 7.1 with only ~42 GB/s total wire (16.4 in + 25.5 out)
+    while csv->csv q0 does 135 GB/s total — so the 65-68 GB/s "wire wall" cannot be what
+    limits it, and per-worker rate collapses 3.2x from W1 (20.2 Mrows/s alone) to W23
+    (6.2/worker). Question: does csv->json q0 PLATEAU flat from mid-W (shared-resource
+    ceiling, e.g. write-side DRAM amplification RFO/memset/scratch) or PEAK-THEN-DECLINE
+    (contention/convoy)? Sweep W in {1,2,4,8,12,16,20,23} under the HEALTHY r_par config
+    (ccx_aware=false, pin_threads=false — the ccxON+pinON single-source pathology is
+    documented in MATRIX_RESULTS_2026-08-05.md); csv->csv q0 same sweep = the control that
+    keeps scaling. InMemory prefill + REPEAT=20 (true = reported x20, identical correction
+    across W -> curve SHAPE needs no correction). data_size MUST be csv (matrix catalog
+    entries; unknown value silently falls back to FIRST entry = json bytes into CSV parser
+    = fake corruption). Expected anchors at W23 (matrix v2): csvjson_q0 ~822 MB/s reported
+    (16.4 GB/s true), csvcsv_q0 ~3380 MB/s reported (67.6 GB/s true).
+    RESULTS (2026-08-06c, 32/32): csvjson FLAT PLATEAU from W12 (792/811/830/829 MB/s at
+    W12/16/20/23) while csvcsv climbs monotone to W23 (3404 = 68.1 GB/s true, 136 GB/s wire
+    total). Not peak-then-decline -> saturated shared resource, not convoy. Profiling
+    (prof_output_plateau_*) identified it: STORE-QUEUE-FULL dispatch stalls 0.28/cycle at
+    W23 csvjson (vs 0.048 at W4, 0.062 for csvcsv W23); IPC 2.07(W4)->0.78(W23) at CONSTANT
+    ~560-600 insn/row; all workers 99% duty, locks negligible. Field-wise serialization's
+    small scattered stores RFO cold output lines; loaded DRAM latency at 23 writers
+    overwhelms the store queue. Coalesced csv->csv (ERMS bulk copy, 296 insn/row) immune.
+    -> Notes/nebulastream/benchmark/2_engine_to_e2e/OUTPUT_PLATEAU_PROBE_RESULTS.md
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 2
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: csv
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 23
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: true
+      pin_threads: false
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: InMemory
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, threading_mode: PARALLEL, allow_commas_in_strings: false }
+    output_formatter: { type: JSON }
+    input_parser:
+      uint64: TracedUINT64
+      int64: TracedINT64
+      int32: FastINT32
+      int16: TracedINT16
+      uint32: TracedUINT32
+      uint16: TracedUINT16
+      bool: TracedBOOL
+      f64: EiselFloatF64
+      f32: EiselFloatF32
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+  worker_env:
+    NES_INMEM_PREFILL: 1
+    NES_INMEM_REPEAT: 20
+    NES_INMEM_BUFSIZE: 131072
+
+_wsweep: &wsweep
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [1, 2, 4, 8, 12, 16, 20, 23]
+
+_cfg: &cfg
+  label: "config"
+  explicit:
+    - name: healthy_rpar
+      baseline: true
+      overrides: {}
+
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s reported; TRUE = x20)" }
+
+variants:
+  - name: csvjson_q0
+    description: "csv->json q0 passthrough: the plateaued cell under test"
+    query: nexmark/matrix/bidstr_q0
+    axes: { x: *wsweep, series: *cfg }
+    y: *tput_y
+    visualization: { type: line_chart }
+  - name: csvcsv_q0
+    description: "csv->csv q0 passthrough (coalesced raw-forward output): the scaling control"
+    query: nexmark/matrix/bidstr_q0
+    overrides: { query_config.output_formatter: { type: CSV } }
+    axes: { x: *wsweep, series: *cfg }
+    y: *tput_y
+    visualization: { type: line_chart }

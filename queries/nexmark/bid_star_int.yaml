@@ -1,0 +1,33 @@
+query:
+  name: nexmark_bid_star_int
+  description: >
+    SELECT * FROM bid with ALL FOUR fields typed as INTEGERS (price as INT64, not the FLOAT64 of
+    bid_star/q1). Formatter-bound probe: paired with a Void sink + NATIVE output format, this forces the
+    input formatter to index + parse all four int fields (NATIVE output != CSV input, so the lazy
+    passthrough elision does NOT apply -> the parse actually runs) while stripping float parsing, float
+    serialization, and sink cost. So throughput is dominated by the input formatter (index phase + int
+    parse) -- the thing the sequential-CSV rewrite is meant to move. bid_1GB (medium) is 4-int data.
+  sql: "SELECT * FROM bid"
+
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: INT64, not_null: true }
+      data:
+        large:
+          file: large/nexmark/bid_6GB.csv
+          size_bytes: 6442450944
+          rows: 183991721
+        medium:
+          file: large/nexmark/bid_1GB.csv
+          size_bytes: 1089194961
+          rows: 31300000
+
+  sink_schema:
+    - { name: bid.timestamp, type: UINT64, not_null: true }
+    - { name: bid.auctionId, type: INT32, not_null: true }
+    - { name: bid.bidder, type: INT32, not_null: true }
+    - { name: bid.price, type: INT64, not_null: true }

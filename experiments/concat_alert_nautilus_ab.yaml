@@ -1,0 +1,93 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: concat_alert_nautilus_ab
+  description: >
+    A/B for the nautilus non-volatile mem-intrinsic fix on the alert-string use case
+    (CONCAT(constant, varsized) -> JSON). Single r6-config cell (W1, full opts, JSON out,
+    FastINT32/ZMIJ). The fix is a property of the compiled worker (nautilus lib), NOT a
+    knob -> run TWICE swapping the worker+cli binary:
+      OLD (volatile nautilus):     scratchpad/bin_new/{worker,cli}
+      NEW (non-volatile nautilus): scratchpad/bin_nautilus_fixed/{worker,cli}
+    Both carry the q10 fix (irrelevant to CONCAT). The only difference is the nautilus
+    isVolatile flag on llvm.memcpy/memmove/memset.
+
+    EXPECTATION (honest): the fix constant-forwards the per-row copy of the ~22-byte literal
+    into immediate stores (saves a few loads + a cache-line dep/row) and drops the volatile
+    optimization barrier. The per-row saving is small relative to parse + the runtime channel
+    copy + JSON output + the CONCAT arena round-trip, so the e2e delta may be single-digit %
+    or noise. W1 to unmask it (W16 read-wall would hide it).
+
+    GOTCHAS: bid_strings_3GB (3.6GB) is the only data variant. Port 9099, governor performance.
+    RUN (put the target binary in the build dir first):
+      cd ~/work/piparse-bench && PBENCH_KEEP_LOGS=1 uv run python bench.py run \
+        experiments/concat_alert_nautilus_ab.yaml \
+        --build-dir ~/work/nebulastream-public/cmake-build-release --worker-port 9099
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 5
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 1800
+  overload: false
+  worker:
+    query_engine:
+      number_of_worker_threads: 1
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      inline_invoke_calls: true
+      trace_constant_bytes: true
+      pin_threads: true
+      ccx_aware_task_queues: false
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: BlockingFile
+    sink_type: Monitoring
+    input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+    output_formatter: { type: JSON }
+    input_parser: { uint64: TracedUINT64, int64: TracedINT64, int32: FastINT32, int16: TracedINT16, uint32: TracedUINT32, uint16: TracedUINT16, bool: TracedBOOL, f64: EiselFloatF64, f32: EiselFloatF32 }
+    output_parser: { f64: ZMIJF64, f32: ZMIJF32 }
+  generator:
+    repeat: 1
+
+_noop_x: &noop_x
+  label: "config"
+  parameter: topology
+  values: [single-node]
+_tput_y: &tput_y { metric: throughput_mbps, label: "Throughput (MB/s)" }
+
+_cell: &cell
+  label: "config"
+  explicit:
+    - name: r6_fullopt_w1
+      baseline: true
+      overrides:
+        query_config.source_type: BlockingFile
+        query_config.input_formatter: { type: SequentialCSV, threading_mode: SEQUENTIAL, allow_commas_in_strings: false }
+        query_config.output_formatter: { type: JSON }
+        worker.query_engine.number_of_worker_threads: 1
+        worker.query_engine.invoke_mode_configuration: fnattr
+        worker.query_engine.inline_invoke_calls: true
+        worker.query_engine.trace_constant_bytes: true
+        overload: false
+        generator.repeat: 1
+
+variants:
+  - name: nx_concat_alert
+    description: "CONCAT(constant, channel) -> JSON alert string"
+    query: nexmark/concat_alert
+    axes: { x: *noop_x, series: *cell }
+    y: *tput_y
+    visualization: { type: grouped_bar }

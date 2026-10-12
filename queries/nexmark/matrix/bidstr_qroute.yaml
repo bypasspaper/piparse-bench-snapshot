@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0
+# GENERATED for the 16-cell input x output matrix (session 2026-08-04b). q_route ward routing; channel google = 20.0% of rows (measured).
+# Schema family bidstr; junk leaves not_null (interpreted rung has no NULL coercion).
+query:
+  name: matrix_bidstr_qroute
+  description: "q_route ward routing; channel google = 20.0% of rows (measured)"
+  sql: |
+    SELECT * FROM bid WHERE channel == VARSIZED("google")
+  flink_sql: |
+    SELECT * FROM bid WHERE channel = 'google'
+  spark_sql: |
+    SELECT * FROM bid WHERE channel = 'google'
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+        - { name: channel, type: VARSIZED, not_null: true }
+        - { name: url, type: VARSIZED, not_null: true }
+      data:
+        csv:
+          file: large/nexmark/bid_strings_3GB.csv
+          size_bytes: 3595281395
+          rows: 31300000
+        json:
+          file: large/nexmark/bid_strings_3GB.json
+          size_bytes: 5567181395
+          rows: 31300000
+        native:
+          file: large/nexmark/bid_strings_3GB.nes
+          size_bytes: 3443000000
+          rows: 31300000
+  sink_schema:
+    - { name: bid.timestamp, type: UINT64, not_null: true }
+    - { name: bid.auctionId, type: INT32, not_null: true }
+    - { name: bid.bidder, type: INT32, not_null: true }
+    - { name: bid.price, type: FLOAT64, not_null: true }
+    - { name: bid.channel, type: VARSIZED, not_null: true }
+    - { name: bid.url, type: VARSIZED, not_null: true }

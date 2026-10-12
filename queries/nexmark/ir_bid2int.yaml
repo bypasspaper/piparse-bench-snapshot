@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+# Minimal 2-INT-field JSON-glue probe for the tcb (trace_constant_bytes) IR study.
+# Purpose: exercise JSONOutputFormatter::writeConstantBytes (the LITERAL/glue side of tcb) with
+# the LEAST possible value-formatting noise -- two INT32 columns, no float (ZMIJ) codec in the way.
+# Per row the JSON glue emits: `{"bid$auctionId":<int>,"bid$bidder":<int>}\n` = 3 writeConstantBytes
+# calls (2 field prefixes + 1 record suffix), each a host-known constant the tcb knob either bakes
+# into a JIT constant global (ON) or passes as an opaque host pointer (OFF). Tiny data (165 rows)
+# because we only need the query to COMPILE -- the IR dump is produced at compile time, size-invariant.
+query:
+  name: nexmark_ir_bid2int
+  description: "SELECT auctionId, bidder FROM bid (2x INT32) -- JSON glue IR probe"
+  sql: "SELECT auctionId, bidder FROM bid"
+  sources:
+    - name: bid
+      schema:
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: auctionId, type: INT32, not_null: true }
+        - { name: bidder, type: INT32, not_null: true }
+        - { name: price, type: FLOAT64, not_null: true }
+      data:
+        tiny:
+          file: small/nexmark/bid_5K.csv
+          size_bytes: 8192
+          rows: 165
+  sink_schema:
+    - { name: bid.auctionId, type: INT32, not_null: true }
+    - { name: bid.bidder, type: INT32, not_null: true }

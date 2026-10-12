@@ -1,0 +1,57 @@
+query:
+  name: yahoo_ysb_10k
+  description: "Yahoo Streaming Benchmark: tumbling window aggregation, 10k campaign IDs"
+
+  sql: |
+    SELECT
+    start,
+    end,
+    campaign_id,
+    SUM(user_id) AS sum_user_id
+    FROM ysb10k
+    WHERE event_type < UINT64(1)
+    GROUP BY campaign_id
+    WINDOW TUMBLING(current_ms, SIZE 30 SEC)
+
+  flink_sql: |
+    SELECT CAST(TIMESTAMPDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', CAST(window_start AS TIMESTAMP(3))) AS BIGINT) * 1000 AS `start`, CAST(TIMESTAMPDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', CAST(window_end AS TIMESTAMP(3))) AS BIGINT) * 1000 AS `end`, campaign_id, SUM(user_id) AS sum_user_id
+    FROM TABLE(TUMBLE(TABLE ysb10k, DESCRIPTOR(`__rt`), INTERVAL '30' SECOND))
+    WHERE event_type < 1
+    GROUP BY window_start, window_end, campaign_id
+
+  sources:
+    - name: ysb10k
+      flink_rowtime: { column: current_ms, delay: "0.001 SECOND" }
+      schema:
+        - { name: user_id, type: UINT64, not_null: true }
+        - { name: page_id, type: UINT64, not_null: true }
+        - { name: campaign_id, type: UINT64, not_null: true }
+        - { name: ad_type, type: UINT64, not_null: true }
+        - { name: event_type, type: UINT64, not_null: true }
+        - { name: current_ms, type: UINT64, not_null: true }
+        - { name: ip, type: UINT64, not_null: true }
+        - { name: d1, type: UINT64, not_null: true }
+        - { name: d2, type: UINT64, not_null: true }
+        - { name: d3, type: UINT32, not_null: true }
+        - { name: d4, type: UINT16, not_null: true }
+      data:
+        large:
+          # LF in place (2026-07-14): ExternalData ships CRLF (trailing \r on d4 UINT16 breaks
+          # fast parsers); this name now holds the tr -d '\r' copy - REGENERATE after build-dir wipe
+          file: large/ysb/ysb_10k_data_479M.csv
+          size_bytes: 497209125
+          rows: 5000000
+        native:
+          # 5,000,000 rows x 78 B (u64 x9, u32, u16 packed LE)
+          file: large/ysb/ysb_10k_data_479M.nes
+          size_bytes: 390000000
+          rows: 5000000
+
+  sink_schema:
+    - { name: ysb10k.start, type: UINT64, not_null: true }
+    - { name: ysb10k.end, type: UINT64, not_null: true }
+    - { name: ysb10k.campaign_id, type: UINT64, not_null: true }
+    - { name: ysb10k.sum_user_id, type: UINT64, not_null: true }
+
+  validation:
+    large: { tuples: 1517953, checksum: 2109797738 }

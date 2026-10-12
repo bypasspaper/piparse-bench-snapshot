@@ -1,0 +1,54 @@
+query:
+  name: sg1_global_avg
+  description: "Smart Grid SG1 (LightSaber): global AVG(value), sliding 1h/1s"
+
+  sql: |
+    SELECT start, end, AVG(value) AS avg_value
+    FROM smartGrid
+    WINDOW SLIDING(creationTS, SIZE 1 HOUR, ADVANCE BY 1 SEC)
+
+  flink_sql: |
+    SELECT CAST(TIMESTAMPDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', CAST(window_start AS TIMESTAMP(3))) AS BIGINT) * 1000 AS `start`, CAST(TIMESTAMPDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', CAST(window_end AS TIMESTAMP(3))) AS BIGINT) * 1000 AS `end`, AVG(CAST(`value` AS DOUBLE)) AS avg_value
+    FROM TABLE(HOP(TABLE smartGrid, DESCRIPTOR(`__rt`), INTERVAL '1' SECOND, INTERVAL '1' HOUR))
+    GROUP BY window_start, window_end
+
+  sources:
+    - name: smartGrid
+      flink_rowtime: { column: creationTS, delay: "0.001 SECOND" }
+      schema:
+        - { name: creationTS, type: UINT64, not_null: true }
+        - { name: value, type: FLOAT32, not_null: true }
+        - { name: property, type: FLOAT32, not_null: true }
+        - { name: plugId, type: INT16, not_null: true }
+        - { name: householdId, type: INT16, not_null: true }
+        - { name: houseId, type: INT16, not_null: true }
+      data:
+        large:
+          # LF in place (2026-07-14): the DEBS14/LightSaber ExternalData seed ships CRLF (the
+          # trailing \r on houseId INT16 mis-parses under fast parsers). 33627 rows spanning
+          # only 84 SECONDS of event time - the 1h window NEVER fills on this file; use for
+          # smoke only.
+          file: large/smartgrid/smartgrid-data_974K.csv
+          size_bytes: 963766
+          rows: 33627
+        native:
+          # 33627 rows x 22 B (u64, f32, f32, i16 x3 packed LE)
+          file: large/smartgrid/smartgrid-data_974K.nes
+          size_bytes: 739794
+          rows: 33627
+        xlarge:
+          # 120 copies of large with creationTS += 84000 ms per copy (seamless forward time,
+          # span 2.8h -> the 1h windows fill; replaying instead corrupts stateful windows,
+          # see cmysb_repeat_probe). 4,035,240 rows.
+          file: large/smartgrid/smartgrid_ext120_115M.csv
+          size_bytes: 115651920
+          rows: 4035240
+        xlarge_native:
+          file: large/smartgrid/smartgrid_ext120_115M.nes
+          size_bytes: 88775280
+          rows: 4035240
+
+  sink_schema:
+    - { name: smartGrid.start, type: UINT64, not_null: true }
+    - { name: smartGrid.end, type: UINT64, not_null: true }
+    - { name: smartGrid.avg_value, type: FLOAT64, not_null: true }

@@ -1,0 +1,43 @@
+experiment:
+  name: fullstack_uncompiled
+  # Fully-UNCOMPILED in/out on bid_star_parseall. UncompiledCSV input (SIMD flat band + HARDCODED fast_float
+  # parse, no plugin/std::function indirection) + CSVUncompiled output (legacy CSVFormat, now HARDCODED ZMIJ
+  # float + to_chars int, byte-identical to the compiled ZMIJ output). NO input_parser/output_parser overrides
+  # -- both are hardcoded in the uncompiled path (compiled parser plugin names are not in its registry). Same
+  # fast infra (fnattr no-op for the interpreted path, 128 KiB buffers, native). Compare vs fullstack_compiled.
+  # RESULTS (2026-07-06, reps=3, native):
+  #   string output (getFormattedBuffer): W1/4/16 = 278 / 1075 / 4101 MB/s = 73%/72%/77% of compiled.
+  #   DIRECT-BUFFER output (formatToBuffer, to_chars/zmij straight into a reused thread_local buffer, no
+  #     std::string/append): W1/4/16 = 335 / 1284 / 4885 MB/s = 88%/86%/91% of compiled (+~20%). The
+  #     std::string build was the unfair part; direct-buffer write matches how the compiled path emits.
+  # Remaining ~1/4 gap = architecture (interpreted parse -> materialized buffer -> interpreted serialize vs JIT
+  # fused single pass); codecs held equal (fast_float in, ZMIJ out). Near-linear scaling (~14x W1->W16), like compiled.
+  description: "Fully-uncompiled UncompiledCSV in + legacy(ZMIJ) out, parse-all, hardcoded fast parsers"
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: systest
+  build: native
+  data_size: large
+  worker:
+    query_engine: { number_of_io_threads: 1, pin_threads: false, invoke_mode_configuration: fnattr, admission_queue_size: 1024 }
+    default_query_execution: { operator_buffer_size: 131072, execution_mode: COMPILER }
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  topology: single-node
+  query_config:
+    source_type: File
+    sink_type: Checksum
+    input_formatter: { type: UncompiledCSV }
+    output_formatter: { type: CSVUncompiled }
+variants:
+  - name: parseall
+    query: nexmark/bid_star_parseall
+    axes:
+      x: { label: "Worker Threads", parameter: worker.query_engine.number_of_worker_threads, values: [1, 4, 16] }
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: line_chart }

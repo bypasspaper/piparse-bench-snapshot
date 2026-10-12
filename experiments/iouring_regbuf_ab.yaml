@@ -1,0 +1,74 @@
+experiment:
+  name: iouring_regbuf_ab
+  description: >
+    A/B registered fixed buffers against the §34 finding that the cold-O_DIRECT producer thread is KERNEL-
+    bound on the PER-READ O_DIRECT path: get_user_pages (~14%) + AMD IOMMU map/unmap (~16%) + bio
+    dirty/setup (~10%), all inline in io_uring_enter; user-side emit/pool only ~5%. Registered fixed buffers
+    (NES_IOURING_REGBUF=1) pin the buffer-pool slab ONCE (io_uring_register_buffers) and read via
+    io_uring_prep_read_fixed -> every read skips get_user_pages + page-dirty/unpin (profile-confirmed §36).
+    Needs 512-aligned payloads: set worker config global_buffer_alignment: 512 (the io_uring source falls
+    back to plain reads otherwise). The pool is one contiguous slab (BufferManager basePointer) exposed via
+    AbstractBufferProvider::getContiguousSlab().
+
+    This is the SINGLE-PASS A/B (cold reads are single-pass; absolute ~5.9-6.0 GB/s, repeat-1 includes ramp).
+    The STEADY-STATE numbers (baseline 6.57 -> regbuf 6.84 GB/s = 97% of the 7.03 fio device cap) were taken
+    with a now-removed multipass profiling build (§36); here we confirm the lever + ratio on the shipped code.
+    Points: baseline / align512 (alignment alone, isolates its ~+3%) / regbuf. n=3 median.
+    GOTCHA: regbuf pins the ~512 MB slab (memlock ~8 GB here; modern kernels don't count io_uring regbufs vs
+    RLIMIT_MEMLOCK anyway). +320 B/buffer control-block padding from 512-alignment (negligible at 4096 buffers).
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 3
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  cold_read: true
+  completion_timeout_s: 120
+  worker:
+    query_engine:
+      number_of_worker_threads: 4
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: false
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 4096
+  query_config:
+    source_type: IoUringFile
+    sink_type: Monitoring
+    input_formatter: {type: SIMDCSV}
+    input_parser: {uint64: TracedUINT64, int32: TracedINT32, int64: TracedINT64}
+    output_formatter: {type: CSV}
+  generator:
+    repeat: 1
+    mode: burst
+    rate: 1000000
+  worker_env:
+    NES_IOURING_DIRECT: 1
+    NES_IOURING_QD: 64
+    NES_IOURING_REGBUF: 0
+
+variants:
+  - name: iouring_regbuf_ab
+    description: "single-pass cold O_DIRECT QD64: baseline vs 512-align vs registered fixed buffers"
+    query: nexmark/bid_passthrough
+    axes:
+      x:
+        label: "mode"
+        explicit:
+          - name: "baseline"
+            baseline: true
+            overrides: {}
+          - name: "align512"
+            overrides: {"worker.global_buffer_alignment": 512}
+          - name: "regbuf"
+            overrides: {"worker.global_buffer_alignment": 512, "worker_env.NES_IOURING_REGBUF": 1}
+    y: {metric: throughput_mbps, label: "Throughput (MB/s)"}
+    visualization: {type: bar_chart}

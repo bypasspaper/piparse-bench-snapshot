@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: Apache-2.0
+query:
+  name: nexmark_person_passthrough
+  description: >
+    person 5-field passthrough (SELECT id, name, email_address, city, state -- matches
+    person_hl7_passthrough's SQL; varsized-heavy), csv + json arms for the HL7 format matrix.
+    Same 4M logical rows in every representation:
+      csv  -> person_840MB.csv  (876941057 B)
+      json -> person_840MB.json (1240941057 B; UPPERCASE keys but schema ORDER matches --
+              SchemaJSON gathers positionally, key spelling is irrelevant)
+  sql: "SELECT id, name, email_address, city, state FROM person"
+  sources:
+    - name: person
+      schema:
+        - { name: id, type: INT32, not_null: true }
+        - { name: name, type: VARSIZED, not_null: true }
+        - { name: email_address, type: VARSIZED, not_null: true }
+        - { name: credit_card, type: VARSIZED, not_null: true }
+        - { name: city, type: VARSIZED, not_null: true }
+        - { name: state, type: VARSIZED, not_null: true }
+        - { name: timestamp, type: UINT64, not_null: true }
+        - { name: extra, type: VARSIZED, not_null: true }
+      data:
+        csv:
+          file: large/nexmark/person_840MB.csv
+          size_bytes: 876941057
+          rows: 4000000
+        json:
+          file: large/nexmark/person_840MB.json
+          size_bytes: 1240941057
+          rows: 4000000
+  sink_schema:
+    - { name: person.id, type: INT32, not_null: true }
+    - { name: person.name, type: VARSIZED, not_null: true }
+    - { name: person.email_address, type: VARSIZED, not_null: true }
+    - { name: person.city, type: VARSIZED, not_null: true }
+    - { name: person.state, type: VARSIZED, not_null: true }

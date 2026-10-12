@@ -1,0 +1,90 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: prof_person_projection_pin11_ab
+  # FOLLOW-UP PROBE (user ask 2026-07-08): person_projection csv-vs-native at 1io+11w, PINNED
+  # vs UNPINNED (x-axis = pin_threads). Pinned topology: io=cpu0 + workers cpu1-11 = io shares
+  # CCX0 (cpu0-5) with 5 workers, 6 workers on CCX1 (cpu6-11). Question: does pinning still win
+  # when the worker set SPANS CCXs (vs the clean 1io+5w single-CCX result: csv 10487 / native
+  # 10431 MB/s)? Context from prof_person_projection_pin_ccx: both arms are single-io-thread
+  # supply-bound (~10.5 GB/s = ~80% of the file's 13 GB/s dd ceiling); unpinned placement costs
+  # up to ~1.8x; csv workers SIMD-scan 100% of recycled raw-buffer bytes (RFO coupling to the io
+  # thread's stores), native proj touches ~1 line/368B row. Files dd-verified fast-class
+  # (person csv 13.0 / nes 12.9 GB/s) after the 2026-07-08 rewrite.
+  # EXPECT (predict-first): all 4 runs io-thread-bound (11 workers need ~2 cores). Pinned csv
+  #   slightly BELOW the 5w result (6 cross-CCX scanners partially re-introduce the RFO drag):
+  #   ~9.5-10.3 GB/s; pinned native ~unchanged ~10.4 (workers don't touch bytes). Unpinned both
+  #   arms lower AND noisier (~6-9 GB/s, placement lottery) -> pinned should WIN despite spanning.
+  #
+  # RESULTS (2026-07-08, n=1/cell; affinities VERIFIED per window via taskset -pc; rchar 10s
+  # rates in parens):
+  #   csv    pinned  9643.2 MB/s / 43.8 Mr/s (rchar 9.82 GB/s)   unpinned 6219.5 / 28.2 (6.27)
+  #   native pinned 10087.3 MB/s / 27.4 Mr/s (rchar 10.17)       unpinned 7275.4 / 19.8 (8.38*)
+  #   (*unpinned native rchar window > wall-span: within-run drift, the placement lottery again)
+  # ALL FOUR PREDICTIONS HIT: (1) pinned >> unpinned even when workers SPAN CCXs: csv +55%,
+  #   native +39%. (2) spanning costs a little vs single-CCX 1io+5w: csv 9643 vs 10487 (-8%,
+  #   the 6 CCX1 workers scanning raw bytes re-introduce part of the cross-CCX RFO drag on the
+  #   io thread's stores), native 10087 vs 10431 (-3%, workers barely touch bytes). (3) still
+  #   io-thread supply-bound everywhere. (4) unpinned csv landed at the historical unpinned band
+  #   (5.8-7.3). TAKEAWAY: pinning is the first-order control (+39-55%); CCX-compactness of
+  #   byte-scanning workers is second-order (-8%); keep io+scanning-workers on ONE CCX when the
+  #   worker count allows, but pinned-spanning still crushes unpinned.
+  description: "probe: person_projection csv/native, 1io+11w, pinned (CCX0+CCX1) vs unpinned"
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  completion_timeout_s: 300
+  worker:
+    query_engine:
+      number_of_worker_threads: 11
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser: { uint64: TracedUINT64, int32: FastINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  generator:
+    repeat: 500
+
+_series: &format_series
+  label: "input format"
+  explicit:
+    - name: csv_optimized
+      baseline: true
+      overrides: {}
+    - name: native
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "16,32,32,16,4,256" }
+        query_config.input_parser: {}
+        generator.repeat: 380
+
+variants:
+  - name: person_projection_11w_pin_ab
+    query: nexmark/person_projection
+    axes:
+      x:
+        label: "pin_threads"
+        parameter: worker.query_engine.pin_threads
+        values: [true, false]
+      series: *format_series
+    y: { metric: throughput_mbps, label: "Throughput (MB/s)" }
+    visualization: { type: grouped_bar }

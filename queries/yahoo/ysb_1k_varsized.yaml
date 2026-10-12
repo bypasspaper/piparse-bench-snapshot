@@ -1,0 +1,72 @@
+query:
+  name: yahoo_ysb_1k_varsized
+  description: "Yahoo Streaming Benchmark: varsized schema, 1k campaigns, COUNT aggregation"
+
+  sql: |
+    SELECT
+    start,
+    end,
+    campaign_id,
+    COUNT(user_id) AS count_user_id
+    FROM ysb1k
+    WHERE event_type == VARSIZED("view")
+    GROUP BY campaign_id
+    WINDOW TUMBLING(event_time, SIZE 30 SEC)
+
+  flink_sql: |
+    SELECT CAST(TIMESTAMPDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', CAST(window_start AS TIMESTAMP(3))) AS BIGINT) * 1000 AS `start`, CAST(TIMESTAMPDIFF(SECOND, TIMESTAMP '1970-01-01 00:00:00', CAST(window_end AS TIMESTAMP(3))) AS BIGINT) * 1000 AS `end`, campaign_id, COUNT(user_id) AS count_user_id
+    FROM TABLE(TUMBLE(TABLE ysb1k, DESCRIPTOR(`__rt`), INTERVAL '30' SECOND))
+    WHERE event_type = 'view'
+    GROUP BY window_start, window_end, campaign_id
+
+  spark_sql: |
+    SELECT unix_millis(window.start) AS `start`, unix_millis(window.end) AS `end`, campaign_id, COUNT(user_id) AS count_user_id FROM ysb1k WHERE event_type = 'view' GROUP BY window(__rt, '30 seconds'), campaign_id
+  sources:
+    - name: ysb1k
+      flink_rowtime: { column: event_time, delay: "0.001 SECOND" }
+      spark_rowtime: { column: event_time, delay: "1 millisecond" }
+      schema:
+        - { name: user_id, type: VARSIZED, not_null: true }
+        - { name: page_id, type: VARSIZED, not_null: true }
+        - { name: campaign_id, type: VARSIZED, not_null: true }
+        - { name: ad_id, type: VARSIZED, not_null: true }
+        - { name: ad_type, type: VARSIZED, not_null: true }
+        - { name: event_type, type: VARSIZED, not_null: true }
+        - { name: event_time, type: UINT64, not_null: true }
+        - { name: ip_address, type: VARSIZED, not_null: true }
+      data:
+        large:
+          # actual on-disk size (the old 3221225472 was the name's "3GB"); LF file, no CRLF trap
+          file: large/ysb/ysb1k_with_varsized_3GB.csv
+          size_bytes: 3713333331
+          rows: 20000000
+        native:
+          # 20M rows x 182 B: tight fixed slots 37,37,37,37,9,9,8 for the 7 VARSIZED cols
+          # (maxlen+1: uuid 36, ad_type/event_type 8, ip 7) + u64 event_time. SystemNative arm
+          # MUST pass string_length "37,37,37,37,9,9,8" (consumed per VARSIZED col in schema
+          # order). Note: only 1.020x denser than the CSV (uuid text is 36 B either way) - the
+          # fixed-width ysb footprint gap (1.28x) does not exist here.
+          file: large/ysb/ysb1k_with_varsized_3GB.nes
+          size_bytes: 3640000000
+          rows: 20000000
+        xlarge:
+          # 4 copies of large with event_time += 2,000,000 ms (the file's span) per copy -
+          # forward-moving event time (replay corrupts stateful windows, cmysb_repeat_probe).
+          # event_time stays 13 digits -> size is exactly 4x large. No validation entry.
+          file: large/ysb/ysb1k_varsized_ext4_15G.csv
+          size_bytes: 14853333324
+          rows: 80000000
+        xlarge_native:
+          # same 4x shift on packed field 6 via numpy; 80M x 182 B
+          file: large/ysb/ysb1k_varsized_ext4_15G.nes
+          size_bytes: 14560000000
+          rows: 80000000
+
+  sink_schema:
+    - { name: ysb1k.start, type: UINT64, not_null: true }
+    - { name: ysb1k.end, type: UINT64, not_null: true }
+    - { name: ysb1k.campaign_id, type: VARSIZED, not_null: true }
+    - { name: ysb1k.count_user_id, type: UINT64, not_null: true }
+
+  validation:
+    large: { tuples: 68000, checksum: 278998939 }

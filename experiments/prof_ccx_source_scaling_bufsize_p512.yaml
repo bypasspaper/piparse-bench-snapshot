@@ -1,0 +1,119 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: prof_ccx_source_scaling_bufsize_p512
+  description: >
+    SOURCE-COUNT scaling under cell pools x BUFFER SIZE (user ask 2026-07-11): N in {1..256}
+    (powers of two), passthrough bid_1GB (medium entry added to the catalog for this - the
+    LARGE 6GB file makes high-N windows infeasible), 8io+16w striped cells, cell pools ON.
+    Three buffer sizes at CONSTANT POOL BYTES (16 MB/cell, same L3 working set): 128 KiB x 128
+    / 64 KiB x 256 / 32 KiB x 512 - differences are then purely per-buffer overheads (task
+    dispatch rate 2x/4x, spanning-tuple frequency), not working-set effects.
+
+    LIVENESS (the parallel-formatter deadlock floor ~2 buffers/source, prof_ccx_pool_size_sweep
+    finding 4): at N=256 -> 64 src/cell, the configs give 2.0 / 4.0 / 8.0 buffers per source -
+    the 128 KiB point sits EXACTLY at the observed floor; a 600s-timeout stall there is itself
+    the datapoint. 64/32 KiB extend headroom to N=512/1024 (future).
+
+    EXPECT (predict-first): (1) throughput ~flat ~40-42 GB/s from N~8 up for all three sizes IF
+    per-buffer overhead is negligible; the 32 KiB curve dips first if the 4x task rate
+    (~1.3M tasks/s at the wall) costs measurable worker/queue time - watch the gap vs 128 KiB
+    in the overlap. (2) p50 IDENTICAL across sizes at equal N (Little's law: pool BYTES x
+    numCcx / throughput ~ 1.5 ms at the wall) - a falsifiable granularity check. (3) low N
+    (1-4): io-copy-bound like the historical curve (N=1 ~5-7 GB/s), sizes ~equal.
+
+    GOTCHAS: dd-preflight bid_1GB; 600s completion timeout (bounds potential N=256@128KiB
+    stall); operator_buffer_size is GLOBAL (sets pipeline buffers too - fine for passthrough);
+    NES_TASKQUEUE_STATS on; deployment of 256 queries takes ~1 min per such window.
+
+    RESULTS-P512 (2026-07-11, 27/27 ok; CONSTANT COUNT 512/cell, bytes vary:
+    128Kx512=64MB/cell=2xL3 | 64Kx512=32MB/cell==total-L3 boundary | 32Kx512=16MB resident):
+      buf   bytes/cell   plateau MB/s   p50@N=32   p999
+      128K   64 MB        ~19-21        256us*     ~4ms     <- deep spill: DRAM-ring floor
+      64K    32 MB        ~28-30        3.2ms      ~12ms    <- L3 boundary: -12% off fixed-cost rate
+      32K    16 MB        ~22.7-23.3    2.7ms      ~15-16ms <- reproduces the constant-bytes run EXACTLY
+    (*spilled rings run UNDERFULL - the private-pool signature: low p50, collapsed throughput.)
+    FINDINGS (joins prof_ccx_source_scaling_bufsize into the full 2D map):
+    (1) ORDERING FLIPS at constant count, as predicted: 128K goes from BEST (42 GB/s at
+        16MB/cell) to WORST (19-21 at 64MB/cell). Buffer size has NO intrinsic goodness -
+        the two real variables are pool BYTES (working-set class) and buffer COUNT (liveness
+        + fixed-cost share).
+    (2) min() MODEL fits both sweeps: throughput = min(fixed-cost rate B/(7.1us+B*0.135ns)
+        x 8 io, working-set rate [resident: unconstrained | ~total-L3: ~88% | spill: ~50%]).
+        64Kx512 = min(32.5, boundary) = 29 measured; 32Kx512 = min(22.5, resident) = 22.9;
+        128Kx512 = min(42, spill~20) = 19-21.
+    (3) Little's law nuance: RESIDENT rings run full (p50 = pool_bytes x 4/throughput);
+        SPILLED rings run underfull (128Kx512 in-flight ~32 MB of 256 MB) - low p50 with
+        collapsed throughput, same signature as private pools.
+    (4) 2D OPTIMUM overall remains 128K x 128-192 (42 GB/s, resident, liveness to N~384-512).
+        For N~1024+ WITHOUT the borrow valve, the best available = 64K x 512 (~29 GB/s,
+        8/source liveness at 256 src/cell) - a -30% tax that the budgeted borrow valve would
+        avoid. The valve stays the right long-term answer for extreme fan-in.
+  primary_metric: throughput_mbps
+  higher_is_better: true
+  repetitions: 1
+  aggregation: median
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: medium
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 600
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 8
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 32768
+    ccx_shared_source_pools: true
+    ccx_source_pool_buffers: 512
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV }
+    input_parser: { uint64: TracedUINT64, int32: TracedINT32, f64: EiselFloatF64 }
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  worker_env:
+    NES_TASKQUEUE_STATS: 1
+  generator:
+    repeat: 6
+
+_axes_x: &n_sweep
+  label: "Concurrent Queries (= Concurrent Sources)"
+  parameter: num_queries
+  values: [1, 2, 4, 8, 16, 32, 64, 128, 256]
+
+variants:
+  - name: buf128k_pool512
+    query: nexmark/bid_passthrough
+    axes: { x: *n_sweep }
+    y: { metric: throughput_mbps, label: "Aggregate System Throughput (MB/s)" }
+    visualization: { type: line_chart, x_scale: log }
+
+  - name: buf64k_pool512
+    query: nexmark/bid_passthrough
+    overrides:
+      worker.default_query_execution.operator_buffer_size: 65536
+      worker.ccx_source_pool_buffers: 512
+    axes: { x: *n_sweep }
+    y: { metric: throughput_mbps, label: "Aggregate System Throughput (MB/s)" }
+    visualization: { type: line_chart, x_scale: log }
+
+  - name: buf32k_pool512
+    query: nexmark/bid_passthrough
+    overrides:
+      worker.default_query_execution.operator_buffer_size: 32768
+      worker.ccx_source_pool_buffers: 512
+    axes: { x: *n_sweep }
+    y: { metric: throughput_mbps, label: "Aggregate System Throughput (MB/s)" }
+    visualization: { type: line_chart, x_scale: log }

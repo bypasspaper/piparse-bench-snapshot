@@ -1,0 +1,99 @@
+# SPDX-License-Identifier: Apache-2.0
+experiment:
+  name: nexmark_q22_strings
+  description: >
+    STRING-MANIPULATION bid query (user pick from the opus source survey, interim CONCAT
+    form of flink q22 - engine has no SPLIT_INDEX/regex; q21 deferred by user until a
+    simplified version is worth building). New string-bearing bid data: bid_1GB rows +
+    channel (80% hot-4/20% tail, <=12 ch) + url (<=72 ch), 3.60GB csv / 3.44GB nes,
+    footprint only 1.044 (string bytes dominate both formats - varsized-YSB regime).
+    Query reads BOTH varsized columns, CONCATs them into a new varsized value (defeats
+    lazy passthrough elision by construction), projects 3 numeric cols alongside.
+
+    EXPECT (predict-first, from the varsized-YSB law): with footprint ~1.04 and per-byte
+    ~parity for string-dominated schemas, rows/s ratio ~1.0-1.1 - parsed execution should
+    effectively TIE native on string manipulation. A bigger native win would implicate
+    the CSV varsized field copy (index+copy per string col) beyond what YSB showed.
+    Output is varsized-heavy (~100B/row x 31.3M x repeat), so both arms pay the same
+    serialize; the input side is the contrast.
+
+    GOTCHAS: string_length "13,73" on the native arm (VARSIZED cols in schema order);
+    allow_commas_in_strings stays false (urls use &, no commas); stateless -> repeat 4
+    keeps ~10-20s windows; no recorded reference (new data) - smoke records the first
+    counts/checksums, arm equality is the gate; dd-class rule for per-byte readings.
+    RESULTS (2026-07-13, 12/12 ok, reps=3 median): SMOKE arm-identical x6
+    (31300000,291341396217 - first reference recording). MEASURED: csv 8291 MB/s own
+    bytes / wall 1.73s; native 7569 MB/s / wall 1.82s -> rows/s 0.95 (native slightly
+    SLOWER), per-byte 0.913 csv-favored; footprint 1.044 x per-byte = the wall ratio.
+    PREDICTION CONFIRMED (tie, even csv-leaning): string manipulation through the full
+    parse->CONCAT->serialize path costs the SAME per byte in text as in fixed-slot
+    native (which pays its padding + NUL-scan) - the varsized-YSB law extends to active
+    string manipulation, not just string passthrough. Per-byte finer than ~10% carries
+    the dd-class caveat; the robust claim is parity at footprint ~1.04.
+
+defaults:
+  system: nebulastream
+  branch: benchmark-piparse-lazyparse-fast-csv
+  mode: worker-cli
+  build: native
+  data_size: large
+  topology: single-node
+  warm_read: true
+  completion_timeout_s: 900
+  worker:
+    query_engine:
+      number_of_worker_threads: 16
+      number_of_io_threads: 1
+      invoke_mode_configuration: fnattr
+      pin_threads: true
+      ccx_aware_task_queues: true
+      admission_queue_size: 1024
+    default_query_execution:
+      operator_buffer_size: 131072
+      execution_mode: COMPILER
+    number_of_buffers_in_global_buffer_manager: 16384
+    dump_compilation_result: NONE
+  query_config:
+    source_type: File
+    sink_type: Monitoring
+    input_formatter: { type: SIMDCSV, allow_commas_in_strings: false }
+    input_parser:
+      uint64: TracedUINT64
+      int32: FastINT32
+      f64: EiselFloatF64
+    output_formatter: { type: CSV }
+    output_parser: { f64: ZMIJF64 }
+  generator:
+    repeat: 4
+
+_series_fmt: &fmt_series
+  label: "input format"
+  explicit:
+    - name: csv_optimized
+      baseline: true
+      overrides: {}
+    - name: native
+      overrides:
+        data_size: native
+        query_config.input_formatter: { type: SystemNative, string_length: "13,73" }
+        query_config.input_parser: {}
+
+_axes_x: &w16_x
+  label: "worker threads"
+  parameter: worker.query_engine.number_of_worker_threads
+  values: [16]
+
+_y: &time_y { metric: processing_time_s, label: "Processing time (s)" }
+
+variants:
+  - name: smoke_q22
+    description: "GATE: arm-vs-arm counts/checksums (first recording on the new data)"
+    query: nexmark/q22_concat
+    overrides: { query_config.sink_type: Checksum, generator.repeat: 1 }
+    axes: { x: *w16_x, series: *fmt_series }
+    y: *time_y
+  - name: q22_concat
+    query: nexmark/q22_concat
+    axes: { x: *w16_x, series: *fmt_series }
+    y: *time_y
+    visualization: { type: grouped_bar }
